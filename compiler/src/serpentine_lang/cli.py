@@ -91,6 +91,26 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_llvm(args: argparse.Namespace) -> int:
+    """serp llvm: check, lower to LLVM IR (Backend B numeric core), JIT-run or dump IR."""
+    from .llvmgen import LLVMUnsupported, generate_llvm, run_llvm
+    rep = Reporter()
+    try:
+        tc = run_check(Path(args.file), rep)
+    except SerpError:
+        print(rep.render_all(), file=sys.stderr)
+        return 1
+    try:
+        if args.emit_ir:
+            print(generate_llvm(tc))
+            return 0
+        return run_llvm(tc)
+    except LLVMUnsupported as exc:
+        print(f"serp: program is outside the LLVM numeric core ({exc}) — "
+              f"use `serp build` (Rust backend)", file=sys.stderr)
+        return 3
+
+
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(prog="serp", description="Serpentine compiler")
@@ -107,6 +127,11 @@ def main() -> int:
     p_build.add_argument("--keep-rust", action="store_true", help="write the generated .rs next to the source")
     p_build.add_argument("--debug", action="store_true", help="opt-level=0 for faster builds")
     p_build.set_defaults(func=cmd_build)
+
+    p_llvm = sub.add_parser("llvm", help="run via the LLVM backend (numeric core, JIT)")
+    p_llvm.add_argument("file")
+    p_llvm.add_argument("--emit-ir", action="store_true", help="print LLVM IR instead of running")
+    p_llvm.set_defaults(func=cmd_llvm)
 
     args = parser.parse_args()
     return args.func(args)

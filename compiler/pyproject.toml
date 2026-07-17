@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serpentine-lang"
-version = "0.1.0"
+version = "0.3.0"
 description = "Serpentine: AOT compiler for an ownership-disciplined Python subset (serp CLI)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "Serpentine contributors" }]
+
+[project.optional-dependencies]
+llvm = ["llvmlite>=0.44"]
 
 [project.scripts]
 serp = "serpentine_lang.cli:main"

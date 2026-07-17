@@ -39,7 +39,7 @@ def rust_type(t: Type) -> str:
     if isinstance(t, TBool):
         return "bool"
     if isinstance(t, TStr):
-        return "String"
+        return "SStr"
     if isinstance(t, TNone):
         return "()"
     if isinstance(t, TList):
@@ -321,6 +321,8 @@ class RustGen:
                 msg = self._expr(e.args[0], "val")
                 if kind == "KeyError":
                     msg = f"py_repr(&({msg}))"
+                else:
+                    msg = f"({msg}).to_string()"
             else:
                 msg = "String::new()"
             err = f'SerpErr::new("{kind}", {msg})'
@@ -721,7 +723,7 @@ class RustGen:
             return self._wrap_ref(f"{v!r}f64", mode)
         if isinstance(v, str):
             esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
-            return self._wrap_ref(f'"{esc}".to_string()', mode)
+            return self._wrap_ref(f'sstr("{esc}")', mode)
         if v is None:
             return self._wrap_ref("None", mode)
         raise CodegenError(f"cannot emit literal {v!r}")
@@ -871,8 +873,8 @@ class RustGen:
                 raise CodegenError(f"unsupported f-string format spec '{spec}'")
         fmt = "".join(fmt_parts)
         if args:
-            return f'format!("{fmt}", {", ".join(args)})'
-        return f'"{fmt}".to_string()'
+            return f'sstring(format!("{fmt}", {", ".join(args)}))'
+        return f'sstr("{fmt}")'
 
     def _unary(self, node: ast.UnaryOp, mode: str) -> str:
         t = self._t(node.operand)
@@ -889,7 +891,7 @@ class RustGen:
 
     def _binop_code(self, op: ast.operator, l: str, r: str, lt: Type, rt: Type) -> str:
         if isinstance(lt, TStr) and isinstance(rt, TStr) and isinstance(op, ast.Add):
-            return f'format!("{{}}{{}}", {l}, {r})'
+            return f'sstring(format!("{{}}{{}}", {l}, {r}))'
         both_int = isinstance(lt, TInt) and isinstance(rt, TInt)
         if both_int:
             table = {ast.Add: "serp_add_i", ast.Sub: "serp_sub_i", ast.Mult: "serp_mul_i",
@@ -975,7 +977,7 @@ class RustGen:
             return self._wrap_ref(f"serp_upgrade({w})", mode)
         if name == "open":
             path = self._expr(node.args[0], "ref")
-            fmode = self._expr(node.args[1], "ref") if len(node.args) > 1 else '&"r".to_string()'
+            fmode = self._expr(node.args[1], "ref") if len(node.args) > 1 else '"r"'
             return self._wrap_ref(self._q(f"serp_open({path}, {fmode})"), mode)
         target = self.tc.call_targets.get(id(node))
         if target is not None:
@@ -1044,7 +1046,7 @@ class RustGen:
             v = self._expr(args[0], "val")
             return self._q(f"serp_abs_i({v})") if isinstance(t, TInt) else f"(({v}) as f64).abs()"
         if name == "str":
-            return f"py_str({self._expr(args[0], 'ref')})"
+            return f"sstring(py_str({self._expr(args[0], 'ref')}))"
         if name == "int":
             t = self._t(args[0])
             if isinstance(t, TStr):

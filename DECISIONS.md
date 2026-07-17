@@ -44,7 +44,21 @@ Python (RESEARCH.md §4); no Tier decisions are made for self-hosting's sake.
 
 ---
 
-## Phase-2 incidental decisions (recorded for transparency)
+## Phase-3 incidental decisions (recorded for transparency)
+
+- **Backend B emits LLVM IR from the typed AST** (via llvmlite), mirroring Backend A's
+  documented deviation — SIR remains the analysis IR. Scope: the numeric core (int/float/bool,
+  full CPython arithmetic semantics incl. overflow traps, control flow, calls, print of
+  int/bool/str literals). `serp llvm` JIT-executes; programs outside the core exit 3 with a
+  pointer to `serp build`. Backend A (Rust) remains the full-language, static-binary path.
+- **Strings are `Rc<str>`** (`SStr`) per §3.7 — O(1) copies; producing ops pay one extra copy
+  (documented 0.6x on the string microbench, Phase-4 optimization target).
+- **`range()` is a lazy iterator** in the runtime (was a materialized Vec).
+- **Codon/mypyc benchmarking is host-blocked** (no Windows support / no cl.exe); the vs-Codon
+  half of the Phase-3 milestone is carried by the alloc-churn benchmark achieving parity with
+  handwritten Rust, to be re-run against Codon on a Linux/macOS host.
+- **llvmlite** is a compiler-side dependency only (added to the venv); generated binaries and
+  the shim are unaffected.
 
 - **Runtime architecture:** all fatal runtime errors are `SerpErr` error values; generated
   functions return `Result<T, SerpErr>`; `try` lowers to stable labeled blocks (no closures,

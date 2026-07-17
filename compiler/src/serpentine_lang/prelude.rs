@@ -35,6 +35,13 @@ impl SerpErr {
 
 type SRes<T> = Result<T, SerpErr>;
 
+// ---------- Rc<str> strings (SPEC section 3.7: O(1) string copies) ----------
+
+type SStr = Rc<str>;
+
+fn sstr(s: &str) -> SStr { Rc::from(s) }
+fn sstring(s: String) -> SStr { Rc::from(s) }
+
 fn serp_err<T>(kind: &str, msg: String) -> SRes<T> {
     Err(SerpErr::new(kind, msg))
 }
@@ -144,8 +151,8 @@ impl PyShow for bool {
     fn py_str(&self) -> String { if *self { "True".into() } else { "False".into() } }
     fn py_repr(&self) -> String { self.py_str() }
 }
-impl PyShow for String {
-    fn py_str(&self) -> String { self.clone() }
+impl PyShow for str {
+    fn py_str(&self) -> String { self.to_string() }
     fn py_repr(&self) -> String {
         let quote = if self.contains('\'') && !self.contains('"') { '"' } else { '\'' };
         let mut out = String::new();
@@ -163,6 +170,14 @@ impl PyShow for String {
         out.push(quote);
         out
     }
+}
+impl PyShow for String {
+    fn py_str(&self) -> String { self.clone() }
+    fn py_repr(&self) -> String { self.as_str().py_repr() }
+}
+impl PyShow for Rc<str> {
+    fn py_str(&self) -> String { self.to_string() }
+    fn py_repr(&self) -> String { (**self).py_repr() }
 }
 impl PyShow for SerpErr {
     fn py_str(&self) -> String { self.msg.clone() }
@@ -292,13 +307,24 @@ fn serp_max_list<T: PartialOrd + Clone>(v: &Vec<T>, name: &str) -> SRes<T> {
 fn serp_min2<T: PartialOrd>(a: T, b: T) -> T { if b < a { b } else { a } }
 fn serp_max2<T: PartialOrd>(a: T, b: T) -> T { if b > a { b } else { a } }
 
-fn serp_range(start: i64, stop: i64, step: i64) -> SRes<Vec<i64>> {
+struct SerpRange { i: i64, stop: i64, step: i64 }
+
+impl Iterator for SerpRange {
+    type Item = i64;
+    fn next(&mut self) -> Option<i64> {
+        if (self.step > 0 && self.i < self.stop) || (self.step < 0 && self.i > self.stop) {
+            let v = self.i;
+            self.i += self.step;
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+fn serp_range(start: i64, stop: i64, step: i64) -> SRes<SerpRange> {
     if step == 0 { return serp_err("ValueError", "range() arg 3 must not be zero".into()); }
-    let mut out = Vec::new();
-    let mut i = start;
-    if step > 0 { while i < stop { out.push(i); i += step; } }
-    else { while i > stop { out.push(i); i += step; } }
-    Ok(out)
+    Ok(SerpRange { i: start, stop, step })
 }
 
 // ---------- insertion-ordered dict (SPEC.md D8) ----------
@@ -374,17 +400,20 @@ impl<K: PyShow, V: PyShow> PyShow for SerpDict<K, V> {
 // ---------- str operations ----------
 
 fn py_len_str(s: &str) -> i64 { s.chars().count() as i64 }
-fn py_split_ws(s: &str) -> Vec<String> { s.split_whitespace().map(String::from).collect() }
-fn py_split(s: &str, sep: &str) -> SRes<Vec<String>> {
+fn py_split_ws(s: &str) -> Vec<SStr> { s.split_whitespace().map(Rc::from).collect() }
+fn py_split(s: &str, sep: &str) -> SRes<Vec<SStr>> {
     if sep.is_empty() { return serp_err("ValueError", "empty separator".into()); }
-    Ok(s.split(sep).map(String::from).collect())
+    Ok(s.split(sep).map(Rc::from).collect())
 }
-fn py_join(sep: &str, v: &Vec<String>) -> String { v.join(sep) }
-fn py_strip(s: &str) -> String { s.trim().to_string() }
-fn py_lstrip(s: &str) -> String { s.trim_start().to_string() }
-fn py_rstrip(s: &str) -> String { s.trim_end().to_string() }
-fn py_upper(s: &str) -> String { s.to_uppercase() }
-fn py_lower(s: &str) -> String { s.to_lowercase() }
+fn py_join(sep: &str, v: &Vec<SStr>) -> SStr {
+    let parts: Vec<&str> = v.iter().map(|s| &**s).collect();
+    sstring(parts.join(sep))
+}
+fn py_strip(s: &str) -> SStr { sstr(s.trim()) }
+fn py_lstrip(s: &str) -> SStr { sstr(s.trim_start()) }
+fn py_rstrip(s: &str) -> SStr { sstr(s.trim_end()) }
+fn py_upper(s: &str) -> SStr { sstring(s.to_uppercase()) }
+fn py_lower(s: &str) -> SStr { sstring(s.to_lowercase()) }
 fn py_startswith(s: &str, p: &str) -> bool { s.starts_with(p) }
 fn py_endswith(s: &str, p: &str) -> bool { s.ends_with(p) }
 fn py_find(s: &str, sub: &str) -> i64 {
@@ -393,7 +422,7 @@ fn py_find(s: &str, sub: &str) -> i64 {
         None => -1,
     }
 }
-fn py_replace(s: &str, from: &str, to: &str) -> String { s.replace(from, to) }
+fn py_replace(s: &str, from: &str, to: &str) -> SStr { sstring(s.replace(from, to)) }
 fn py_contains_str(hay: &str, needle: &str) -> bool { hay.contains(needle) }
 
 // ---------- conversions ----------
@@ -417,14 +446,14 @@ fn py_float_from_str(s: &str) -> SRes<f64> {
     t.parse::<f64>().map_err(|_| SerpErr::new("ValueError",
         format!("could not convert string to float: {}", s.to_string().py_repr())))
 }
-fn serp_input() -> SRes<String> {
+fn serp_input() -> SRes<SStr> {
     use std::io::BufRead;
     let mut line = String::new();
     let n = std::io::stdin().lock().read_line(&mut line)
         .map_err(|_| SerpErr::new("EOFError", "EOF when reading a line".into()))?;
     if n == 0 { return serp_err("EOFError", "EOF when reading a line".into()); }
     if line.ends_with('\n') { line.pop(); if line.ends_with('\r') { line.pop(); } }
-    Ok(line)
+    Ok(sstring(line))
 }
 
 // ---------- files (Tier 1: open / read / write / close; drop closes) ----------
@@ -457,14 +486,14 @@ fn serp_open(path: &str, mode: &str) -> SRes<SerpFile> {
 }
 
 impl SerpFile {
-    fn read_all(&mut self) -> SRes<String> {
+    fn read_all(&mut self) -> SRes<SStr> {
         use std::io::Read;
         if !self.readable { return serp_err("io.UnsupportedOperation", "not readable".into()); }
         let f = self.inner.as_mut().ok_or_else(|| SerpErr::new("ValueError",
             "I/O operation on closed file.".into()))?;
         let mut s = String::new();
         f.read_to_string(&mut s).map_err(|e| SerpErr::new("OSError", format!("{}", e)))?;
-        Ok(s)
+        Ok(sstring(s))
     }
     fn write_str(&mut self, s: &str) -> SRes<i64> {
         use std::io::Write;
@@ -481,6 +510,6 @@ impl SerpFile {
 
 // ---------- sys ----------
 
-fn serp_argv() -> Vec<String> {
-    std::env::args().collect()
+fn serp_argv() -> Vec<SStr> {
+    std::env::args().map(Rc::from).collect()
 }
