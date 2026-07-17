@@ -23,22 +23,22 @@
 
 ## Phase 1 — Walking Skeleton
 
-- [ ] Scaffold the `serp` CLI with `check` and `build` subcommands (§4)
-- [ ] Frontend: `ast` parsing, module discovery, three-bin import resolution (§3.10)
-- [ ] Name resolution / symbol tables
-- [ ] Type checker: full-annotation enforcement over Tier-0 types (§4.②)
-- [ ] Flow-sensitive `is None` narrowing in the type checker (§3.6)
-- [ ] Design SIR: CFG, basic blocks, places, explicit move/borrow/drop ops (§4.③)
-- [ ] AST → SIR lowering for the minimal language (ints, functions, if/while, lists)
-- [ ] Initialized-places dataflow analysis (§4.④)
-- [ ] Lexical loan analysis: any number of `Ref` XOR one `Mut` (§3.2)
-- [ ] Drop insertion at end of lexical scope (§3.2)
-- [ ] Diagnostics v1: error codes, source spans, primary labels
-- [ ] Backend A: SIR → Rust codegen incl. floor-div/mod helpers (§4.⑤a, §7)
-- [ ] Runtime-error parity in generated Rust (CPython messages, exit 1) (§3.9)
-- [ ] `serp build`: invoke rustc, emit the native binary
-- [ ] Differential test harness: every accept test runs CPython + native, stdout diffed (§5.6)
-- [ ] **Milestone: fib.py + a list program dual-run with byte-identical output (§9)**
+- [x] Scaffold the `serp` CLI with `check` and `build` subcommands (§4) — `compiler/`, installable, `serp` entry point
+- [x] Frontend: `ast` parsing, module discovery, three-bin import resolution (§3.10)
+- [x] Name resolution / symbol tables
+- [x] Type checker: full-annotation enforcement over Tier-0 types (§4.②)
+- [x] Flow-sensitive `is None` narrowing in the type checker (§3.6)
+- [x] Design SIR: CFG, basic blocks, places, explicit move/borrow/drop ops (§4.③) — `serp check --dump-sir`
+- [x] AST → SIR lowering for the minimal language (ints, functions, if/while, lists)
+- [x] Initialized-places dataflow analysis (§4.④) — worklist fixed point; loop moves caught
+- [x] Lexical loan analysis: any number of `Ref` XOR one `Mut` (§3.2) — for-loop regions + intra-call conflicts
+- [x] Drop insertion at end of lexical scope (§3.2) — drop ops in SIR at scope exits
+- [x] Diagnostics v1: error codes, source spans, primary labels
+- [x] Backend A: SIR → Rust codegen incl. floor-div/mod helpers (§4.⑤a, §7) — *codegen emits structured Rust from the typed AST; SIR drives the analyses (keeps rustc-as-oracle meaningful)*
+- [x] Runtime-error parity in generated Rust (CPython messages, exit 1) (§3.9)
+- [x] `serp build`: invoke rustc, emit the native binary
+- [x] Differential test harness: every accept test runs CPython + native, stdout diffed (§5.6) — `tools/run_differential_tests.py`, 36/36
+- [x] **Milestone: fib.py + a list program dual-run with byte-identical output (§9)** — entire accept corpus dual-runs identically
 
 ## Phase 2 — Make the Checker Real
 

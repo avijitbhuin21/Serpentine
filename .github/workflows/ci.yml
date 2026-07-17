@@ -28,6 +28,20 @@ jobs:
       - name: Reject corpus parses and is well-annotated
         run: python tools/check_reject_tests.py
 
+      - name: Install the compiler
+        run: python -m pip install ./compiler
+
+      - name: serp check accepts the whole accept corpus
+        run: python tools/run_differential_tests.py --check-only
+
+      - name: serp check catches the whole reject corpus with exact codes
+        run: python tools/run_reject_serp.py
+
+      - name: Differential suite (CPython vs native via rustc)
+        run: |
+          rustc --version
+          python tools/run_differential_tests.py
+
   package:
     runs-on: ubuntu-latest
     steps:

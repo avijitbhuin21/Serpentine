@@ -337,6 +337,7 @@ The **complete** list. Anything else that differs is a Serpentine bug.
 | D9 | unhandled runtime error | traceback + exit 1 | same error class + message + exit 1; **traceback frames best-effort** | documented (§11) |
 | D10 | recursion depth | `RecursionError` ≈ 1000 frames | native stack, no artificial limit | documented |
 | D11 | division by zero float ops | `ZeroDivisionError` | must match (no IEEE inf leak) | fixed in codegen |
+| D12 | stdout line endings | OS text mode (`\r\n` on Windows) | always `\n` | documented; differential harness normalizes |
 
 Rule: divergences must be either checker-rejected (D3, D5), fixed-in-implementation (D4, D6,
 D7, D8, D11), or loud documented decisions (D1, D2, D9, D10). **Never silent drift.**

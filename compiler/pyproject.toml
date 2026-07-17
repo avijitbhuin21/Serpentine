@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serpentine-lang"
+version = "0.1.0"
+description = "Serpentine: AOT compiler for an ownership-disciplined Python subset (serp CLI)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+
+[project.scripts]
+serp = "serpentine_lang.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+serpentine_lang = ["prelude.rs"]
