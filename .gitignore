@@ -11,3 +11,8 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# test artifacts
+tests/accept/tmp_serp_*.txt
+tests/accept/*.exe
+tests/accept/*.rs

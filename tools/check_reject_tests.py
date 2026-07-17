@@ -12,7 +12,7 @@ HEADER = re.compile(r"^# serp-reject: (SE\d{3}) [a-z][a-z0-9-]*$")
 INLINE = re.compile(r"# E: (SE\d{3})\s*$")
 
 KNOWN_CODES = {
-    "SE001", "SE002", "SE003", "SE004", "SE005", "SE006", "SE007",
+    "SE001", "SE002", "SE003", "SE004", "SE005", "SE006", "SE007", "SE008",
     "SE201", "SE202", "SE203", "SE204", "SE205", "SE206", "SE207",
     "SE208", "SE209", "SE210", "SE211", "SE212", "SE213", "SE214",
 }

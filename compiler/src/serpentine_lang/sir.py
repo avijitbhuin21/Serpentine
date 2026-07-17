@@ -61,6 +61,7 @@ class Lowerer:
         self.cur: Block = self._new_block()
         self.loan_stack: list[tuple[str, str]] = []
         self.loop_stack: list[tuple[int, int]] = []   # (head_id, exit_id)
+        self.handler_stack: list[int] = []            # entry block of enclosing try handlers
         self.noncopy_locals: list[str] = []
 
     def _new_block(self) -> Block:
@@ -102,6 +103,19 @@ class Lowerer:
             self._lower_stmt(stmt)
 
     def _lower_stmt(self, stmt: ast.stmt) -> None:
+        if isinstance(stmt, ast.Try):
+            self._lower_try(stmt)
+            return
+        if isinstance(stmt, ast.Raise):
+            if stmt.exc is not None:
+                self._lower_expr(stmt.exc)
+            if self.handler_stack:
+                # Unwinding to a local handler: locals stay live for the handler path.
+                self.cur.succs.append(self.handler_stack[-1])
+            else:
+                self._emit_drops(stmt)
+            self.cur.is_exit = True
+            return
         if isinstance(stmt, ast.Return):
             if stmt.value is not None:
                 self._lower_expr(stmt.value)
@@ -122,6 +136,12 @@ class Lowerer:
             return
         if isinstance(stmt, ast.Expr):
             self._lower_expr(stmt.value)
+            e = stmt.value
+            if isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) \
+                    and isinstance(e.func.value, ast.Name) and e.func.value.id == "sys" \
+                    and e.func.attr == "exit":
+                self._emit_drops(stmt)
+                self.cur.is_exit = True
             return
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             target = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
@@ -134,6 +154,13 @@ class Lowerer:
                 root = self._root_of(target.value)
                 if root:
                     self._emit("mut_use", root, stmt)
+            elif isinstance(target, ast.Attribute):
+                if isinstance(target.value, ast.Name) and self._is_plain_class_var(target.value.id):
+                    self._emit("field_def", f"{target.value.id}.{target.attr}", stmt)
+                else:
+                    root = self._root_of(target.value)
+                    if root:
+                        self._emit("mut_use", root, stmt)
             return
         if isinstance(stmt, ast.AugAssign):
             self._lower_expr(stmt.value)
@@ -142,6 +169,10 @@ class Lowerer:
                 self._emit("def", stmt.target.id, stmt)
             elif isinstance(stmt.target, ast.Subscript):
                 self._lower_expr(stmt.target.slice)
+                root = self._root_of(stmt.target.value)
+                if root:
+                    self._emit("mut_use", root, stmt)
+            elif isinstance(stmt.target, ast.Attribute):
                 root = self._root_of(stmt.target.value)
                 if root:
                     self._emit("mut_use", root, stmt)
@@ -220,13 +251,51 @@ class Lowerer:
                 self._emit("borrow_end", borrowed, stmt)
             return
 
+    def _lower_try(self, stmt: ast.Try) -> None:
+        """Try body: every statement boundary edges to the handler entry (E1 join)."""
+        handler_entry = self._new_block()
+        self.cur.succs.append(handler_entry.id)
+        self.handler_stack.append(handler_entry.id)
+        for s in stmt.body:
+            if self.cur.is_exit:
+                break
+            self._lower_stmt(s)
+            if not self.cur.is_exit and handler_entry.id not in self.cur.succs:
+                self.cur.succs.append(handler_entry.id)
+        self.handler_stack.pop()
+        body_end = self.cur
+        join = self._new_block()
+        if not body_end.is_exit:
+            body_end.succs.append(join.id)
+        for h in stmt.handlers:
+            hb = self._new_block()
+            handler_entry.succs.append(hb.id)
+            self.cur = hb
+            if h.name:
+                self._emit("def", h.name, h)
+            self._lower_block(h.body)
+            if not self.cur.is_exit:
+                self.cur.succs.append(join.id)
+        self.cur = join
+        if stmt.finalbody:
+            self._lower_block(stmt.finalbody)
+
+    def _is_plain_class_var(self, name: str) -> bool:
+        """Whether name is a local/param dataclass instance (not Shared)."""
+        from .ptypes import TClass
+        facts = self.tc.facts[(self.sig.module, self.sig.name)]
+        return isinstance(facts.locals.get(name), TClass)
+
     def _is_copy_var(self, name: str) -> bool:
         facts = self.tc.facts[(self.sig.module, self.sig.name)]
         t = facts.locals.get(name)
         return t is None or t.is_copy()
 
     def _root_of(self, e: ast.expr) -> str | None:
-        while isinstance(e, ast.Subscript):
+        while isinstance(e, (ast.Subscript, ast.Attribute)):
+            if isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name) \
+                    and e.value.id == "sys":
+                return None
             e = e.value
         if isinstance(e, ast.Name):
             return e.id
@@ -251,38 +320,78 @@ class Lowerer:
 
     def _lower_expr(self, e: ast.expr) -> None:
         """Emit use/move/mut_use ops for every place read in an expression."""
+        facts = self.tc.facts[(self.sig.module, self.sig.name)]
         if isinstance(e, ast.Name):
             if isinstance(e.ctx, ast.Load):
                 self._emit("use", e.id, e)
+            return
+        if isinstance(e, ast.Attribute):
+            if isinstance(e.value, ast.Name):
+                if e.value.id == "sys":
+                    return
+                if self._is_plain_class_var(e.value.id):
+                    self._emit("use", f"{e.value.id}.{e.attr}", e)
+                elif e.value.id in facts.locals:
+                    self._emit("use", e.value.id, e)
+                return
+            self._lower_expr(e.value)
             return
         if isinstance(e, ast.Call):
             if isinstance(e.func, ast.Name) and id(e) in self.tc.move_calls:
                 arg = e.args[0]
                 if isinstance(arg, ast.Name) and not self._is_copy_var(arg.id):
                     self._emit("move", arg.id, e)
+                elif isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name) \
+                        and self._is_plain_class_var(arg.value.id):
+                    t = self.tc.expr_types.get(id(e))
+                    if t is not None and not t.is_copy():
+                        self._emit("move", f"{arg.value.id}.{arg.attr}", e)
+                    else:
+                        self._emit("use", f"{arg.value.id}.{arg.attr}", e)
                 else:
                     self._lower_expr(arg)
                 return
             if isinstance(e.func, ast.Attribute):
                 recv = e.func.value
-                from .ptypes import TDict, TList
+                from .ptypes import TClass, TDict, TFile, TList, TShared
+                if isinstance(recv, ast.Name) and recv.id == "sys":
+                    for a in e.args:
+                        self._lower_expr(a)
+                    return
                 rt = self.tc.expr_types.get(id(recv))
                 root = self._root_of(recv)
                 for a in e.args:
                     self._lower_expr(a)
-                is_mut = (isinstance(rt, TList) and e.func.attr in self.MUT_LIST_METHODS) or \
-                         (isinstance(rt, TDict) and e.func.attr == "pop")
-                if root is not None and not self._is_copy_var(root):
-                    self._emit("mut_use" if is_mut else "use", root, e)
-                elif root is not None:
-                    self._emit("use", root, e)
-                if not isinstance(recv, (ast.Name, ast.Subscript)):
+                is_mut = False
+                if isinstance(rt, TShared):
+                    is_mut = False
+                elif isinstance(rt, TList) and e.func.attr in self.MUT_LIST_METHODS:
+                    is_mut = True
+                elif isinstance(rt, TDict) and e.func.attr == "pop":
+                    is_mut = True
+                elif isinstance(rt, TFile):
+                    is_mut = True
+                elif isinstance(rt, TClass):
+                    tgt = self.tc.call_targets.get(id(e))
+                    if tgt is not None:
+                        msig = self.tc.sigs[tgt]
+                        if msig.params and msig.params[0].conv == "mut":
+                            is_mut = True
+                if root is not None and root in facts.locals:
+                    if not self._is_copy_var(root):
+                        self._emit("mut_use" if is_mut else "use", root, e)
+                    else:
+                        self._emit("use", root, e)
+                if not isinstance(recv, (ast.Name, ast.Subscript, ast.Attribute)):
                     self._lower_expr(recv)
                 elif isinstance(recv, ast.Subscript):
                     self._lower_expr(recv.slice)
                 return
             if isinstance(e.func, ast.Name):
                 sig = self.tc._resolve_callee(self._mod(), e.func.id)
+                tgt = self.tc.call_targets.get(id(e))
+                if tgt is not None:
+                    sig = self.tc.sigs[tgt]
                 for i, a in enumerate(e.args):
                     self._lower_expr(a)
                     if sig is not None and i < len(sig.params) and sig.params[i].conv == "mut":
@@ -303,8 +412,10 @@ class Lowerer:
 
 
 def lower_program(tc: TypeChecker) -> dict[tuple[str, str], FuncSIR]:
-    """Lower every checked function to SIR."""
+    """Lower every checked (non-template) function to SIR."""
     out = {}
     for key, sig in tc.sigs.items():
+        if sig.is_template or key not in tc.facts:
+            continue
         out[key] = Lowerer(tc, sig).lower()
     return out

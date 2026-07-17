@@ -44,7 +44,27 @@ Python (RESEARCH.md §4); no Tier decisions are made for self-hosting's sake.
 
 ---
 
-## Phase-0 incidental decisions (recorded for transparency)
+## Phase-2 incidental decisions (recorded for transparency)
+
+- **Runtime architecture:** all fatal runtime errors are `SerpErr` error values; generated
+  functions return `Result<T, SerpErr>`; `try` lowers to stable labeled blocks (no closures,
+  no unwinding) — implements D1's backend sketch.
+- **`self` conventions:** methods must annotate `self: Ref[C]` or `self: Mut[C]`. `Owned`
+  (consuming) self is deferred to Tier 2 (`SE202`).
+- **Generic classes must declare `class C(Generic[T])`** — required for CPython parity
+  (`C[int]` subscription at runtime). `from __future__ import annotations` is allowed and
+  recommended for forward references (`self: Ref[C]` inside `C`).
+- **Exceptions surface:** built-in exception classes only; no `try/else`; no `return` inside
+  try-with-finally; no `break`/`continue` escaping a try; no `return/break/continue` in
+  `finally`. Handler variables are Copy `exception` values.
+- **New code `SE008 move-out-of-borrow`:** moving (a field) out of a `Ref`/`Mut` parameter —
+  required for rustc agreement (E0507).
+- **Mutation through a per-iteration loop Ref is `SE004`** — required for rustc agreement
+  (loop variables are `&T` in the generated Rust).
+- **Documented divergences added:** `repr` of a `Weak` field prints `<weak>` natively
+  (CPython shim shows the referent); `sys.argv[0]` is the native binary path (CPython: the
+  .py path); `upgrade()` can return `None` natively but never under CPython (D2 timing);
+  mutating `sys.argv` is not supported (each read is an owned copy).
 
 - **License:** MIT.
 - **Version pin:** CPython 3.12 for spec grammar and CI (RESEARCH.md §4).

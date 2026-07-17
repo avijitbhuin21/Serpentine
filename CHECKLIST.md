@@ -42,18 +42,18 @@
 
 ## Phase 2 — Make the Checker Real
 
-- [ ] Field-sensitive tracking: partial moves, `x.f` moved while `x.g` live (§5.7)
-- [ ] Fixed-point dataflow for loops (move-in-loop-body cases) (§6.3)
-- [ ] Iterator-invalidation rule: `for` holds a `Ref` of the iterable for the body (§6.6)
-- [ ] `Shared[T]` + `Weak[T]`: refcounted escape hatch, leak-on-cycle policy (§8.2)
-- [ ] Tier-1 classes: `@dataclass`-style fields + methods, no inheritance (§3.1)
-- [ ] Generics with monomorphization on functions and classes (§3.1)
-- [ ] Exceptions: try-as-sub-scope borrows, unwind-path drops, catchable runtime errors (§8.1, §3.9)
-- [ ] Tier-1 builtins: `open()` with drop-closes-file, `sys.argv`, `sys.exit` (§3.8)
-- [ ] Error UX pass: secondary "moved here" labels, suggested fixes, rustc-quality polish (§5.8)
-- [ ] rustc-agreement harness: transpile corpus, diff verdicts, fix every disagreement (§4)
-- [ ] Corpus study: run checker on real small programs, catalog rejected idioms (§5.9)
-- [ ] **Milestone: all reject tests caught with quality messages; checker agrees with rustc (§9)**
+- [x] Field-sensitive tracking: partial moves, `x.f` moved while `x.g` live (§5.7) — one-level place sensitivity in borrowck; SE008 for moves out of borrows
+- [x] Fixed-point dataflow for loops (move-in-loop-body cases) (§6.3) — *landed in Phase 1 (worklist fixed point); re-verified*
+- [x] Iterator-invalidation rule: `for` holds a `Ref` of the iterable for the body (§6.6) — *landed in Phase 1 (loan regions); Phase 2 added the no-mutation-through-loop-Ref rule*
+- [x] `Shared[T]` + `Weak[T]`: refcounted escape hatch, leak-on-cycle policy (§8.2) — `share`/`downgrade`/`upgrade`, Rc<RefCell> backend, runtime-borrow errors
+- [x] Tier-1 classes: `@dataclass`-style fields + methods, no inheritance (§3.1) — Ref/Mut self conventions, dataclass repr/eq parity, by-value-cycle rejection
+- [x] Generics with monomorphization on functions and classes (§3.1) — TypeVar + Generic[T], AST-copy instantiation per argument types
+- [x] Exceptions: try-as-sub-scope borrows, unwind-path drops, catchable runtime errors (§8.1, §3.9) — E1 join in borrowck; runtime rebuilt on SerpErr error values; labeled-block Rust lowering
+- [x] Tier-1 builtins: `open()` with drop-closes-file, `sys.argv`, `sys.exit` (§3.8)
+- [x] Error UX pass: secondary "moved here" labels, suggested fixes, rustc-quality polish (§5.8) — secondary spans + `help:` lines in diagnostics
+- [x] rustc-agreement harness: transpile corpus, diff verdicts, fix every disagreement (§4) — `tools/run_rustc_agreement.py`: 11 confirmed, 11 policy-only, 0 disagreements
+- [x] Corpus study: run checker on real small programs, catalog rejected idioms (§5.9) — `docs/corpus-study.md`
+- [x] **Milestone: all reject tests caught with quality messages; checker agrees with rustc (§9)** — 50/50 rejects exact codes; 48/48 accept tests dual-run byte-identical
 
 ## Phase 3 — Native Backend & Benchmarks
 

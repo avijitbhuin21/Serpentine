@@ -399,6 +399,7 @@ they are frozen once released.
 | SE005 | move-while-borrowed | J1, §5.4 |
 | SE006 | move-out-of-container | §5.1 |
 | SE007 | move-loop-variable | §5.4 |
+| SE008 | move-out-of-borrow | Phase 2: moving a field (or the whole) out of a `Ref`/`Mut` parameter would leave the caller's value with a hole (rustc E0507 parity) |
 
 ### Types & subset (SE2xx)
 
@@ -419,5 +420,37 @@ they are frozen once released.
 | SE213 | foreign-import |
 | SE214 | type-mismatch |
 
-Diagnostic format (Phase 1 target): `error[SE001]: use of moved value 'xs'` with a primary
-source span; secondary "value moved here" labels are Phase-2 work.
+Diagnostic format: `error[SE001]: use of moved value 'xs'` with a primary source span;
+Phase 2 added secondary "value moved here" labels and `help:` suggestion lines.
+
+---
+
+## 13. Tier-1 surface (Phase 2) — summary
+
+Normative details live in the implementation + test corpus until the Tier-1 spec pass;
+this section records the shipped surface and its rules of thumb.
+
+- **Classes** — `@dataclass` (imported from `serpentine`) with annotated fields and
+  methods; no inheritance (only a `Generic[...]` base), no field defaults, no dunder
+  methods. Instances are non-Copy owned values; dataclass `==`/`repr` follow CPython.
+  `self` must be annotated `Ref[C]` or `Mut[C]` (`Owned` self is Tier 2). Classes that
+  contain themselves by value are rejected (SE214); use `Shared`/`Weak`/`list`.
+- **Field places** — the checker is field-sensitive one level deep: `move(x.f)` leaves
+  `x.g` usable; using the whole `x` is SE001 until `x.f` is re-assigned; assigning a
+  field of a wholly-moved value is SE001; moving out of a borrowed parameter is SE008.
+- **Generics** — module-level `T = TypeVar("T")`; generic functions and generic classes
+  (`class Box(Generic[T])`). Monomorphized per call-site/constructor argument types;
+  type arguments must be inferable from arguments (else SE214/SE204).
+- **`Shared[T]` / `Weak[T]`** — `share(move(x))`, `downgrade(s)`, `upgrade(w) ->
+  Shared[T] | None`. Handles copy freely; reads/writes go through a runtime borrow
+  (conflict → catchable RuntimeError). Cycles leak (DECISIONS.md D3).
+- **Exceptions** — `try/except/finally` (no `else`), `raise Class("msg")`, bare `raise`
+  in handlers, built-in exception classes only. `try` is a sub-scope with the E1
+  maybe-moved join (DECISIONS.md D1). Restrictions: no `return` inside a try with
+  `finally`; no `break`/`continue` out of a try; no `return`/`break`/`continue` inside
+  `finally`. Tier-0 runtime errors are catchable.
+- **Builtins** — `open(path, mode)` with modes r/w/a, `.read()`, `.write(s)`,
+  `.close()`; dropping a file closes it. `import sys`: `sys.argv` (owned copy),
+  `sys.exit(int)`.
+- **`from __future__ import annotations`** — permitted and recommended in files that
+  mention class names in annotations (CPython forward-reference parity).

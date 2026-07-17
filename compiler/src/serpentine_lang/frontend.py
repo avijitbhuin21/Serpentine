@@ -18,6 +18,9 @@ class Module:
     shim_imports: set[str] = field(default_factory=set)
     functions: dict[str, ast.FunctionDef] = field(default_factory=dict)
     constants: dict[str, ast.AnnAssign] = field(default_factory=dict)
+    classes: dict[str, ast.ClassDef] = field(default_factory=dict)
+    typevars: set[str] = field(default_factory=set)
+    imports_sys: bool = False
     entry_call: str | None = None
 
 
@@ -84,6 +87,11 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
     for node in body:
         span = Span(file, node.lineno, node.col_offset)
         if isinstance(node, ast.ImportFrom):
+            if node.module == "__future__":
+                if [a.name for a in node.names] != ["annotations"]:
+                    rep.fatal("SE201", "unsupported-feature",
+                              "only 'from __future__ import annotations' is supported", span)
+                continue
             if node.module == "serpentine":
                 for alias in node.names:
                     if alias.asname:
@@ -97,12 +105,16 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
                 rep.fatal("SE213", "foreign-import",
                           f"import of '{node.module}' is not a Serpentine module or the shim", span)
         elif isinstance(node, ast.Import):
+            if len(node.names) == 1 and node.names[0].name == "sys" and node.names[0].asname is None:
+                mod.imports_sys = True
+                continue
             rep.fatal("SE213", "foreign-import",
                       f"import of '{node.names[0].name}' is not a Serpentine module or the shim "
-                      f"(stdlib and site-packages are not Tier 0)", span)
+                      f"(stdlib and site-packages are not Tier 0/1; only 'import sys' is special-cased)",
+                      span)
         elif isinstance(node, ast.FunctionDef):
             if node.decorator_list:
-                rep.fatal("SE201", "unsupported-feature", "decorators are not Tier 0", span)
+                rep.fatal("SE201", "unsupported-feature", "decorators are not Tier 0/1", span)
             mod.functions[node.name] = node
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             mod.constants[node.target.id] = node
@@ -112,15 +124,44 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
             assert isinstance(call.value.func, ast.Name)
             mod.entry_call = call.value.func.id
         elif isinstance(node, ast.ClassDef):
-            rep.fatal("SE201", "unsupported-feature", "classes are Tier 1, not Tier 0", span)
+            deco = node.decorator_list
+            if not (len(deco) == 1 and isinstance(deco[0], ast.Name) and deco[0].id == "dataclass"):
+                rep.fatal("SE201", "unsupported-feature",
+                          "classes must carry exactly the @dataclass decorator "
+                          "(from serpentine import dataclass)", span)
+            if node.keywords or any(not _is_generic_base(b) for b in node.bases):
+                rep.fatal("SE201", "unsupported-feature",
+                          "class inheritance is not supported in Tier 1 (only a "
+                          "Generic[...] base for generic classes)", span)
+            mod.classes[node.name] = node
+        elif _is_typevar_decl(node):
+            assert isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            mod.typevars.add(node.targets[0].id)
         elif isinstance(node, ast.Assign):
             rep.fatal("SE206", "mutable-global",
                       "module-level bindings must be annotated Copy-typed constants", span)
         else:
             rep.fatal("SE205", "module-level-statement",
-                      "only imports, function definitions, Copy constants, and the entry guard "
-                      "are allowed at module level", span)
+                      "only imports, function definitions, classes, Copy constants, and the "
+                      "entry guard are allowed at module level", span)
     return mod
+
+
+def _is_generic_base(node: ast.expr) -> bool:
+    """Recognize `Generic[T, ...]` as the sole permitted class base."""
+    return (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+            and node.value.id == "Generic")
+
+
+def _is_typevar_decl(node: ast.stmt) -> bool:
+    """Recognize `T = TypeVar(\"T\")` at module level."""
+    if not (isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)):
+        return False
+    v = node.value
+    return (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "TypeVar"
+            and len(v.args) == 1 and isinstance(v.args[0], ast.Constant)
+            and v.args[0].value == node.targets[0].id)
 
 
 def _is_entry_guard(node: ast.stmt) -> bool:
