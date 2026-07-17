@@ -1,0 +1,56 @@
+# Serpentine
+
+> Python source code, written under an ownership-and-borrowing discipline, ahead-of-time
+> compiled to native machine code with **no garbage collector** — while the exact same file
+> remains valid, runnable CPython. One codebase, two execution modes.
+
+**Status:** Phase 0 — spec & foundations. Nothing compiles yet; the spec and test corpus are
+the deliverables.
+
+## The Dual-Execution Guarantee
+
+Any program accepted by `serp check` produces the same observable behavior when
+(a) executed by CPython, and (b) compiled by `serp build` and run natively — modulo a small,
+explicitly documented list of divergences ([SPEC.md §10](SPEC.md)).
+
+```python
+from serpentine import Owned, Ref, Mut, move
+
+def total(prices: Ref[list[float]]) -> float:
+    return sum(prices)
+
+def main() -> None:
+    prices: Owned[list[float]] = [9.99, 4.50]
+    print(total(prices))     # immutable borrow, ends after the call
+    archive = move(prices)   # explicit ownership transfer
+    # print(prices)          # <- serp: error[SE001] use-after-move
+
+if __name__ == "__main__":
+    main()
+```
+
+Ownership is encoded exclusively through constructs CPython ignores at runtime: type
+annotations, decorators, and the `serpentine-shim` package where `Owned`/`Ref`/`Mut`/`move`
+are no-ops.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `SPEC.md` | The Tier-0 language specification — the wall against scope creep |
+| `DECISIONS.md` | Resolved design questions (RESEARCH.md §8) |
+| `RESEARCH.md` | The research & design document that seeded the project |
+| `CHECKLIST.md` | Ordered execution tracker for all phases |
+| `docs/exceptions-ownership.md` | Paper prototype: exceptions × ownership (Tier 1) |
+| `shim/` | `serpentine-shim` — the runtime no-op package (`pip install serpentine-shim`) |
+| `tests/accept/` | Programs the checker must accept; each runs under CPython today |
+| `tests/reject/` | Programs the checker must reject; each annotated with its expected error |
+
+## Version pin
+
+The spec grammar and CI are pinned to **CPython 3.12**. Raising the pin is a deliberate spec
+change, not an incidental upgrade.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
