@@ -42,6 +42,14 @@ jobs:
           rustc --version
           python tools/run_differential_tests.py
 
+      - name: rustc-agreement harness (borrow checker vs oracle)
+        run: python tools/run_rustc_agreement.py
+
+      - name: LLVM backend differential (Backend B numeric core)
+        run: |
+          python -m pip install llvmlite
+          python tools/run_llvm_differential.py
+
   package:
     runs-on: ubuntu-latest
     steps:
