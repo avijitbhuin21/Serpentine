@@ -74,3 +74,33 @@
 - [ ] North-star demo: JSON parser developed under CPython, deployed as native binary (§9)
 - [ ] Docs: language tour, ownership guide, divergence page, migration notes
 - [ ] Publish `serpentine-lang` v0.1 + announce
+
+## Bonus — Phase 4 backlog (readiness-report findings, 2026-07-17)
+
+> Ordered by impact-per-effort from the post-Phase-3 readiness report and the corpus study
+> (`docs/corpus-study.md`). Items feed into the Phase-4 boxes above.
+
+### Daily-tool ergonomics (fastest path to "use it for local things")
+- [ ] List/dict comprehensions (top corpus rejection; desugars to loop + append, no ownership novelty)
+- [ ] String slicing `s[a:b]` (missing entirely — bites every text tool)
+- [ ] `sorted(xs)` keyless (no closures needed)
+- [ ] `with open(...) as f:` RAII sugar (Tier-2 §3.1, high demand)
+- [ ] Default parameter values
+- [ ] Small builtin gaps: `round()`, `str.format`-adjacent specs, more str/dict methods
+- [ ] Named element borrows (scoped borrow of `rows[0]` — most-wanted ergonomic fix from the corpus study)
+- [ ] `is None` narrowing on field places (currently plain names only)
+
+### Performance
+- [ ] String runtime optimization (0.6x CPython on transformation pipelines: ASCII byte-len fast path, buffer-reusing ops, SSO/arena — see `docs/benchmarks.md`)
+- [ ] Re-run `bench_alloc.py` head-to-head vs Codon on a Linux/macOS host (Codon has no Windows support)
+
+### Library-building prerequisites
+- [ ] Multi-package/module resolution design (imports are single-directory bin-1 only; libraries ship as source under whole-program compilation)
+- [ ] Cross-library API conventions: ownership in public signatures, monomorphization across package boundaries
+- [ ] Protocols/traits + closures (blocking any real library API surface; Tier 2)
+- [ ] Iterators as first-class borrows (Tier 2)
+
+### Housekeeping
+- [ ] Bump CI actions (checkout@v4 / setup-python@v5) to silence Node-20 deprecation annotations
+- [ ] `Owned` (consuming) `self` methods (deferred from Phase 2, SE202)
+- [ ] Backend B: grow the LLVM numeric core (float printing via shortest-roundtrip, strings) or fold into Phase-4 priorities
