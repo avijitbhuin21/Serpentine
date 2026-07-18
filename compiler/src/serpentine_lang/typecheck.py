@@ -33,6 +33,7 @@ class Param:
     name: str
     conv: str
     typ: Type
+    default: ast.expr | None = None
 
 
 @dataclass
@@ -58,6 +59,15 @@ class ClassInfo:
     field_order: list[str] = field(default_factory=list)
     methods: dict[str, FuncSig] = field(default_factory=dict)
     typevars: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ProtoInfo:
+    """A Tier-2 structural protocol: required method signatures only."""
+
+    module: str
+    name: str
+    methods: dict[str, tuple[list[Param], Type]] = field(default_factory=dict)
 
 
 # Exception classes recognized by raise/except (SPEC.md section 11 + Tier-1 additions).
@@ -92,14 +102,20 @@ class TypeChecker:
         self.facts: dict[tuple[str, str], FuncFacts] = {}
         self.constants: dict[tuple[str, str], Type] = {}
         self.classes: dict[tuple[str, str], ClassInfo] = {}
+        self.protocols: dict[tuple[str, str], ProtoInfo] = {}
+        self.tvar_bounds: dict[tuple[str, str], tuple[str, str]] = {}
         self.call_targets: dict[int, tuple[str, str]] = {}   # call node id -> sig key
         self.ctor_calls: dict[int, tuple[str, str, tuple]] = {}   # call node id -> class inst
+        self.lambda_elems: dict[int, Type] = {}   # sorted-key lambda node id -> element type
         self.checked_bodies: set[tuple[str, str]] = set()
 
     def run(self) -> None:
         """Check every module: classes and signatures first, then all bodies."""
         for mod in self.program.modules.values():
             self._collect_classes(mod)
+        for mod in self.program.modules.values():
+            self._collect_protocols(mod)
+            self._resolve_tvar_bounds(mod)
         for mod in self.program.modules.values():
             self._collect_class_members(mod)
             self._collect_signatures(mod)
@@ -213,9 +229,9 @@ class TypeChecker:
         file = str(mod.path)
         a = fn.args
         span = Span(file, fn.lineno, fn.col_offset)
-        if a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg or a.defaults or a.kw_defaults:
+        if a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg or a.kw_defaults:
             self.rep.fatal("SE201", "unsupported-feature",
-                           "methods take plain positional parameters without defaults", span)
+                           "methods take plain positional parameters", span)
         if not a.args or a.args[0].arg != "self":
             self.rep.fatal("SE203", "missing-annotation",
                            f"method '{fn.name}' must take 'self' as its first parameter", span)
@@ -234,7 +250,8 @@ class TypeChecker:
                            f"Mut[{info.name}] (Owned self is Tier 2)",
                            Span(file, self_arg.lineno, self_arg.col_offset))
         params = [Param("self", parsed.conv, self._self_type(info))]
-        for arg in a.args[1:]:
+        defaults_off = len(a.args) - len(a.defaults)
+        for i, arg in enumerate(a.args[1:], start=1):
             if arg.annotation is None:
                 self.rep.fatal("SE203", "missing-annotation",
                                f"parameter '{arg.arg}' has no type annotation",
@@ -250,7 +267,10 @@ class TypeChecker:
                     self.rep.fatal("SE203", "missing-annotation",
                                    f"non-Copy parameter '{arg.arg}' must state a convention "
                                    f"(Owned/Ref/Mut)", Span(file, arg.lineno, arg.col_offset))
-            params.append(Param(arg.arg, conv, p.typ))
+            default = a.defaults[i - defaults_off] if i >= defaults_off else None
+            if default is not None:
+                self._check_default(arg.arg, p.typ, conv, default, file)
+            params.append(Param(arg.arg, conv, p.typ, default))
         if fn.returns is None:
             self.rep.fatal("SE203", "missing-annotation",
                            f"method '{fn.name}' has no return annotation", span)
@@ -265,6 +285,143 @@ class TypeChecker:
                       is_template=template, cls=info.name)
         self.sigs[(mod.name, sig.name)] = sig
         return sig
+
+    def _collect_protocols(self, mod: Module) -> None:
+        """Parse every Tier-2 protocol class: method signatures with no bodies."""
+        file = str(mod.path)
+        names = self._type_names(mod)
+        for pname, pnode in mod.protocols.items():
+            names_p = dict(names)
+            names_p[pname] = TClass(mod.name, pname)
+            info = ProtoInfo(mod.name, pname)
+            body = pnode.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                body = body[1:]
+            for stmt in body:
+                span = Span(file, stmt.lineno, stmt.col_offset)
+                if isinstance(stmt, ast.Pass):
+                    continue
+                if not isinstance(stmt, ast.FunctionDef):
+                    self.rep.fatal("SE201", "unsupported-feature",
+                                   "protocol bodies may only contain method signatures", span)
+                for b in stmt.body:
+                    if not (isinstance(b, ast.Pass) or
+                            (isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant))):
+                        self.rep.fatal("SE201", "unsupported-feature",
+                                       "protocol methods have no body — write '...'",
+                                       Span(file, b.lineno, b.col_offset))
+                a = stmt.args
+                if a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg or a.defaults \
+                        or a.kw_defaults:
+                    self.rep.fatal("SE201", "unsupported-feature",
+                                   "protocol methods take plain positional parameters", span)
+                if not a.args or a.args[0].arg != "self" or a.args[0].annotation is None:
+                    self.rep.fatal("SE203", "missing-annotation",
+                                   f"protocol method '{stmt.name}' needs an annotated 'self' "
+                                   f"(Ref[{pname}] or Mut[{pname}])", span)
+                parsed = parse_annotation(a.args[0].annotation, self.rep, file,
+                                          allow_wrapper=True, names=names_p)
+                if parsed.conv not in (CONV_REF, CONV_MUT) \
+                        or parsed.typ != TClass(mod.name, pname):
+                    self.rep.fatal("SE202", "invalid-wrapper-position",
+                                   f"'self' of protocol method '{stmt.name}' must be "
+                                   f"Ref[{pname}] or Mut[{pname}]", span)
+                params = [Param("self", parsed.conv, parsed.typ)]
+                for arg in a.args[1:]:
+                    if arg.annotation is None:
+                        self.rep.fatal("SE203", "missing-annotation",
+                                       f"parameter '{arg.arg}' has no type annotation",
+                                       Span(file, arg.lineno, arg.col_offset))
+                    p = parse_annotation(arg.annotation, self.rep, file, allow_wrapper=True,
+                                         names=names)
+                    conv = p.conv
+                    if conv is None:
+                        if p.typ.is_copy():
+                            conv = CONV_COPY
+                        else:
+                            self.rep.fatal("SE203", "missing-annotation",
+                                           f"non-Copy protocol parameter '{arg.arg}' must "
+                                           f"state a convention (Owned/Ref/Mut)",
+                                           Span(file, arg.lineno, arg.col_offset))
+                    params.append(Param(arg.arg, conv, p.typ))
+                if stmt.returns is None:
+                    self.rep.fatal("SE203", "missing-annotation",
+                                   f"protocol method '{stmt.name}' has no return annotation",
+                                   span)
+                ret = parse_annotation(stmt.returns, self.rep, file, allow_wrapper=False,
+                                       names=names).typ
+                info.methods[stmt.name] = (params, ret)
+            if not info.methods:
+                self.rep.fatal("SE201", "unsupported-feature",
+                               f"protocol '{pname}' declares no methods",
+                               Span(file, pnode.lineno, pnode.col_offset))
+            self.protocols[(mod.name, pname)] = info
+
+    def _resolve_tvar_bounds(self, mod: Module) -> None:
+        """Resolve every `TypeVar(..., bound=P)` to a collected protocol."""
+        for tv, bname in mod.typevar_bounds.items():
+            if bname in mod.protocols:
+                self.tvar_bounds[(mod.name, tv)] = (mod.name, bname)
+                continue
+            if bname in mod.imports:
+                tmod, orig = mod.imports[bname]
+                if (tmod, orig) in self.protocols or orig in \
+                        self.program.modules.get(tmod, mod).protocols:
+                    self.tvar_bounds[(mod.name, tv)] = (tmod, orig)
+                    continue
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"TypeVar '{tv}' bound '{bname}' must name a Protocol class",
+                           Span(str(mod.path), 1, 0))
+
+    def _check_bounds(self, module: str, sub: dict, node: ast.AST) -> None:
+        """Enforce protocol bounds on every inferred type argument."""
+        for tv, concrete in sub.items():
+            pkey = self.tvar_bounds.get((module, tv))
+            if pkey is not None:
+                self._check_protocol(concrete, pkey, tv, node)
+
+    def _check_protocol(self, concrete: Type, pkey: tuple[str, str], tvname: str,
+                        node: ast.AST) -> None:
+        """Structurally check that a concrete class satisfies a protocol bound."""
+        pname = pkey[1]
+        proto = self.protocols[pkey]
+        label = f"protocol '{pname}' (bound of {tvname})"
+        if not isinstance(concrete, TClass):
+            self._err("SE215", "unsatisfied-protocol",
+                      f"{concrete} does not satisfy {label} — only classes can "
+                      f"implement protocols", node)
+            raise AssertionError
+        info = self.classes.get((concrete.module, concrete.name))
+        assert info is not None
+        sub2 = dict(zip(info.typevars, concrete.args))
+        for mname, (pparams, pret) in proto.methods.items():
+            m = info.methods.get(mname)
+            if m is None:
+                self._err("SE215", "unsatisfied-protocol",
+                          f"{concrete} is missing method '{mname}' required by {label}",
+                          node)
+                raise AssertionError
+            mparams = [Param(p.name, p.conv, subst_type(p.typ, sub2)) for p in m.params]
+            if len(mparams) != len(pparams):
+                self._err("SE215", "unsatisfied-protocol",
+                          f"{concrete}.{mname}() takes {len(mparams) - 1} parameter(s) but "
+                          f"{label} requires {len(pparams) - 1}", node)
+            if mparams[0].conv != pparams[0].conv:
+                self._err("SE215", "unsatisfied-protocol",
+                          f"{concrete}.{mname}() takes self by "
+                          f"{mparams[0].conv} but {label} requires {pparams[0].conv}", node)
+            for pp, mp in zip(pparams[1:], mparams[1:]):
+                if pp.conv != mp.conv or pp.typ != mp.typ:
+                    self._err("SE215", "unsatisfied-protocol",
+                              f"{concrete}.{mname}() parameter '{mp.name}' is "
+                              f"{mp.conv}[{mp.typ}] but {label} requires "
+                              f"{pp.conv}[{pp.typ}]", node)
+            mret = subst_type(m.ret, sub2)
+            if mret != pret:
+                self._err("SE215", "unsatisfied-protocol",
+                          f"{concrete}.{mname}() returns {mret} but {label} requires "
+                          f"{pret}", node)
 
     def _check_class_cycles(self) -> None:
         """Reject classes that contain themselves by value (infinite size)."""
@@ -303,6 +460,41 @@ class TypeChecker:
         return Span(str(mod.path), node.lineno, node.col_offset,
                     getattr(node, "end_col_offset", None))
 
+    def _check_default(self, pname: str, typ: Type, conv: str, default: ast.expr,
+                       file: str) -> None:
+        """Validate a Tier-2 default parameter value: literal, type-compatible."""
+        span = Span(file, default.lineno, default.col_offset)
+        if not isinstance(default, ast.Constant):
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"default value of '{pname}' must be a literal constant "
+                           f"(mutable or computed defaults are not Tier 2)", span)
+        if has_tvar(typ):
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"generic parameter '{pname}' cannot take a default value", span)
+        v = default.value
+        vt: Type
+        if isinstance(v, bool):
+            vt = BOOL
+        elif isinstance(v, int):
+            vt = INT
+        elif isinstance(v, float):
+            vt = FLOAT
+        elif isinstance(v, str):
+            vt = STR
+        elif v is None:
+            vt = NONE
+        else:
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"default value of '{pname}' must be an int/float/bool/str/None "
+                           f"literal", span)
+            raise AssertionError
+        if not self._assignable(vt, typ) and not (isinstance(typ, TFloat) and isinstance(vt, TInt)):
+            self.rep.fatal("SE214", "type-mismatch",
+                           f"default value of '{pname}' is {vt}, expected {typ}", span)
+        if conv in (CONV_REF, CONV_MUT):
+            self.rep.fatal("SE202", "invalid-wrapper-position",
+                           f"borrowed parameter '{pname}' cannot take a default value", span)
+
     def _collect_signatures(self, mod: Module) -> None:
         """Parse and validate every function signature in a module."""
         file = str(mod.path)
@@ -312,11 +504,9 @@ class TypeChecker:
             if a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg:
                 self.rep.fatal("SE201", "unsupported-feature",
                                "only plain positional parameters are Tier 0", self._span(mod, fn))
-            if a.defaults or a.kw_defaults:
-                self.rep.fatal("SE201", "unsupported-feature",
-                               "default parameter values are not Tier 0", self._span(mod, fn))
+            defaults_off = len(a.args) - len(a.defaults)
             params = []
-            for arg in a.args:
+            for i, arg in enumerate(a.args):
                 if arg.annotation is None:
                     self.rep.fatal("SE203", "missing-annotation",
                                    f"parameter '{arg.arg}' has no type annotation",
@@ -333,7 +523,10 @@ class TypeChecker:
                         self.rep.fatal("SE203", "missing-annotation",
                                        f"non-Copy parameter '{arg.arg}' must state a convention "
                                        f"(Owned/Ref/Mut)", Span(file, arg.lineno, arg.col_offset))
-                params.append(Param(arg.arg, conv, parsed.typ))
+                default = a.defaults[i - defaults_off] if i >= defaults_off else None
+                if default is not None:
+                    self._check_default(arg.arg, parsed.typ, conv, default, file)
+                params.append(Param(arg.arg, conv, parsed.typ, default))
             if fn.returns is None:
                 self.rep.fatal("SE203", "missing-annotation",
                                f"function '{fn.name}' has no return annotation", self._span(mod, fn))
@@ -393,6 +586,8 @@ class TypeChecker:
         self.sig = sig
         self.cur_facts = facts
         self.loop_refs: list[dict[str, str]] = []
+        self.comp_borrows: list[list[str]] = []
+        self.with_targets: list[str] = []
         self.loop_depth = 0
         self.try_stack: list[dict] = []
         self.handler_depth = 0
@@ -418,7 +613,8 @@ class TypeChecker:
 
     def _instantiate(self, template: FuncSig, sub: dict, node: ast.AST) -> FuncSig:
         """Monomorphize a generic function/method for a concrete substitution."""
-        params = [Param(p.name, p.conv, subst_type(p.typ, sub)) for p in template.params]
+        params = [Param(p.name, p.conv, subst_type(p.typ, sub), p.default)
+                  for p in template.params]
         ret = subst_type(template.ret, sub)
         mangle = "_".join(mangle_type(sub[k]) for k in sorted(sub))
         inst_name = f"{template.name}__{mangle}" if sub else template.name
@@ -434,11 +630,13 @@ class TypeChecker:
             if p.conv == CONV_OWNED and p.typ.is_copy():
                 p.conv = CONV_COPY
         saved = (self.env, self.mod, self.fn, self.sig, self.cur_facts, self.loop_refs,
-                 self.loop_depth, self.try_stack, self.handler_depth)
+                 self.loop_depth, self.try_stack, self.handler_depth, self.comp_borrows,
+                 self.with_targets)
         target_mod = self.program.modules[template.module]
         self._check_function(target_mod, node_copy, inst)
         (self.env, self.mod, self.fn, self.sig, self.cur_facts, self.loop_refs,
-         self.loop_depth, self.try_stack, self.handler_depth) = saved
+         self.loop_depth, self.try_stack, self.handler_depth, self.comp_borrows,
+         self.with_targets) = saved
         return inst
 
     def _err(self, code: str, name: str, msg: str, node: ast.AST, label: str = "",
@@ -475,7 +673,9 @@ class TypeChecker:
         if isinstance(stmt, ast.Raise):
             self._check_raise(stmt, narrow)
             return narrow, True
-        if isinstance(stmt, (ast.With, ast.Match, ast.Assert, ast.Delete, ast.Global,
+        if isinstance(stmt, ast.With):
+            return self._check_with(stmt, narrow)
+        if isinstance(stmt, (ast.Match, ast.Assert, ast.Delete, ast.Global,
                              ast.Nonlocal, ast.Import, ast.ImportFrom,
                              ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             self._err("SE201", "unsupported-feature",
@@ -617,6 +817,36 @@ class TypeChecker:
             return
         self._err("SE201", "unsupported-feature",
                   "raise takes a known exception class or class(message)", stmt)
+
+    def _check_with(self, stmt: ast.With, narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
+        """Tier-2 `with open(...) as f:` — RAII sugar; f closes and scopes to the block."""
+        if len(stmt.items) != 1:
+            self._err("SE201", "unsupported-feature",
+                      "with takes exactly one context manager in Tier 2", stmt)
+        item = stmt.items[0]
+        ctx = item.context_expr
+        if not (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name)
+                and ctx.func.id == "open"):
+            self._err("SE201", "unsupported-feature",
+                      "with supports only open(...) in Tier 2", ctx)
+        self._type_expr(ctx, narrow)
+        if item.optional_vars is None or not isinstance(item.optional_vars, ast.Name):
+            self._err("SE201", "unsupported-feature",
+                      "with open(...) needs a single 'as <name>' target", stmt)
+        name = item.optional_vars.id
+        if name in self.env:
+            self._err("SE201", "unsupported-feature",
+                      f"with target '{name}' shadows an existing variable — use a fresh name",
+                      item.optional_vars)
+        self.env[name] = (TFile(), "local")
+        self.expr_types[id(item.optional_vars)] = TFile()
+        self.with_targets.append(name)
+        assigned = self._assigned_names(stmt.body)
+        body_narrow = {k: v for k, v in narrow.items() if k not in assigned}
+        _, term = self._check_block(stmt.body, body_narrow)
+        self.with_targets.pop()
+        self.env.pop(name, None)
+        return {k: v for k, v in narrow.items() if k not in assigned}, term
 
     def _check_return(self, stmt: ast.Return, narrow: dict[str, Type]) -> None:
         if stmt.value is None:
@@ -842,6 +1072,9 @@ class TypeChecker:
         elems: tuple[Type, ...]
         if isinstance(iter_t, TList):
             elems = (iter_t.elem,)
+        elif isinstance(iter_t, TStr):
+            kind = "str"
+            elems = (STR,)
         elif isinstance(iter_t, TIter):
             kind = iter_t.kind
             elems = iter_t.elem
@@ -890,7 +1123,8 @@ class TypeChecker:
         if isinstance(e, ast.Call):
             if isinstance(e.func, ast.Name) and e.func.id == "range":
                 return None
-            if isinstance(e.func, ast.Name) and e.func.id == "enumerate" and e.args:
+            if isinstance(e.func, ast.Name) and e.func.id in ("enumerate", "reversed", "zip") \
+                    and e.args:
                 e = e.args[0]
             elif isinstance(e.func, ast.Attribute):
                 e = e.func.value
@@ -941,11 +1175,15 @@ class TypeChecker:
         return t
 
     def _type_expr_inner(self, node: ast.expr, narrow: dict[str, Type], expect: Type | None) -> Type:
-        if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp,
-                             ast.GeneratorExp, ast.NamedExpr, ast.Await, ast.Yield,
-                             ast.YieldFrom, ast.Starred, ast.Set, ast.Slice)):
+        if isinstance(node, (ast.Lambda, ast.SetComp, ast.GeneratorExp, ast.NamedExpr,
+                             ast.Await, ast.Yield, ast.YieldFrom, ast.Starred, ast.Set)):
             self._err("SE201", "unsupported-feature",
                       f"'{type(node).__name__}' is not in the Tier-0 grammar", node)
+        if isinstance(node, ast.Slice):
+            self._err("SE201", "unsupported-feature",
+                      "slices are only allowed directly inside a str subscript (s[a:b])", node)
+        if isinstance(node, (ast.ListComp, ast.DictComp)):
+            return self._type_comprehension(node, narrow)
         if isinstance(node, ast.Constant):
             return self._const_type(node)
         if isinstance(node, ast.Name):
@@ -1099,6 +1337,25 @@ class TypeChecker:
         base = self._type_expr(node.value, narrow)
         if isinstance(base, TShared):
             base = base.inner
+        if isinstance(base, TStr):
+            if isinstance(node.slice, ast.Slice):
+                if node.slice.step is not None:
+                    self._err("SE201", "unsupported-feature",
+                              "str slicing with a step is not Tier 2 — use s[a:b]", node.slice)
+                for bound in (node.slice.lower, node.slice.upper):
+                    if bound is not None:
+                        bt = self._type_expr(bound, narrow)
+                        if not isinstance(bt, TInt):
+                            self._err("SE214", "type-mismatch",
+                                      f"str slice bounds must be int, got {bt}", bound)
+                return STR
+            it = self._type_expr(node.slice, narrow)
+            if not isinstance(it, TInt):
+                self._err("SE214", "type-mismatch", f"str index must be int, got {it}", node.slice)
+            return STR
+        if isinstance(node.slice, ast.Slice):
+            self._err("SE201", "unsupported-feature",
+                      "slicing is Tier-2 for str only (s[a:b])", node.slice)
         idx = self._type_expr(node.slice, narrow)
         if isinstance(base, TList):
             if not isinstance(idx, TInt):
@@ -1220,7 +1477,8 @@ class TypeChecker:
     # ---------- calls ----------
 
     def _type_call(self, node: ast.Call, narrow: dict[str, Type], expect: Type | None) -> Type:
-        if node.keywords:
+        is_sorted = isinstance(node.func, ast.Name) and node.func.id == "sorted"
+        if node.keywords and not is_sorted:
             self._err("SE201", "unsupported-feature", "keyword arguments are not Tier 0", node)
         if isinstance(node.func, ast.Attribute):
             return self._type_method_call(node, narrow)
@@ -1255,12 +1513,149 @@ class TypeChecker:
         if cls is not None:
             return self._type_ctor(node, cls, narrow)
         if name in ("eval", "exec", "globals", "locals", "compile", "id",
-                    "sorted", "map", "filter", "zip", "any", "all", "type", "isinstance"):
+                    "map", "filter", "any", "all", "type", "isinstance"):
             self._err("SE201", "unsupported-feature", f"'{name}' is not a Tier-0/1 builtin", node)
         sig = self._resolve_callee(self.mod, name)
         if sig is not None:
             return self._type_user_call(node, sig, narrow)
         return self._type_builtin_call(node, name, narrow)
+
+    def _type_sorted(self, node: ast.Call, ts: list[Type], narrow: dict[str, Type]) -> Type:
+        """Type sorted(xs) and sorted(xs, key=lambda v: ...) (Tier 2)."""
+        args = node.args
+        if len(args) != 1:
+            self._err("SE214", "type-mismatch",
+                      "sorted() takes exactly one positional argument", node)
+        t0 = ts[0].inner if isinstance(ts[0], TShared) else ts[0]
+        if not isinstance(t0, TList):
+            self._err("SE214", "type-mismatch", f"sorted() takes a list, got {ts[0]}", node)
+        elem = t0.elem
+        key = None
+        for kw in node.keywords:
+            if kw.arg != "key":
+                self._err("SE201", "unsupported-feature",
+                          f"sorted() keyword '{kw.arg}' is not Tier 2 (only key=lambda)", node)
+            key = kw.value
+        if key is None:
+            if not isinstance(elem, (TInt, TFloat, TStr)):
+                self._err("SE214", "type-mismatch",
+                          f"sorted() without a key needs int/float/str elements, got {t0}",
+                          node)
+            return TList(elem)
+        if not elem.is_copy():
+            self._err("SE211", "extend-non-copy",
+                      f"sorted(key=...) on {t0} would bulk-copy non-Copy elements — "
+                      f"sort a list of Copy keys instead", node)
+        if not isinstance(key, ast.Lambda):
+            self._err("SE201", "unsupported-feature",
+                      "sorted() key must be an inline lambda in Tier 2", key)
+        la = key.args
+        if la.posonlyargs or la.kwonlyargs or la.vararg or la.kwarg or la.defaults \
+                or len(la.args) != 1:
+            self._err("SE201", "unsupported-feature",
+                      "sorted() key lambda takes exactly one plain parameter", key)
+        pname = la.args[0].arg
+        saved = self.env.get(pname)
+        self.env[pname] = (elem, "local")
+        root = self._borrowable_root(args[0])
+        self.comp_borrows.append(([root] if root else []) + [pname])
+        body_narrow = dict(narrow)
+        body_narrow.pop(pname, None)
+        kt = self._type_expr(key.body, body_narrow)
+        self.comp_borrows.pop()
+        if saved is None:
+            self.env.pop(pname, None)
+        else:
+            self.env[pname] = saved
+        if not isinstance(kt, (TInt, TFloat, TStr)):
+            self._err("SE214", "type-mismatch",
+                      f"sorted() key must return int/float/str, got {kt}", key.body)
+        self.lambda_elems[id(key)] = elem
+        return TList(elem)
+
+    def _comp_transfer_check(self, value: ast.expr, typ: Type) -> None:
+        """Reject comprehensions that would copy a live non-Copy place out."""
+        if typ.is_copy():
+            return
+        if isinstance(value, (ast.Name, ast.Attribute, ast.Subscript)):
+            self._err("SE003", "implicit-transfer",
+                      "a comprehension may only produce Copy values or freshly "
+                      "constructed ones — this would silently copy a non-Copy value",
+                      value)
+
+    def _type_comprehension(self, node: ast.expr, narrow: dict[str, Type]) -> Type:
+        """Type a list or dict comprehension (Tier 2: one for clause, one optional if)."""
+        assert isinstance(node, (ast.ListComp, ast.DictComp))
+        gens = node.generators
+        if len(gens) != 1:
+            self._err("SE201", "unsupported-feature",
+                      "comprehensions take exactly one 'for' clause in Tier 2", node)
+        gen = gens[0]
+        if gen.is_async:
+            self._err("SE201", "unsupported-feature", "async comprehensions are not supported", node)
+        if len(gen.ifs) > 1:
+            self._err("SE201", "unsupported-feature",
+                      "comprehensions take at most one 'if' clause in Tier 2", node)
+        iter_t = self._type_expr(gen.iter, narrow)
+        kind = "list"
+        elems: tuple[Type, ...]
+        if isinstance(iter_t, TList):
+            elems = (iter_t.elem,)
+        elif isinstance(iter_t, TStr):
+            kind = "str"
+            elems = (STR,)
+        elif isinstance(iter_t, TIter):
+            kind = iter_t.kind
+            elems = iter_t.elem
+        else:
+            self._err("SE214", "type-mismatch", f"cannot iterate over {iter_t}", gen.iter)
+            raise AssertionError
+        self.loop_iter_kind[id(node)] = kind
+        targets: list[ast.Name] = []
+        if isinstance(gen.target, ast.Name):
+            targets = [gen.target]
+        elif isinstance(gen.target, ast.Tuple) and len(gen.target.elts) == 2 \
+                and all(isinstance(e, ast.Name) for e in gen.target.elts):
+            targets = list(gen.target.elts)  # type: ignore[arg-type]
+        else:
+            self._err("SE201", "unsupported-feature",
+                      "comprehension target must be one or two names", gen.target)
+        if len(targets) != len(elems):
+            self._err("SE214", "type-mismatch",
+                      f"comprehension target unpacks {len(targets)} names but iterator "
+                      f"yields {len(elems)}", gen.target)
+        saved: dict[str, tuple | None] = {}
+        for tgt, et in zip(targets, elems):
+            saved[tgt.id] = self.env.get(tgt.id)
+            self.env[tgt.id] = (et, "local")
+        root = self._borrowable_root(gen.iter)
+        self.comp_borrows.append(([root] if root else []) + [t.id for t in targets])
+        body_narrow = {k: v for k, v in narrow.items()
+                       if k not in {t.id for t in targets}}
+        if gen.ifs:
+            ct = self._type_expr(gen.ifs[0], body_narrow)
+            if not isinstance(ct, TBool):
+                self._err("SE214", "type-mismatch",
+                          f"comprehension condition must be bool, got {ct}", gen.ifs[0])
+            body_narrow, _neg = self._narrow_from_test(gen.ifs[0], body_narrow)
+        if isinstance(node, ast.DictComp):
+            kt = self._type_expr(node.key, body_narrow)
+            if not kt.is_copy():
+                self._err("SE214", "type-mismatch", "dict keys must be Copy types", node.key)
+            vt = self._type_expr(node.value, body_narrow)
+            self._comp_transfer_check(node.value, vt)
+            result: Type = TDict(kt, vt)
+        else:
+            et2 = self._type_expr(node.elt, body_narrow)
+            self._comp_transfer_check(node.elt, et2)
+            result = TList(et2)
+        self.comp_borrows.pop()
+        for name, old in saved.items():
+            if old is None:
+                self.env.pop(name, None)
+            else:
+                self.env[name] = old
+        return result
 
     def _resolve_class(self, mod: Module, name: str) -> ClassInfo | None:
         if (mod.name, name) in self.classes:
@@ -1325,6 +1720,7 @@ class TypeChecker:
                           f"cannot infer type argument(s) {', '.join(missing)} for "
                           f"{cls.name} — annotate the target", node)
             args = tuple(sub[tv] for tv in cls.typevars)
+        self._check_bounds(cls.module, sub, node)
         t = TClass(cls.module, cls.name, args)
         self.ctor_calls[id(node)] = (cls.module, cls.name, args)
         return t
@@ -1369,6 +1765,15 @@ class TypeChecker:
                 self._err("SE007", "move-loop-variable",
                           f"'{arg.id}' is a per-iteration Ref loop variable and cannot be moved",
                           node)
+        for scope in self.comp_borrows:
+            if arg.id in scope:
+                self._err("SE005", "move-while-borrowed",
+                          f"'{arg.id}' is borrowed by an enclosing comprehension or key "
+                          f"lambda and cannot be moved there", node)
+        if arg.id in self.with_targets:
+            self._err("SE005", "move-while-borrowed",
+                      f"cannot move '{arg.id}' out of its 'with' block — the file closes "
+                      f"at block end", node)
         conv = self.env.get(arg.id, (None, None))[1]
         if conv in (CONV_REF, CONV_MUT):
             self._err("SE008", "move-out-of-borrow",
@@ -1411,6 +1816,11 @@ class TypeChecker:
                 self._err("SE004", "conflicting-borrow",
                           f"'{root}' is a per-iteration Ref loop variable — it cannot be "
                           f"mutated through", node)
+        for scope in self.comp_borrows:
+            if root in scope:
+                self._err("SE004", "conflicting-borrow",
+                          f"'{root}' is borrowed by an enclosing comprehension or key "
+                          f"lambda — it cannot be mutated there", node)
 
     def _mut_borrow_place(self, e: ast.expr, node: ast.AST) -> None:
         root = self._borrow_root(e)
@@ -1424,9 +1834,12 @@ class TypeChecker:
             narrow.pop(root, None)
 
     def _type_user_call(self, node: ast.Call, sig: FuncSig, narrow: dict[str, Type]) -> Type:
-        if len(node.args) != len(sig.params):
+        required = len([p for p in sig.params if p.default is None])
+        if not (required <= len(node.args) <= len(sig.params)):
+            want = str(len(sig.params)) if required == len(sig.params) \
+                else f"{required} to {len(sig.params)}"
             self._err("SE214", "type-mismatch",
-                      f"'{sig.name}' takes {len(sig.params)} arguments, got {len(node.args)}", node)
+                      f"'{sig.name}' takes {want} arguments, got {len(node.args)}", node)
         if sig.is_template:
             sub: dict = {}
             arg_ts = []
@@ -1449,6 +1862,7 @@ class TypeChecker:
                 self._err("SE214", "type-mismatch",
                           f"cannot infer type argument(s) {', '.join(missing)} for "
                           f"'{sig.name}'", node)
+            self._check_bounds(sig.module, sub, node)
             sig = self._instantiate(sig, sub, node)
             return self._finish_user_call(node, sig, narrow, pre_typed=arg_ts)
         return self._finish_user_call(node, sig, narrow, pre_typed=None)
@@ -1516,6 +1930,16 @@ class TypeChecker:
             if not isinstance(ts[0], TList):
                 self._err("SE214", "type-mismatch", "enumerate() takes a list in Tier 0", node)
             return TIter("enumerate", (INT, ts[0].elem))
+        if name == "zip":
+            arity(2)
+            if not (isinstance(ts[0], TList) and isinstance(ts[1], TList)):
+                self._err("SE214", "type-mismatch", "zip() takes two lists in Tier 2", node)
+            return TIter("zip", (ts[0].elem, ts[1].elem))
+        if name == "reversed":
+            arity(1)
+            if not isinstance(ts[0], TList):
+                self._err("SE214", "type-mismatch", "reversed() takes a list in Tier 2", node)
+            return TIter("reversed", (ts[0].elem,))
         if name == "sum":
             arity(1)
             if isinstance(ts[0], TList) and isinstance(ts[0].elem, NUMERIC):
@@ -1555,6 +1979,28 @@ class TypeChecker:
             if not isinstance(ts[0], (TInt, TFloat, TBool, TStr)):
                 self._err("SE214", "type-mismatch", f"bool() cannot convert {ts[0]}", node)
             return BOOL
+        if name == "round":
+            if len(args) not in (1, 2):
+                self._err("SE214", "type-mismatch", "round() takes 1 or 2 arguments", node)
+            if isinstance(ts[0], TBool) or not isinstance(ts[0], NUMERIC):
+                self._err("SE214", "type-mismatch", f"round() needs a number, got {ts[0]}", node)
+            if len(args) == 2:
+                if not isinstance(ts[1], TInt):
+                    self._err("SE214", "type-mismatch", "round() ndigits must be int", args[1])
+                return ts[0]
+            return INT
+        if name == "ord":
+            arity(1)
+            if not isinstance(ts[0], TStr):
+                self._err("SE214", "type-mismatch", f"ord() expects a str, got {ts[0]}", node)
+            return INT
+        if name == "chr":
+            arity(1)
+            if not isinstance(ts[0], TInt):
+                self._err("SE214", "type-mismatch", f"chr() expects an int, got {ts[0]}", node)
+            return STR
+        if name == "sorted":
+            return self._type_sorted(node, ts, narrow)
         if name == "input":
             if len(args) > 1:
                 self._err("SE214", "type-mismatch", "input() takes at most one argument", node)
@@ -1618,10 +2064,14 @@ class TypeChecker:
             self._err("SE214", "type-mismatch", f"{rt} has no method '{method}'", node)
             raise AssertionError
         sub: dict = dict(zip(info.typevars, rt.args))
-        params = [Param(p.name, p.conv, subst_type(p.typ, sub)) for p in tmpl.params]
-        if len(args) != len(params) - 1:
+        params = [Param(p.name, p.conv, subst_type(p.typ, sub), p.default)
+                  for p in tmpl.params]
+        required = len([p for p in params[1:] if p.default is None])
+        if not (required <= len(args) <= len(params) - 1):
+            want = str(len(params) - 1) if required == len(params) - 1 \
+                else f"{required} to {len(params) - 1}"
             self._err("SE214", "type-mismatch",
-                      f".{method}() takes {len(params) - 1} argument(s), got {len(args)}", node)
+                      f".{method}() takes {want} argument(s), got {len(args)}", node)
         method_tvars = {t.name for p in params for t in self._walk(p.typ) if isinstance(t, TVar)}
         for arg, at, p in zip(args, ts, params[1:]):
             if not unify(p.typ, at, sub) and not self._assignable(at, subst_type(p.typ, sub)):
@@ -1632,6 +2082,7 @@ class TypeChecker:
             self._err("SE214", "type-mismatch",
                       f"cannot infer type argument(s) {', '.join(missing)} for "
                       f".{method}()", node)
+        self._check_bounds(tmpl.module, sub, node)
         if tmpl.is_template:
             sig = self._instantiate(tmpl, sub, node)
         else:

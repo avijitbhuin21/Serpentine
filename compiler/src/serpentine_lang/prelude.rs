@@ -425,6 +425,73 @@ fn py_find(s: &str, sub: &str) -> i64 {
 fn py_replace(s: &str, from: &str, to: &str) -> SStr { sstring(s.replace(from, to)) }
 fn py_contains_str(hay: &str, needle: &str) -> bool { hay.contains(needle) }
 
+fn py_chars(s: &str) -> impl Iterator<Item = SStr> + '_ {
+    s.chars().map(|c| sstring(c.to_string()))
+}
+fn py_str_idx(s: &str, i: i64) -> SRes<SStr> {
+    let n = s.chars().count() as i64;
+    let j = if i < 0 { i + n } else { i };
+    if j < 0 || j >= n { return serp_err("IndexError", "string index out of range".into()); }
+    Ok(sstring(s.chars().nth(j as usize).unwrap().to_string()))
+}
+fn py_str_slice(s: &str, lo: Option<i64>, hi: Option<i64>) -> SStr {
+    let n = s.chars().count() as i64;
+    let norm = |v: i64| -> i64 {
+        let x = if v < 0 { v + n } else { v };
+        x.clamp(0, n)
+    };
+    let a = norm(lo.unwrap_or(0));
+    let b = norm(hi.unwrap_or(n));
+    if a >= b { return sstr(""); }
+    sstring(s.chars().skip(a as usize).take((b - a) as usize).collect::<String>())
+}
+fn py_ord(s: &str) -> SRes<i64> {
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), None) => Ok(c as i64),
+        _ => serp_err("TypeError", format!(
+            "ord() expected a character, but string of length {} found", s.chars().count())),
+    }
+}
+fn py_chr(i: i64) -> SRes<SStr> {
+    if i < 0 || i >= 0x110000 {
+        return serp_err("ValueError", "chr() arg not in range(0x110000)".into());
+    }
+    match char::from_u32(i as u32) {
+        Some(c) => Ok(sstring(c.to_string())),
+        None => serp_err("ValueError", "chr() arg not in range(0x110000)".into()),
+    }
+}
+
+fn round_ties_even_f(x: f64) -> f64 {
+    if (x - x.trunc()).abs() == 0.5 { 2.0 * (x / 2.0).round() } else { x.round() }
+}
+fn py_round0(x: f64) -> SRes<i64> {
+    if x.is_nan() { return serp_err("ValueError", "cannot convert float NaN to integer".into()); }
+    if x.is_infinite() { return serp_err("OverflowError", "cannot convert float infinity to integer".into()); }
+    let r = round_ties_even_f(x);
+    if r < (i64::MIN as f64) || r > (i64::MAX as f64) {
+        return serp_err("OverflowError", OVERFLOW_MSG.into());
+    }
+    Ok(r as i64)
+}
+fn py_round_n(x: f64, n: i64) -> f64 {
+    if x.is_nan() || x.is_infinite() { return x; }
+    if n >= 0 {
+        let p = n.min(400) as usize;
+        format!("{:.*}", p, x).parse::<f64>().unwrap_or(x)
+    } else {
+        let scale = 10f64.powi((-n).min(400) as i32);
+        round_ties_even_f(x / scale) * scale
+    }
+}
+
+fn serp_sorted<T: PartialOrd + Clone>(v: &Vec<T>) -> Vec<T> {
+    let mut c = v.clone();
+    c.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    c
+}
+
 // ---------- conversions ----------
 
 fn py_int_from_str(s: &str) -> SRes<i64> {

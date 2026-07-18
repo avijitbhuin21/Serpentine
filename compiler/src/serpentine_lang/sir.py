@@ -103,6 +103,16 @@ class Lowerer:
             self._lower_stmt(stmt)
 
     def _lower_stmt(self, stmt: ast.stmt) -> None:
+        if isinstance(stmt, ast.With):
+            item = stmt.items[0]
+            self._lower_expr(item.context_expr)
+            assert isinstance(item.optional_vars, ast.Name)
+            name = item.optional_vars.id
+            self._emit("def", name, stmt)
+            self._lower_block(stmt.body)
+            if not self.cur.is_exit:
+                self._emit("drop", name, stmt)
+            return
         if isinstance(stmt, ast.Try):
             self._lower_try(stmt)
             return
@@ -224,10 +234,10 @@ class Lowerer:
             return
         if isinstance(stmt, ast.For):
             self._lower_expr(stmt.iter)
-            borrowed = self._for_borrow_root(stmt.iter)
-            if borrowed:
-                self._emit("borrow_begin", borrowed, stmt)
-                self.loan_stack.append((borrowed, "ref"))
+            borrowed = self._for_borrow_roots(stmt.iter)
+            for b in borrowed:
+                self._emit("borrow_begin", b, stmt)
+                self.loan_stack.append((b, "ref"))
             head = self._new_block()
             self._goto(head)
             self.cur = head
@@ -244,11 +254,11 @@ class Lowerer:
             if not self.cur.is_exit:
                 self.cur.succs.append(head.id)
             self.loop_stack.pop()
-            if borrowed:
+            for _b in borrowed:
                 self.loan_stack.pop()
             self.cur = exit_b
-            if borrowed:
-                self._emit("borrow_end", borrowed, stmt)
+            for b in borrowed:
+                self._emit("borrow_end", b, stmt)
             return
 
     def _lower_try(self, stmt: ast.Try) -> None:
@@ -301,26 +311,56 @@ class Lowerer:
             return e.id
         return None
 
-    def _for_borrow_root(self, iter_expr: ast.expr) -> str | None:
-        """The root variable a for loop Ref-borrows for its body (range: none)."""
+    def _for_borrow_roots(self, iter_expr: ast.expr) -> list[str]:
+        """The root variables a for loop Ref-borrows for its body (range: none)."""
         e = iter_expr
+        exprs = [e]
         if isinstance(e, ast.Call):
             if isinstance(e.func, ast.Name) and e.func.id == "range":
-                return None
-            if isinstance(e.func, ast.Name) and e.func.id == "enumerate" and e.args:
-                e = e.args[0]
+                return []
+            if isinstance(e.func, ast.Name) and e.func.id == "zip":
+                exprs = list(e.args)
+            elif isinstance(e.func, ast.Name) and e.func.id in ("enumerate", "reversed",
+                                                                "sorted") and e.args:
+                exprs = [e.args[0]]
             elif isinstance(e.func, ast.Attribute):
-                e = e.func.value
-        root = self._root_of(e) if not isinstance(e, ast.Call) else None
-        if root is not None and not self._is_copy_var(root):
-            return root
-        return None
+                exprs = [e.func.value]
+            else:
+                return []
+        out = []
+        for ex in exprs:
+            if isinstance(ex, ast.Call):
+                continue
+            root = self._root_of(ex)
+            if root is not None and not self._is_copy_var(root):
+                out.append(root)
+        return out
 
     MUT_LIST_METHODS = {"append", "insert", "pop", "extend", "clear", "reverse", "sort"}
 
     def _lower_expr(self, e: ast.expr) -> None:
         """Emit use/move/mut_use ops for every place read in an expression."""
         facts = self.tc.facts[(self.sig.module, self.sig.name)]
+        if isinstance(e, (ast.ListComp, ast.DictComp)):
+            gen = e.generators[0]
+            self._lower_expr(gen.iter)
+            roots = self._for_borrow_roots(gen.iter)
+            for r in roots:
+                self.loan_stack.append((r, "ref"))
+            targets = [gen.target] if isinstance(gen.target, ast.Name) else list(gen.target.elts)
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    self._emit("def", t.id, e)
+            for cond in gen.ifs:
+                self._lower_expr(cond)
+            if isinstance(e, ast.DictComp):
+                self._lower_expr(e.key)
+                self._lower_expr(e.value)
+            else:
+                self._lower_expr(e.elt)
+            for _r in roots:
+                self.loan_stack.pop()
+            return
         if isinstance(e, ast.Name):
             if isinstance(e.ctx, ast.Load):
                 self._emit("use", e.id, e)
@@ -398,6 +438,18 @@ class Lowerer:
                         root = self._root_of(a)
                         if root:
                             self._emit("mut_use", root, e)
+                for kw in e.keywords:
+                    v = kw.value
+                    if isinstance(v, ast.Lambda):
+                        roots = self._for_borrow_roots(e.args[0]) if e.args else []
+                        for r in roots:
+                            self.loan_stack.append((r, "ref"))
+                        self._emit("def", v.args.args[0].arg, v)
+                        self._lower_expr(v.body)
+                        for _r in roots:
+                            self.loan_stack.pop()
+                    else:
+                        self._lower_expr(v)
                 return
         for child in ast.iter_child_nodes(e):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):

@@ -1,13 +1,13 @@
 # serp-reject: SE201 unsupported-feature
-"""Reject: default parameter values are not in the Tier-0 grammar (3.2)."""
+"""Reject: Tier-2 default parameter values must be literal constants."""
 
 
-def greet(name: str = "world") -> None:  # E: SE201
-    print(name)
+def scaled(n: int = 2 * 21) -> int:  # E: SE201
+    return n
 
 
 def main() -> None:
-    greet()
+    print(scaled())
 
 
 if __name__ == "__main__":

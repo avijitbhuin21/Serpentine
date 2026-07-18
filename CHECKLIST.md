@@ -68,12 +68,12 @@
 
 ## Phase 4 — Ecosystem & Release
 
-- [ ] Design + implement the CPython interop boundary (deep-copy or refuse) (§5.12)
-- [ ] Tier-2 features in demand order from corpus data: closures, protocols, iterators, `with` (§3.1)
-- [ ] Refactor checker-as-library, ship LSP for editor diagnostics (§5.13)
-- [ ] North-star demo: JSON parser developed under CPython, deployed as native binary (§9)
-- [ ] Docs: language tour, ownership guide, divergence page, migration notes
-- [ ] Publish `serpentine-lang` v0.1 + announce
+- [x] Design + implement the CPython interop boundary (deep-copy or refuse) (§5.12) — `docs/interop.md` + DECISIONS.md D6: v0.1 refuses (SE213 states the policy); deep-copy boundary fully specified for when demand arrives
+- [x] Tier-2 features in demand order from corpus data: closures, protocols, iterators, `with` (§3.1) — shipped: comprehensions, str index/slice, `sorted` (+`key=` lambda closures), `with open`, default params, `zip`/`reversed`/str iteration, `round`/`ord`/`chr`, structural protocols as generic bounds (SE215); user-defined `__iter__`/`__next__` deferred by D7 (stored borrows; zero corpus demand); SPEC.md §14
+- [x] Refactor checker-as-library, ship LSP for editor diagnostics (§5.13) — `serpentine_lang.api` (check_file/check_source with buffer overlays) + `serp lsp` (stdio, dependency-free); `tools/run_lsp_smoke.py`
+- [x] North-star demo: JSON parser developed under CPython, deployed as native binary (§9) — `examples/json_parser.py` (full escapes incl. surrogate pairs, error recovery); byte-identical dual-run; locked into the corpus as `tests/accept/055_json_roundtrip.py`
+- [x] Docs: language tour, ownership guide, divergence page, migration notes — `docs/tour.md`, `docs/ownership.md`, `docs/divergences.md`, `docs/migration.md` (+ `docs/interop.md`)
+- [ ] Publish `serpentine-lang` v0.1 + announce — *sdists + wheels built (`dist/`, serpentine-shim 0.3.0 + serpentine-lang 0.3.0), twine-checked; the upload itself and the announcement need the owner's PyPI credentials (same blocker as the Phase-0 registration box)*
 
 ## Bonus — Phase 4 backlog (readiness-report findings, 2026-07-17)
 
@@ -81,12 +81,12 @@
 > (`docs/corpus-study.md`). Items feed into the Phase-4 boxes above.
 
 ### Daily-tool ergonomics (fastest path to "use it for local things")
-- [ ] List/dict comprehensions (top corpus rejection; desugars to loop + append, no ownership novelty)
-- [ ] String slicing `s[a:b]` (missing entirely — bites every text tool)
-- [ ] `sorted(xs)` keyless (no closures needed)
-- [ ] `with open(...) as f:` RAII sugar (Tier-2 §3.1, high demand)
-- [ ] Default parameter values
-- [ ] Small builtin gaps: `round()`, `str.format`-adjacent specs, more str/dict methods
+- [x] List/dict comprehensions (top corpus rejection; desugars to loop + append, no ownership novelty) — *landed with Phase 4 (SPEC §14)*
+- [x] String slicing `s[a:b]` (missing entirely — bites every text tool) — *landed with Phase 4 (+ `s[i]` indexing, str iteration)*
+- [x] `sorted(xs)` keyless (no closures needed) — *landed with Phase 4, plus `key=lambda` (Copy elements)*
+- [x] `with open(...) as f:` RAII sugar (Tier-2 §3.1, high demand) — *landed with Phase 4*
+- [x] Default parameter values — *landed with Phase 4 (literal defaults, functions + methods)*
+- [x] Small builtin gaps: `round()`, `str.format`-adjacent specs, more str/dict methods — *`round`/`ord`/`chr`/`zip`/`reversed` landed; `str.format` itself stays out (f-strings cover it); further str/dict methods by demand*
 - [ ] Named element borrows (scoped borrow of `rows[0]` — most-wanted ergonomic fix from the corpus study)
 - [ ] `is None` narrowing on field places (currently plain names only)
 
@@ -97,8 +97,8 @@
 ### Library-building prerequisites
 - [ ] Multi-package/module resolution design (imports are single-directory bin-1 only; libraries ship as source under whole-program compilation)
 - [ ] Cross-library API conventions: ownership in public signatures, monomorphization across package boundaries
-- [ ] Protocols/traits + closures (blocking any real library API surface; Tier 2)
-- [ ] Iterators as first-class borrows (Tier 2)
+- [x] Protocols/traits + closures (blocking any real library API surface; Tier 2) — *structural protocols as generic bounds landed (SE215); closures landed as the `sorted key=` subset — general closures still open*
+- [ ] Iterators as first-class borrows (Tier 2) — *scoped by DECISIONS.md D7: needs named-borrow machinery; built-in iterator forms (`zip`/`reversed`/str) landed*
 
 ### Housekeeping
 - [ ] Bump CI actions (checkout@v4 / setup-python@v5) to silence Node-20 deprecation annotations

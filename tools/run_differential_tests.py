@@ -5,6 +5,7 @@ Usage: python tools/run_differential_tests.py [--check-only] [pattern]
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -24,8 +25,13 @@ def collect(pattern: str) -> list[Path]:
 
 
 def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    """Run a command capturing output with a timeout."""
-    return subprocess.run(cmd, capture_output=True, timeout=120, cwd=str(cwd))
+    """Run a command capturing output with a timeout; CPython stdout pinned to UTF-8.
+
+    Native binaries always emit UTF-8; PYTHONIOENCODING pins CPython to the same
+    (it already is on Linux/macOS — this normalizes Windows' cp1252 pipes).
+    """
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    return subprocess.run(cmd, capture_output=True, timeout=120, cwd=str(cwd), env=env)
 
 
 def main() -> int:

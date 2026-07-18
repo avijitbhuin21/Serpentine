@@ -419,6 +419,7 @@ they are frozen once released.
 | SE212 | get-non-copy |
 | SE213 | foreign-import |
 | SE214 | type-mismatch |
+| SE215 | unsatisfied-protocol (Tier 2) |
 
 Diagnostic format: `error[SE001]: use of moved value 'xs'` with a primary source span;
 Phase 2 added secondary "value moved here" labels and `help:` suggestion lines.
@@ -454,3 +455,50 @@ this section records the shipped surface and its rules of thumb.
   `sys.exit(int)`.
 - **`from __future__ import annotations`** — permitted and recommended in files that
   mention class names in annotations (CPython forward-reference parity).
+
+---
+
+## 14. Tier-2 surface (Phase 4) — summary
+
+Shipped in demand order from the Phase-2 corpus study (`docs/corpus-study.md`).
+Normative details live in the implementation + test corpus (tests/accept/050–055,
+tests/reject/r029, r036, r051, r052).
+
+- **str indexing & slicing** — `s[i]` (negative indices; out of range raises
+  `IndexError: string index out of range`) and `s[a:b]` (clamping, negatives, no step;
+  a step slice is SE201). Slicing is str-only in Tier 2.
+- **Comprehensions** — `[expr for x in it if cond]` and `{k: v for x in it if cond}`;
+  exactly one `for` clause, at most one `if` clause; targets are one or two names.
+  The iterable is Ref-borrowed for the whole expression (mutating or moving anything
+  it reaches inside the body is SE004/SE005); the element expression must produce a
+  Copy or freshly-constructed value (SE003 otherwise). `is None` narrowing applies
+  inside the `if` clause.
+- **`sorted()`** — `sorted(xs)` for `list[int|float|str]`; `sorted(xs, key=lambda v:
+  expr)` for lists of Copy elements, key returning int/float/str. Stable, returns a new
+  list. The key lambda is the only closure form in Tier 2: one parameter, expression
+  body, reads of enclosing locals allowed, mutation/moves of anything reachable
+  rejected (SE004/SE005). `reverse=` is not supported (SE201).
+- **`with open(...) as f:`** — RAII sugar for files; exactly one context manager, only
+  `open()`. The target must be a fresh name, is scoped to the block (unknown after —
+  keeps "closed at block end" true in both execution modes), and cannot be moved out
+  (SE005). Errors inside the block still close the file on both sides.
+- **Default parameter values** — functions and methods; literal int/float/bool/str/None
+  constants only (SE201 otherwise), not on `Ref`/`Mut` parameters (SE202), not on
+  generic parameters. Call sites may omit trailing defaulted arguments; keyword calls
+  remain unsupported.
+- **Iterators** — `zip(a, b)` (two lists), `reversed(xs)`, and `for ch in s:` (str
+  iteration, one character per step) join `range`/`enumerate`/dict views. All are
+  for/comprehension iterator forms; user-defined `__iter__`/`__next__` objects are
+  deferred (DECISIONS.md D7 — they are stored borrows).
+- **Protocols** — `class P(Protocol):` (import `Protocol` from `serpentine`) declares
+  method signatures with `...` bodies; `T = TypeVar("T", bound=P)` constrains a generic
+  function/class/method. Satisfaction is structural and checked at every inference site
+  (SE215): required methods must exist with identical conventions, parameter types, and
+  return type. Protocols are bounds only — not usable as value types.
+- **New builtins** — `round(x)` (ties-even → int), `round(x, n)` (→ float), `ord(c)`,
+  `chr(i)`. Divergences: `chr()` of a lone surrogate raises `ValueError` natively;
+  `round(x, n)` with `n < 0` rounds the binary value (CPython rounds decimal digits).
+- **Tooling (not language)** — `serpentine_lang.api.check_file/check_source` is the
+  checker-as-library surface; `serp lsp` serves LSP diagnostics over stdio with unsaved
+  buffer overlays. The CPython interop boundary refuses foreign imports (SE213,
+  DECISIONS.md D6, `docs/interop.md`).

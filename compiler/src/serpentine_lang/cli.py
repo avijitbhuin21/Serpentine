@@ -15,9 +15,10 @@ from .sir import lower_program
 from .typecheck import TypeChecker
 
 
-def run_check(entry: Path, rep: Reporter, dump_sir: bool = False):
+def run_check(entry: Path, rep: Reporter, dump_sir: bool = False,
+              overlay: dict[str, str] | None = None):
     """Run the full static pipeline; returns the TypeChecker on success."""
-    program = load_program(entry, rep)
+    program = load_program(entry, rep, overlay)
     tc = TypeChecker(program, rep)
     tc.run()
     sirs = lower_program(tc)
@@ -80,7 +81,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     opt = "0" if args.debug else "2"
     proc = subprocess.run(
         [rustc, "--edition", "2021", "-C", f"opt-level={opt}", "-o", str(out), str(rs_file)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if proc.returncode != 0:
         print("serp: rustc rejected the generated program (checker/oracle disagreement):",
@@ -111,6 +112,12 @@ def cmd_llvm(args: argparse.Namespace) -> int:
         return 3
 
 
+def cmd_lsp(args: argparse.Namespace) -> int:
+    """serp lsp: run the Language Server Protocol server on stdio."""
+    from .lsp import serve_stdio
+    return serve_stdio()
+
+
 def main() -> int:
     """CLI entry point."""
     parser = argparse.ArgumentParser(prog="serp", description="Serpentine compiler")
@@ -132,6 +139,9 @@ def main() -> int:
     p_llvm.add_argument("file")
     p_llvm.add_argument("--emit-ir", action="store_true", help="print LLVM IR instead of running")
     p_llvm.set_defaults(func=cmd_llvm)
+
+    p_lsp = sub.add_parser("lsp", help="run the LSP server on stdio (editor diagnostics)")
+    p_lsp.set_defaults(func=cmd_lsp)
 
     args = parser.parse_args()
     return args.func(args)

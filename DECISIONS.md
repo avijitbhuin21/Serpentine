@@ -42,6 +42,49 @@ multiply every design question.
 **Decision:** Kept as a **north-star, not a commitment.** The compiler is written in ordinary
 Python (RESEARCH.md §4); no Tier decisions are made for self-hosting's sake.
 
+## D6 — CPython interop boundary (§5.12, Phase 4)
+
+**Decision:** **v0.1 refuses foreign imports** (`SE213` names the policy and points to
+`docs/interop.md`). The deep-copy boundary (embed libpython, snapshot values both ways,
+Tier-0 data only, no retained references, no callbacks) is fully specified in that document
+and is the committed design if demand arrives; curated native reimplementation of specific
+stdlib modules is the preferred pressure valve before that. Rationale: the zero-libpython
+static binary is the Phase-3 headline product; dual execution already provides the ecosystem
+during development; deep-copy is the only ownership-sound transfer and that part is settled
+now so a later implementation cannot warp the model.
+
+## D7 — User-defined iterators (Tier-2 scoping, Phase 4)
+
+**Decision:** Tier 2 ships **built-in iterator forms only**: lazy `range`, dict views,
+`enumerate`, and the Phase-4 additions `zip(a, b)`, `reversed(xs)`, and `for ch in s:`
+(str iteration), plus comprehensions over all of them. User-defined `__iter__`/`__next__`
+objects are **deferred**: a user iterator is a *stored borrow* of its container, which
+Tier 0–2 forbid by design (no `Ref` fields, D2); doing this soundly requires the named-borrow
+/ region machinery, and the corpus study recorded zero demand. Reopening this is a spec
+change tied to the "iterators as first-class borrows" backlog item.
+
+---
+
+## Phase-4 incidental decisions (recorded for transparency)
+
+- **Tier-2 surface (SPEC.md §14):** str indexing/slicing (`s[i]`, `s[a:b]`, no step),
+  list/dict comprehensions (one `for`, one optional `if`), `sorted(xs)` and
+  `sorted(xs, key=lambda v: ...)` (Copy elements; key returns int/float/str), `with
+  open(...) as f:` (RAII sugar; the target scopes to the block and cannot be moved out),
+  literal default parameter values, `zip`/`reversed`/str iteration, `round`/`ord`/`chr`,
+  and structural protocols as generic bounds (`class P(Protocol)` + `TypeVar("T", bound=P)`,
+  new code `SE215 unsatisfied-protocol`).
+- **Comprehensions borrow their iterable** for the whole expression (SIR loans); the
+  element expression must produce Copy or freshly-constructed values (`SE003` otherwise).
+- **Key lambdas are the only closures in Tier 2**: exactly one parameter, expression body,
+  may read enclosing locals, may not mutate or move anything it can reach (`SE004`/`SE005`).
+- **`chr()` of a lone surrogate** raises `ValueError` natively (CPython constructs a lone
+  surrogate string) — documented divergence; `round(x, n)` with `n < 0` uses scaled
+  binary rounding (CPython rounds the decimal string) — divergence only in far corners.
+- **`with` target names must be fresh** (no shadowing) and the name is *unknown* after the
+  block — this keeps "file closed at block end" true on both sides of the dual-execution
+  guarantee (CPython would allow touching the closed file object; Serpentine rejects it).
+
 ---
 
 ## Phase-3 incidental decisions (recorded for transparency)

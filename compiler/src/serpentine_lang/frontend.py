@@ -19,7 +19,9 @@ class Module:
     functions: dict[str, ast.FunctionDef] = field(default_factory=dict)
     constants: dict[str, ast.AnnAssign] = field(default_factory=dict)
     classes: dict[str, ast.ClassDef] = field(default_factory=dict)
+    protocols: dict[str, ast.ClassDef] = field(default_factory=dict)
     typevars: set[str] = field(default_factory=set)
+    typevar_bounds: dict[str, str] = field(default_factory=dict)
     imports_sys: bool = False
     entry_call: str | None = None
 
@@ -32,11 +34,16 @@ class Program:
     modules: dict[str, Module] = field(default_factory=dict)
 
 
-def load_program(entry_path: Path, rep: Reporter) -> Program:
-    """Parse the entry file and every bin-1 import reachable from it."""
+def load_program(entry_path: Path, rep: Reporter,
+                 overlay: dict[str, str] | None = None) -> Program:
+    """Parse the entry file and every bin-1 import reachable from it.
+
+    `overlay` maps resolved file paths (str) to in-memory buffer contents that
+    take precedence over the on-disk text (used by the LSP for unsaved edits).
+    """
     entry_path = entry_path.resolve()
     root = entry_path.parent
-    entry = _load_module(entry_path, entry_path.stem, rep)
+    entry = _load_module(entry_path, entry_path.stem, rep, overlay)
     program = Program(entry=entry, modules={entry.name: entry})
     queue = [entry]
     while queue:
@@ -48,9 +55,10 @@ def load_program(entry_path: Path, rep: Reporter) -> Program:
             if not candidate.exists():
                 span = _import_span(mod, mod_name)
                 rep.fatal("SE213", "foreign-import",
-                          f"import of '{mod_name}' does not resolve to a Serpentine module "
-                          f"(stdlib and site-packages are not Tier 0)", span)
-            sub = _load_module(candidate, mod_name, rep)
+                          f"import of '{mod_name}' does not resolve to a Serpentine module — "
+                          f"the CPython interop boundary refuses foreign imports in native "
+                          f"builds (docs/interop.md); run under CPython to use them", span)
+            sub = _load_module(candidate, mod_name, rep, overlay)
             program.modules[mod_name] = sub
             queue.append(sub)
     return program
@@ -67,9 +75,14 @@ def _import_span(mod: Module, mod_name: str) -> Span:
     return Span(str(mod.path), 1, 0)
 
 
-def _load_module(path: Path, name: str, rep: Reporter) -> Module:
+def _load_module(path: Path, name: str, rep: Reporter,
+                 overlay: dict[str, str] | None = None) -> Module:
     """Parse one file and enforce the module-level structure rules."""
-    text = path.read_text(encoding="utf-8")
+    text = None
+    if overlay:
+        text = overlay.get(str(path.resolve()))
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     rep.add_source(str(path), text)
     try:
         tree = ast.parse(text, filename=str(path))
@@ -110,7 +123,8 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
                 continue
             rep.fatal("SE213", "foreign-import",
                       f"import of '{node.names[0].name}' is not a Serpentine module or the shim "
-                      f"(stdlib and site-packages are not Tier 0/1; only 'import sys' is special-cased)",
+                      f"(only 'import sys' is special-cased) — the interop boundary refuses "
+                      f"foreign imports in native builds (docs/interop.md)",
                       span)
         elif isinstance(node, ast.FunctionDef):
             if node.decorator_list:
@@ -124,6 +138,15 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
             assert isinstance(call.value.func, ast.Name)
             mod.entry_call = call.value.func.id
         elif isinstance(node, ast.ClassDef):
+            if _is_protocol_class(node):
+                if node.decorator_list or node.keywords:
+                    rep.fatal("SE201", "unsupported-feature",
+                              "protocol classes take no decorators or keywords", span)
+                if "Protocol" not in mod.shim_imports:
+                    rep.fatal("SE201", "unsupported-feature",
+                              "protocol classes need 'from serpentine import Protocol'", span)
+                mod.protocols[node.name] = node
+                continue
             deco = node.decorator_list
             if not (len(deco) == 1 and isinstance(deco[0], ast.Name) and deco[0].id == "dataclass"):
                 rep.fatal("SE201", "unsupported-feature",
@@ -136,7 +159,12 @@ def _load_module(path: Path, name: str, rep: Reporter) -> Module:
             mod.classes[node.name] = node
         elif _is_typevar_decl(node):
             assert isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-            mod.typevars.add(node.targets[0].id)
+            tv_name = node.targets[0].id
+            mod.typevars.add(tv_name)
+            assert isinstance(node.value, ast.Call)
+            for kw in node.value.keywords:
+                assert kw.arg == "bound" and isinstance(kw.value, ast.Name)
+                mod.typevar_bounds[tv_name] = kw.value.id
         elif isinstance(node, ast.Assign):
             rep.fatal("SE206", "mutable-global",
                       "module-level bindings must be annotated Copy-typed constants", span)
@@ -153,15 +181,23 @@ def _is_generic_base(node: ast.expr) -> bool:
             and node.value.id == "Generic")
 
 
+def _is_protocol_class(node: ast.ClassDef) -> bool:
+    """Recognize `class P(Protocol):` as a Tier-2 structural protocol."""
+    return (len(node.bases) == 1 and isinstance(node.bases[0], ast.Name)
+            and node.bases[0].id == "Protocol")
+
+
 def _is_typevar_decl(node: ast.stmt) -> bool:
-    """Recognize `T = TypeVar(\"T\")` at module level."""
+    """Recognize `T = TypeVar(\"T\")` (optionally with bound=Proto) at module level."""
     if not (isinstance(node, ast.Assign) and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)):
         return False
     v = node.value
-    return (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "TypeVar"
+    if not (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "TypeVar"
             and len(v.args) == 1 and isinstance(v.args[0], ast.Constant)
-            and v.args[0].value == node.targets[0].id)
+            and v.args[0].value == node.targets[0].id):
+        return False
+    return all(kw.arg == "bound" and isinstance(kw.value, ast.Name) for kw in v.keywords)
 
 
 def _is_entry_guard(node: ast.stmt) -> bool:
