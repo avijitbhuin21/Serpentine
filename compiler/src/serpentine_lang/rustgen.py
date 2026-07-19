@@ -266,8 +266,12 @@ class RustGen:
     # ---------- statements ----------
 
     def _emit_block(self, stmts: list[ast.stmt]) -> None:
+        saved_scope = dict(self.scope_types)
+        saved_ref = set(self.ref_bound)
         for stmt in stmts:
             self._emit_stmt(stmt)
+        self.scope_types = saved_scope
+        self.ref_bound = saved_ref
 
     def _emit_stmt(self, stmt: ast.stmt) -> None:
         if isinstance(stmt, ast.Pass):
@@ -456,6 +460,21 @@ class RustGen:
     def _emit_assign(self, stmt: ast.Assign | ast.AnnAssign) -> None:
         target = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
         assert stmt.value is not None
+        bind = self.tc.elem_borrow_binds.get(id(stmt))
+        if bind is not None:
+            name, _root = bind
+            val = self._expr(stmt.value, "ref")
+            self._line(f"let v_{name} = {val};")
+            self.scope_types[name] = self._t(stmt.value)
+            self.ref_bound.add(name)
+            return
+        ibind = self.tc.iter_binds.get(id(stmt))
+        if ibind is not None:
+            name, _root = ibind
+            assert isinstance(stmt.value, ast.Call)
+            seq = self._expr(stmt.value.args[0], "ref")
+            self._line(f"let mut v_{name} = ({seq}).iter();")
+            return
         if isinstance(target, ast.Name):
             declared = self.facts.locals[target.id]
             val = self._coerce(self._expr(stmt.value, "val", expect=declared),
@@ -783,6 +802,16 @@ class RustGen:
             raise CodegenError(f"cannot emit sys.{node.attr}")
         t = self._t(node)
         base_t = self._t(node.value)
+        narrowed = id(node) in self.tc.narrowed_uses
+        if narrowed and not isinstance(base_t, TShared):
+            code = f"{self._place(node.value, mut=(mode == 'mut'))}.a_{node.attr}"
+            if mode == "mut":
+                return f"{code}.as_mut().unwrap()"
+            if mode == "ref":
+                return f"{code}.as_ref().unwrap()"
+            if needs_clone(t) or not t.is_copy():
+                return f"{code}.clone().unwrap()"
+            return f"{code}.unwrap()"
         if isinstance(base_t, TShared):
             guard = self._q(f"shared_ref({self._expr(node.value, 'ref')})")
             code = f"{guard}.a_{node.attr}"
@@ -1033,9 +1062,11 @@ class RustGen:
     def _compare(self, node: ast.Compare) -> str:
         op0 = node.ops[0]
         if isinstance(op0, (ast.Is, ast.IsNot)):
-            assert isinstance(node.left, ast.Name)
             method = "is_none" if isinstance(op0, ast.Is) else "is_some"
-            return f"v_{node.left.id}.{method}()"
+            if isinstance(node.left, ast.Name):
+                return f"v_{node.left.id}.{method}()"
+            ref = self._expr(node.left, "ref")
+            return f"({ref}).{method}()"
         if isinstance(op0, (ast.In, ast.NotIn)):
             ct = self._t(node.comparators[0])
             l = self._expr(node.left, "val")
@@ -1206,6 +1237,9 @@ class RustGen:
             if isinstance(t, TStr):
                 return f"(!({v}).is_empty())"
             return v
+        if name == "next":
+            assert isinstance(args[0], ast.Name)
+            return self._q(f"serp_next(&mut v_{args[0].id})")
         if name == "sorted":
             t = self._t(node)
             assert isinstance(t, TList)
@@ -1268,7 +1302,11 @@ class RustGen:
         if isinstance(inner, TClass):
             target = self.tc.call_targets[id(node)]
             sig = self.tc.sigs[target]
-            argv = [self._recv(recv, sig.params[0].conv == "mut")]
+            conv0 = sig.params[0].conv
+            if conv0 == "owned":
+                argv = [self._expr(recv, "val")]
+            else:
+                argv = [self._recv(recv, conv0 == "mut")]
             for a, p in zip(args, sig.params[1:]):
                 if p.conv == "ref":
                     argv.append(self._expr(a, "ref"))

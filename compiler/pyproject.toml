@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serpentine-lang"
-version = "0.3.0"
+version = "0.4.0"
 description = "Serpentine: AOT compiler for an ownership-disciplined Python subset (serp CLI)"
 readme = "README.md"
 license = { text = "MIT" }

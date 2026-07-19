@@ -60,15 +60,20 @@ constructed (`SE003`) — you cannot duplicate owned elements by comprehension.
 
 ## 5. Containers hold their elements
 
-Reading a non-Copy element out of a container is not a move (that would leave a hole):
+Reading a **Copy** element out is a copy, as in Python. Reading a **non-Copy** element
+into a name creates a *scoped element borrow* (Phase 4):
 
 ```python
-first = rows[0]          # SE006: cannot copy a non-Copy element out
+first = rows[0]          # first: Ref of the element, until the end of this block
+print(len(first))        # read freely
+rows.append(x)           # SE004: rows is frozen while 'first' lives
 ```
 
-Your options: index in place (`rows[0].append(1)`), pop it (`rows.pop(0)` transfers
-ownership out), or overwrite it. Dict `get()` on non-Copy values is `SE212` — use
-`k in d` plus `d[k]` in place, or `d.pop(k)`.
+The borrow ends at the end of the enclosing block; until then the container cannot be
+mutated or moved, and `first` cannot be moved, mutated through, re-assigned, or returned.
+To *take* the element out instead, `rows.pop(0)` transfers ownership; to replace it,
+overwrite the slot. Dict `get()` on non-Copy values is `SE212` — use `k in d` plus `d[k]`
+(in place or as a scoped borrow), or `d.pop(k)`.
 
 ## 6. Fields: one level of precision
 

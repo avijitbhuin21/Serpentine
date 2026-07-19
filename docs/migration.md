@@ -34,12 +34,12 @@ you meant a borrow: restructure to call a function taking `Ref`/`Mut` instead of
 
 | Python habit | Serpentine replacement |
 |---|---|
-| `first = rows[0]` (keep using rows) | use `rows[0]` in place, or `rows.pop(0)` |
+| `first = rows[0]` (keep using rows) | works — a scoped borrow; the container is frozen until block end |
 | `d.get(k)` for non-Copy values | `if k in d: ... d[k]` in place, or `d.pop(k)` |
 | mutate a list while iterating it | collect changes, apply after the loop |
 | classes with inheritance | composition, or protocols for the interface |
 | `lambda`/closures | `sorted(xs, key=lambda v: ...)` is the supported form |
-| generators / `yield` | build and return a list |
+| generators / `yield` | build and return a list, or `it = iter(xs)` + `next(it)` |
 | big ints | stay ≤ 64 bits or keep the tool on CPython |
 | mutable globals | pass state explicitly (usually a dataclass) |
 

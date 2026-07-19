@@ -128,7 +128,8 @@ binary — lives at [`examples/json_parser.py`](../examples/json_parser.py).
 
 ## What's deliberately missing
 
-No inheritance, no closures beyond `sorted` keys, no user iterators/generators, no
-`async`, no mutable globals, no foreign imports in native builds
-([interop.md](interop.md)). The subset grows by demand order from real-code corpus
-studies — see `docs/corpus-study.md` and `SPEC.md` for the normative surface.
+No inheritance, no closures beyond `sorted` keys, no generators/`yield` (but
+`iter()`/`next()` over lists work), no `async`, no mutable globals, no foreign imports
+in native builds ([interop.md](interop.md)). The subset grows by demand order from
+real-code corpus studies — see `docs/corpus-study.md` and `SPEC.md` for the normative
+surface.

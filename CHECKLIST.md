@@ -87,20 +87,20 @@
 - [x] `with open(...) as f:` RAII sugar (Tier-2 §3.1, high demand) — *landed with Phase 4*
 - [x] Default parameter values — *landed with Phase 4 (literal defaults, functions + methods)*
 - [x] Small builtin gaps: `round()`, `str.format`-adjacent specs, more str/dict methods — *`round`/`ord`/`chr`/`zip`/`reversed` landed; `str.format` itself stays out (f-strings cover it); further str/dict methods by demand*
-- [ ] Named element borrows (scoped borrow of `rows[0]` — most-wanted ergonomic fix from the corpus study)
-- [ ] `is None` narrowing on field places (currently plain names only)
+- [x] Named element borrows (scoped borrow of `rows[0]` — most-wanted ergonomic fix from the corpus study) — *landed 2026-07-18: `first = rows[0]` binds a block-scoped Ref; container frozen (SE004/SE005) while live; SPEC §14.1; tests/accept/057, tests/reject/r053*
+- [x] `is None` narrowing on field places (currently plain names only) — *landed 2026-07-18: one-level `x.f` narrowing, invalidated by assignment/Mut use, never through Shared; tests/accept/056*
 
 ### Performance
-- [ ] String runtime optimization (0.6x CPython on transformation pipelines: ASCII byte-len fast path, buffer-reusing ops, SSO/arena — see `docs/benchmarks.md`)
-- [ ] Re-run `bench_alloc.py` head-to-head vs Codon on a Linux/macOS host (Codon has no Windows support)
+- [x] String runtime optimization (0.6x CPython on transformation pipelines: ASCII byte-len fast path, buffer-reusing ops, SSO/arena — see `docs/benchmarks.md`) — *landed 2026-07-18: SSO (≤22 B inline, zero alloc) + ASCII fast paths → 0.8–1.0x CPython (was 0.6x; interleaved min-of-5 measures parity, harness median 0.8x); docs/benchmarks.md Phase-4 update*
+- [ ] Re-run `bench_alloc.py` head-to-head vs Codon on a Linux/macOS host (Codon has no Windows support) — **host-blocked: this machine is Windows-only; needs owner action or a Linux/macOS box**
 
 ### Library-building prerequisites
-- [ ] Multi-package/module resolution design (imports are single-directory bin-1 only; libraries ship as source under whole-program compilation)
-- [ ] Cross-library API conventions: ownership in public signatures, monomorphization across package boundaries
+- [x] Multi-package/module resolution design (imports are single-directory bin-1 only; libraries ship as source under whole-program compilation) — *design of record: `docs/packages.md` (package dirs, serp.toml roots, source-distribution libraries, build caching)*
+- [x] Cross-library API conventions: ownership in public signatures, monomorphization across package boundaries — *`docs/packages.md` §4 (conventions normative once packages land)*
 - [x] Protocols/traits + closures (blocking any real library API surface; Tier 2) — *structural protocols as generic bounds landed (SE215); closures landed as the `sorted key=` subset — general closures still open*
-- [ ] Iterators as first-class borrows (Tier 2) — *scoped by DECISIONS.md D7: needs named-borrow machinery; built-in iterator forms (`zip`/`reversed`/str) landed*
+- [x] Iterators as first-class borrows (Tier 2) — *landed 2026-07-18: `it = iter(xs)` block-scoped borrow + `next(it)` + catchable StopIteration (Copy elements); tests/accept/058; DECISIONS.md Phase-4 backlog entry*
 
 ### Housekeeping
-- [ ] Bump CI actions (checkout@v4 / setup-python@v5) to silence Node-20 deprecation annotations
-- [ ] `Owned` (consuming) `self` methods (deferred from Phase 2, SE202)
-- [ ] Backend B: grow the LLVM numeric core (float printing via shortest-roundtrip, strings) or fold into Phase-4 priorities
+- [x] Bump CI actions (checkout@v4 / setup-python@v5) to silence Node-20 deprecation annotations — *bumped to checkout@v5 / setup-python@v6; LSP smoke test added to CI*
+- [x] `Owned` (consuming) `self` methods (deferred from Phase 2, SE202) — *landed 2026-07-18: `move(x).method()` call discipline (SE002 without move, SE001 after); SPEC §14.1; tests/accept/058, tests/reject/r048*
+- [x] Backend B: grow the LLVM numeric core (float printing via shortest-roundtrip, strings) or fold into Phase-4 priorities — *folded into Phase-4 priorities per this box's own alternative: Backend A (full language) + tooling carried the phase; Backend B remains the numeric-core demo (`serp llvm`, harness green)*

@@ -12,10 +12,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up CPython 3.12 (spec version pin — see SPEC.md §1.3)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -37,6 +37,9 @@ jobs:
       - name: serp check catches the whole reject corpus with exact codes
         run: python tools/run_reject_serp.py
 
+      - name: LSP server smoke test (diagnostics over stdio)
+        run: python tools/run_lsp_smoke.py
+
       - name: Differential suite (CPython vs native via rustc)
         run: |
           rustc --version
@@ -53,8 +56,8 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build serpentine-shim sdist + wheel

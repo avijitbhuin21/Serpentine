@@ -502,3 +502,30 @@ tests/reject/r029, r036, r051, r052).
   checker-as-library surface; `serp lsp` serves LSP diagnostics over stdio with unsaved
   buffer overlays. The CPython interop boundary refuses foreign imports (SE213,
   DECISIONS.md D6, `docs/interop.md`).
+
+### 14.1 Phase-4 backlog additions
+
+- **Owned (consuming) `self`** — `def into_x(self: Owned[C]) -> T`. The call site must
+  transfer the receiver explicitly: `move(x).into_x()` (SE002 otherwise); a
+  freshly-constructed receiver (`C(...).into_x()`) needs no move. The receiver is
+  moved-from after the call (SE001 on later use). Shared receivers cannot be consumed
+  (SE006). Protocol methods still take Ref/Mut self only.
+- **Field-place narrowing** — `if x.f is not None:` narrows the one-level field place
+  `x.f` (plain dataclass locals/params only, never through `Shared`). The narrow dies on
+  any assignment to `x` or `x.f`, and on any `Mut` use of `x` (calls, methods, item
+  writes). Works in `if`/`while` tests and comprehension conditions.
+- **Named element borrows** — `first = rows[i]` (list or dict subscript on a name, one
+  level, non-Copy non-Optional element) binds `first` as a **scoped Ref borrow**: it
+  lives to the end of the enclosing block, during which the container cannot be mutated
+  or moved (SE004/SE005) and `first` cannot be moved (SE008), mutated through (SE004),
+  re-assigned (SE201), or returned (SE209). The name is unknown after the block. Copy
+  elements keep their existing copy semantics. Shared containers stay SE006.
+- **First-class iterators** — `it = iter(xs)` (list of Copy elements, named variable,
+  fresh target) binds a block-scoped iterator that Ref-borrows `xs`; `next(it)` yields
+  the next element and raises catchable `StopIteration` when exhausted (added to the
+  known exception classes). The iterator cannot be printed, passed, moved, or iterated
+  by `for`; drain it with `try: while True: ... except StopIteration:`. Non-Copy element
+  lists are rejected (SE201) — `next()` copies elements out.
+- **String runtime** — small-string optimization (≤22 bytes inline, zero allocation;
+  longer strings `Rc<str>`); ASCII fast paths for `len`/index/slice/`find`. String
+  copies remain O(1); `bench_strings` reaches CPython parity (docs/benchmarks.md).

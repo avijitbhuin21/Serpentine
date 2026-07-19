@@ -28,6 +28,16 @@ class TIter(Type):
         return f"<{self.kind} iterator>"
 
 
+@dataclass(frozen=True)
+class TIterObj(Type):
+    """A first-class list iterator handle (Tier 2): block-scoped borrow, next() only."""
+
+    elem: Type
+
+    def __str__(self) -> str:
+        return f"<list iterator of {self.elem}>"
+
+
 @dataclass
 class Param:
     name: str
@@ -73,7 +83,7 @@ class ProtoInfo:
 # Exception classes recognized by raise/except (SPEC.md section 11 + Tier-1 additions).
 KNOWN_EXC = {"Exception", "ValueError", "RuntimeError", "TypeError", "IndexError", "KeyError",
              "ZeroDivisionError", "OverflowError", "EOFError", "FileNotFoundError",
-             "PermissionError", "OSError", "ArithmeticError", "LookupError"}
+             "PermissionError", "OSError", "ArithmeticError", "LookupError", "StopIteration"}
 
 
 @dataclass
@@ -107,6 +117,8 @@ class TypeChecker:
         self.call_targets: dict[int, tuple[str, str]] = {}   # call node id -> sig key
         self.ctor_calls: dict[int, tuple[str, str, tuple]] = {}   # call node id -> class inst
         self.lambda_elems: dict[int, Type] = {}   # sorted-key lambda node id -> element type
+        self.elem_borrow_binds: dict[int, tuple[str, str]] = {}  # stmt id -> (name, root)
+        self.iter_binds: dict[int, tuple[str, str]] = {}         # stmt id -> (name, root)
         self.checked_bodies: set[tuple[str, str]] = set()
 
     def run(self) -> None:
@@ -243,11 +255,11 @@ class TypeChecker:
                            Span(file, self_arg.lineno, self_arg.col_offset))
         parsed = parse_annotation(self_arg.annotation, self.rep, file,
                                   allow_wrapper=True, names=names)
-        if parsed.conv not in (CONV_REF, CONV_MUT) or not isinstance(parsed.typ, TClass) \
+        if parsed.conv not in (CONV_REF, CONV_MUT, CONV_OWNED) or not isinstance(parsed.typ, TClass) \
                 or parsed.typ.name != info.name or parsed.typ.module != info.module:
             self.rep.fatal("SE202", "invalid-wrapper-position",
-                           f"'self' of method '{fn.name}' must be Ref[{info.name}] or "
-                           f"Mut[{info.name}] (Owned self is Tier 2)",
+                           f"'self' of method '{fn.name}' must be Ref[{info.name}], "
+                           f"Mut[{info.name}], or Owned[{info.name}] (consuming)",
                            Span(file, self_arg.lineno, self_arg.col_offset))
         params = [Param("self", parsed.conv, self._self_type(info))]
         defaults_off = len(a.args) - len(a.defaults)
@@ -588,6 +600,9 @@ class TypeChecker:
         self.loop_refs: list[dict[str, str]] = []
         self.comp_borrows: list[list[str]] = []
         self.with_targets: list[str] = []
+        self.ref_locals: dict[str, str] = {}      # scoped borrow name -> root
+        self.elem_borrows: dict[str, set[str]] = {}   # root -> active borrow names
+        self.borrow_scopes: list[list[tuple[str, str]]] = []
         self.loop_depth = 0
         self.try_stack: list[dict] = []
         self.handler_depth = 0
@@ -631,12 +646,12 @@ class TypeChecker:
                 p.conv = CONV_COPY
         saved = (self.env, self.mod, self.fn, self.sig, self.cur_facts, self.loop_refs,
                  self.loop_depth, self.try_stack, self.handler_depth, self.comp_borrows,
-                 self.with_targets)
+                 self.with_targets, self.ref_locals, self.elem_borrows, self.borrow_scopes)
         target_mod = self.program.modules[template.module]
         self._check_function(target_mod, node_copy, inst)
         (self.env, self.mod, self.fn, self.sig, self.cur_facts, self.loop_refs,
          self.loop_depth, self.try_stack, self.handler_depth, self.comp_borrows,
-         self.with_targets) = saved
+         self.with_targets, self.ref_locals, self.elem_borrows, self.borrow_scopes) = saved
         return inst
 
     def _err(self, code: str, name: str, msg: str, node: ast.AST, label: str = "",
@@ -645,11 +660,16 @@ class TypeChecker:
 
     def _check_block(self, stmts: list[ast.stmt], narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
         """Check a statement list; returns (narrowings after, definitely-terminates)."""
+        self.borrow_scopes.append([])
         term = False
         for stmt in stmts:
             if term:
                 break
             narrow, term = self._check_stmt(stmt, narrow)
+        for (name, root) in self.borrow_scopes.pop():
+            self.env.pop(name, None)
+            self.ref_locals.pop(name, None)
+            self.elem_borrows.get(root, set()).discard(name)
         return narrow, term
 
     def _assigned_names(self, stmts: list[ast.stmt]) -> set[str]:
@@ -661,6 +681,8 @@ class TypeChecker:
                     tgt = node.targets[0] if isinstance(node, ast.Assign) else node.target
                     if isinstance(tgt, ast.Name):
                         names.add(tgt.id)
+                    elif isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name):
+                        names.add(tgt.value.id)
                 if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
                     names.add(node.target.id)
         return names
@@ -695,7 +717,10 @@ class TypeChecker:
                           stmt)
             return narrow, True
         if isinstance(stmt, ast.Expr):
-            self._type_expr(stmt.value, narrow)
+            et = self._type_expr(stmt.value, narrow)
+            if isinstance(et, TIterObj):
+                self._err("SE201", "unsupported-feature",
+                          "iter() must be bound to a name: it = iter(xs)", stmt.value)
             return narrow, self._is_sys_exit(stmt.value)
         if isinstance(stmt, ast.AnnAssign):
             return self._check_annassign(stmt, narrow), False
@@ -727,7 +752,7 @@ class TypeChecker:
         self.try_stack.append({"has_finally": bool(stmt.finalbody),
                                "loop_depth": self.loop_depth})
         assigned = self._assigned_names(stmt.body)
-        body_narrow = {k: v for k, v in narrow.items() if k not in assigned}
+        body_narrow = self._filter_narrow(narrow, assigned)
         _, body_term = self._check_block(stmt.body, body_narrow)
         self.try_stack.pop()
 
@@ -746,7 +771,7 @@ class TypeChecker:
             self.handler_depth += 1
             h_assigned = self._assigned_names(h.body)
             h_narrow = {k: v for k, v in narrow.items()
-                        if k not in assigned and k not in h_assigned}
+                        if k.split('.')[0] not in assigned and k.split('.')[0] not in h_assigned}
             _, h_term = self._check_block(h.body, h_narrow)
             self.handler_depth -= 1
             handler_terms.append(h_term)
@@ -762,7 +787,7 @@ class TypeChecker:
         all_assigned = assigned | set().union(*(self._assigned_names(h.body)
                                                 for h in stmt.handlers)) \
             if stmt.handlers else assigned
-        after = {k: v for k, v in narrow.items() if k not in all_assigned}
+        after = self._filter_narrow(narrow, all_assigned)
         term = body_term and bool(stmt.handlers) and all(handler_terms)
         return after, term
 
@@ -842,11 +867,11 @@ class TypeChecker:
         self.expr_types[id(item.optional_vars)] = TFile()
         self.with_targets.append(name)
         assigned = self._assigned_names(stmt.body)
-        body_narrow = {k: v for k, v in narrow.items() if k not in assigned}
+        body_narrow = self._filter_narrow(narrow, assigned)
         _, term = self._check_block(stmt.body, body_narrow)
         self.with_targets.pop()
         self.env.pop(name, None)
-        return {k: v for k, v in narrow.items() if k not in assigned}, term
+        return self._filter_narrow(narrow, assigned), term
 
     def _check_return(self, stmt: ast.Return, narrow: dict[str, Type]) -> None:
         if stmt.value is None:
@@ -859,6 +884,10 @@ class TypeChecker:
             self._err("SE214", "type-mismatch",
                       f"return type mismatch: expected {self.sig.ret}, got {t}", stmt)
         if isinstance(stmt.value, ast.Name) and not t.is_copy():
+            if self.env.get(stmt.value.id, (None, None))[1] == "reflocal":
+                self._err("SE209", "returned-borrow",
+                          f"cannot return '{stmt.value.id}' — it is a scoped Ref borrow "
+                          f"of an element of '{self.ref_locals.get(stmt.value.id)}'", stmt)
             self.cur_facts.events.append(("move", stmt.value.id, stmt))
 
     def _declare(self, name: str, typ: Type, node: ast.AST) -> None:
@@ -893,6 +922,52 @@ class TypeChecker:
         return (isinstance(e, ast.Attribute) and isinstance(e.value, ast.Name)
                 and e.value.id == "sys" and self.mod.imports_sys)
 
+    def _try_elem_borrow(self, target: ast.Name, value: ast.expr, t: Type,
+                         node: ast.stmt) -> bool:
+        """Bind `name = container[idx]` (non-Copy element) as a scoped Ref borrow."""
+        if not isinstance(value, ast.Subscript) or isinstance(value.slice, ast.Slice):
+            return False
+        if t.is_copy() or isinstance(t, TOptional):
+            return False
+        if not isinstance(value.value, ast.Name):
+            return False
+        base = value.value.id
+        base_t = self.env.get(base, (None, None))[0]
+        if base_t is None or isinstance(base_t, TShared) \
+                or not isinstance(base_t, (TList, TDict)):
+            return False
+        if target.id in self.env:
+            self._err("SE201", "unsupported-feature",
+                      f"scoped element borrow target '{target.id}' must be a fresh name",
+                      target)
+        self.env[target.id] = (t, "reflocal")
+        self.ref_locals[target.id] = base
+        self.elem_borrows.setdefault(base, set()).add(target.id)
+        self.borrow_scopes[-1].append((target.id, base))
+        self.elem_borrow_binds[id(node)] = (target.id, base)
+        return True
+
+    def _try_iter_bind(self, target: ast.Name, value: ast.expr, t: Type,
+                       node: ast.stmt) -> bool:
+        """Bind `it = iter(xs)` as a block-scoped iterator borrow of xs."""
+        if not isinstance(t, TIterObj):
+            return False
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id == "iter" and value.args
+                and isinstance(value.args[0], ast.Name)):
+            self._err("SE201", "unsupported-feature",
+                      "iterators may only be created with 'it = iter(xs)'", value)
+        root = value.args[0].id
+        if target.id in self.env:
+            self._err("SE201", "unsupported-feature",
+                      f"iterator target '{target.id}' must be a fresh name", target)
+        self.env[target.id] = (t, "iterlocal")
+        self.ref_locals[target.id] = root
+        self.elem_borrows.setdefault(root, set()).add(target.id)
+        self.borrow_scopes[-1].append((target.id, root))
+        self.iter_binds[id(node)] = (target.id, root)
+        return True
+
     def _check_annassign(self, stmt: ast.AnnAssign, narrow: dict[str, Type]) -> dict[str, Type]:
         if not isinstance(stmt.target, ast.Name):
             self._err("SE201", "unsupported-feature", "annotated assignment target must be a name", stmt)
@@ -908,6 +983,10 @@ class TypeChecker:
         if not self._assignable(t, parsed.typ):
             self._err("SE214", "type-mismatch",
                       f"cannot assign {t} to '{stmt.target.id}: {parsed.typ}'", stmt)
+        if self._try_elem_borrow(stmt.target, stmt.value, parsed.typ, stmt):
+            narrow = dict(narrow)
+            narrow.pop(stmt.target.id, None)
+            return narrow
         self._rhs_transfer_check(stmt.value, parsed.typ, stmt)
         self._declare(stmt.target.id, parsed.typ, stmt)
         self._record_assign_events(stmt.target.id, stmt.value, stmt)
@@ -931,6 +1010,10 @@ class TypeChecker:
                 self._err("SE201", "unsupported-feature",
                           "this iterator may only be consumed by a for loop", stmt.value)
             if target.id in self.env:
+                if self.env[target.id][1] == "reflocal":
+                    self._err("SE201", "unsupported-feature",
+                              f"scoped element borrow '{target.id}' cannot be re-assigned "
+                              f"— it lives until the end of its block", stmt)
                 declared = self.env[target.id][0]
                 if not self._assignable(t, declared):
                     self._err("SE214", "type-mismatch",
@@ -940,6 +1023,14 @@ class TypeChecker:
                 if self._is_empty_literal(stmt.value):
                     self._err("SE204", "unknown-element-type",
                               "empty container literal needs a type annotation", stmt.value)
+            if self._try_elem_borrow(target, stmt.value, t, stmt):
+                narrow = dict(narrow)
+                narrow.pop(target.id, None)
+                return narrow
+            if self._try_iter_bind(target, stmt.value, t, stmt):
+                narrow = dict(narrow)
+                narrow.pop(target.id, None)
+                return narrow
             self._rhs_transfer_check(stmt.value, t, stmt)
             self._declare(target.id, t, stmt)
             self._record_assign_events(target.id, stmt.value, stmt)
@@ -1023,14 +1114,14 @@ class TypeChecker:
         then_after, then_term = self._check_block(stmt.body, pos)
         else_after, else_term = self._check_block(stmt.orelse, neg) if stmt.orelse else (neg, False)
         assigned = self._assigned_names(stmt.body) | self._assigned_names(stmt.orelse)
-        after = {k: v for k, v in narrow.items() if k not in assigned}
+        after = self._filter_narrow(narrow, assigned)
         if then_term and not else_term:
-            after.update({k: v for k, v in else_after.items() if k not in self._assigned_names(stmt.orelse)})
+            after.update(self._filter_narrow(else_after, self._assigned_names(stmt.orelse)))
         elif else_term and not then_term:
-            after.update({k: v for k, v in then_after.items() if k not in self._assigned_names(stmt.body)})
+            after.update(self._filter_narrow(then_after, self._assigned_names(stmt.body)))
         elif not then_term and not else_term and stmt.orelse:
             common = {k: v for k, v in then_after.items() if else_after.get(k) == v}
-            after.update({k: v for k, v in common.items() if k not in assigned})
+            after.update(self._filter_narrow(common, assigned))
         return after, then_term and (else_term if stmt.orelse else False)
 
     def _narrow_from_test(self, test: ast.expr, narrow: dict[str, Type]) \
@@ -1039,20 +1130,32 @@ class TypeChecker:
         pos = dict(narrow)
         neg = dict(narrow)
         if isinstance(test, ast.Compare) and len(test.ops) == 1 \
-                and isinstance(test.ops[0], (ast.Is, ast.IsNot)) \
-                and isinstance(test.left, ast.Name):
-            name = test.left.id
-            declared = self.env.get(name, (None, None))[0]
-            if isinstance(declared, TOptional):
+                and isinstance(test.ops[0], (ast.Is, ast.IsNot)):
+            key = None
+            declared: Type | None = None
+            if isinstance(test.left, ast.Name):
+                key = test.left.id
+                declared = self.env.get(key, (None, None))[0]
+            elif isinstance(test.left, ast.Attribute) and isinstance(test.left.value, ast.Name):
+                base = test.left.value.id
+                base_t = self.env.get(base, (None, None))[0]
+                if isinstance(base_t, TClass):
+                    key = f"{base}.{test.left.attr}"
+                    declared = self._field_type(base_t, test.left.attr, test.left)
+            if key is not None and isinstance(declared, TOptional):
                 if isinstance(test.ops[0], ast.IsNot):
-                    pos[name] = declared.inner
+                    pos[key] = declared.inner
                 else:
-                    neg[name] = declared.inner
+                    neg[key] = declared.inner
         return pos, neg
+
+    def _filter_narrow(self, narrow: dict[str, Type], assigned: set[str]) -> dict[str, Type]:
+        """Drop narrowings whose root name is (re)assigned."""
+        return {k: v for k, v in narrow.items() if k.split(".")[0] not in assigned}
 
     def _check_while(self, stmt: ast.While, narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
         assigned = self._assigned_names(stmt.body)
-        loop_narrow = {k: v for k, v in narrow.items() if k not in assigned}
+        loop_narrow = self._filter_narrow(narrow, assigned)
         cond_t = self._type_expr(stmt.test, loop_narrow)
         if not isinstance(cond_t, TBool):
             self._err("SE214", "type-mismatch", f"while condition must be bool, got {cond_t}", stmt.test)
@@ -1062,7 +1165,7 @@ class TypeChecker:
         self.loop_depth -= 1
         if stmt.orelse:
             self._err("SE201", "unsupported-feature", "while-else is not Tier 0", stmt)
-        return {k: v for k, v in narrow.items() if k not in assigned}, False
+        return self._filter_narrow(narrow, assigned), False
 
     def _check_for(self, stmt: ast.For, narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
         if stmt.orelse:
@@ -1107,7 +1210,7 @@ class TypeChecker:
         self.loop_refs.append(loop_ref_vars)
         self.loop_depth += 1
         assigned = self._assigned_names(stmt.body)
-        body_narrow = {k: v for k, v in narrow.items() if k not in assigned}
+        body_narrow = self._filter_narrow(narrow, assigned)
         self._check_block(stmt.body, body_narrow)
         self.loop_depth -= 1
         self.loop_refs.pop()
@@ -1115,7 +1218,7 @@ class TypeChecker:
             self.cur_facts.events.append(("loop_borrow_end", borrowed, stmt))
         for tgt in targets:
             assigned.add(tgt.id)
-        return {k: v for k, v in narrow.items() if k not in assigned}, False
+        return self._filter_narrow(narrow, assigned), False
 
     def _borrowable_root(self, iter_expr: ast.expr) -> str | None:
         """The root variable Ref-borrowed by a for loop, if any (range borrows nothing)."""
@@ -1259,6 +1362,13 @@ class TypeChecker:
                 return TList(STR)
             self._err("SE201", "unsupported-feature",
                       f"'sys.{node.attr}' is not Tier 1 (only sys.argv and sys.exit)", node)
+        if isinstance(node.value, ast.Name):
+            key = f"{node.value.id}.{node.attr}"
+            base_env = self.env.get(node.value.id, (None, None))[0]
+            if key in narrow and isinstance(base_env, TClass):
+                self.narrowed_uses.add(id(node))
+                self._type_expr(node.value, narrow)
+                return narrow[key]
         base = self._type_expr(node.value, narrow)
         if isinstance(base, TOptional):
             self._err("SE210", "unnarrowed-optional",
@@ -1288,7 +1398,7 @@ class TypeChecker:
         for part in node.values:
             if isinstance(part, ast.FormattedValue):
                 t = self._type_expr(part.value, narrow)
-                if isinstance(t, (TIter, TFile)):
+                if isinstance(t, (TIter, TIterObj, TFile)):
                     self._err("SE214", "type-mismatch", f"cannot format a {t}", part.value)
         return STR
 
@@ -1422,11 +1532,16 @@ class TypeChecker:
                     or node.comparators[0].value is not None:
                 self._err("SE207", "identity-comparison",
                           "'is' comparisons are only allowed against None", node)
-            if not isinstance(node.left, ast.Name):
+            place_ok = isinstance(node.left, ast.Name) or \
+                (isinstance(node.left, ast.Attribute) and isinstance(node.left.value, ast.Name))
+            if not place_ok:
                 self._err("SE210", "unnarrowed-optional",
-                          "narrowing applies to names only — bind the value first "
-                          "(v = d.get(k))", node.left)
-            self._type_expr(node.left, narrow)
+                          "narrowing applies to names and one-level fields only — bind "
+                          "the value first (v = d.get(k))", node.left)
+            probe = dict(narrow)
+            if isinstance(node.left, ast.Attribute) and isinstance(node.left.value, ast.Name):
+                probe.pop(f"{node.left.value.id}.{node.left.attr}", None)
+            self._type_expr(node.left, probe)
             return BOOL
         if any(isinstance(o, (ast.In, ast.NotIn)) for o in ops):
             if len(ops) != 1:
@@ -1631,7 +1746,7 @@ class TypeChecker:
         root = self._borrowable_root(gen.iter)
         self.comp_borrows.append(([root] if root else []) + [t.id for t in targets])
         body_narrow = {k: v for k, v in narrow.items()
-                       if k not in {t.id for t in targets}}
+                       if k.split('.')[0] not in {t.id for t in targets}}
         if gen.ifs:
             ct = self._type_expr(gen.ifs[0], body_narrow)
             if not isinstance(ct, TBool):
@@ -1774,6 +1889,15 @@ class TypeChecker:
             self._err("SE005", "move-while-borrowed",
                       f"cannot move '{arg.id}' out of its 'with' block — the file closes "
                       f"at block end", node)
+        if arg.id in self.ref_locals:
+            self._err("SE008", "move-out-of-borrow",
+                      f"cannot move '{arg.id}' — it is a scoped Ref borrow of an element "
+                      f"of '{self.ref_locals[arg.id]}'", node)
+        if self.elem_borrows.get(arg.id):
+            names = ", ".join(f"'{n}'" for n in sorted(self.elem_borrows[arg.id]))
+            self._err("SE005", "move-while-borrowed",
+                      f"cannot move '{arg.id}' while element borrow {names} is live "
+                      f"(the borrow ends at the end of its block)", node)
         conv = self.env.get(arg.id, (None, None))[1]
         if conv in (CONV_REF, CONV_MUT):
             self._err("SE008", "move-out-of-borrow",
@@ -1821,6 +1945,15 @@ class TypeChecker:
                 self._err("SE004", "conflicting-borrow",
                           f"'{root}' is borrowed by an enclosing comprehension or key "
                           f"lambda — it cannot be mutated there", node)
+        if root in self.ref_locals:
+            self._err("SE004", "conflicting-borrow",
+                      f"'{root}' is a scoped element borrow of "
+                      f"'{self.ref_locals[root]}' — it cannot be mutated through", node)
+        if self.elem_borrows.get(root):
+            names = ", ".join(f"'{n}'" for n in sorted(self.elem_borrows[root]))
+            self._err("SE004", "conflicting-borrow",
+                      f"'{root}' cannot be mutated while element borrow {names} is live "
+                      f"(the borrow ends at the end of its block)", node)
 
     def _mut_borrow_place(self, e: ast.expr, node: ast.AST) -> None:
         root = self._borrow_root(e)
@@ -1832,6 +1965,8 @@ class TypeChecker:
         root = self._borrow_root(e)
         if root is not None:
             narrow.pop(root, None)
+            for k in [k for k in narrow if k.split(".")[0] == root]:
+                narrow.pop(k, None)
 
     def _type_user_call(self, node: ast.Call, sig: FuncSig, narrow: dict[str, Type]) -> Type:
         required = len([p for p in sig.params if p.default is None])
@@ -1909,7 +2044,7 @@ class TypeChecker:
 
         if name == "print":
             for t in ts:
-                if isinstance(t, (TIter, TFile)):
+                if isinstance(t, (TIter, TIterObj, TFile)):
                     self._err("SE214", "type-mismatch", f"cannot print a {t}", node)
             return NONE
         if name == "len":
@@ -1999,6 +2134,27 @@ class TypeChecker:
             if not isinstance(ts[0], TInt):
                 self._err("SE214", "type-mismatch", f"chr() expects an int, got {ts[0]}", node)
             return STR
+        if name == "iter":
+            arity(1)
+            if not isinstance(ts[0], TList):
+                self._err("SE214", "type-mismatch", f"iter() takes a list, got {ts[0]}", node)
+            if not ts[0].elem.is_copy():
+                self._err("SE201", "unsupported-feature",
+                          f"iter() over {ts[0]} — next() copies elements out, so Tier-2 "
+                          f"iterators need Copy elements", node)
+            if not isinstance(args[0], ast.Name):
+                self._err("SE201", "unsupported-feature",
+                          "iter() takes a named list variable (the iterator borrows it)",
+                          node)
+            return TIterObj(ts[0].elem)
+        if name == "next":
+            arity(1)
+            if not (isinstance(args[0], ast.Name)
+                    and self.env.get(args[0].id, (None, None))[1] == "iterlocal"):
+                self._err("SE201", "unsupported-feature",
+                          "next() takes an iterator bound with 'it = iter(xs)'", node)
+            assert isinstance(ts[0], TIterObj)
+            return ts[0].elem
         if name == "sorted":
             return self._type_sorted(node, ts, narrow)
         if name == "input":
@@ -2092,6 +2248,16 @@ class TypeChecker:
         recv = node.func.value
         recv_root = self._borrow_root(recv)
         shared_recv = isinstance(self.expr_types.get(id(recv)), TShared)
+        if sig.params[0].conv == CONV_OWNED:
+            if shared_recv:
+                self._err("SE006", "move-out-of-container",
+                          f"cannot consume a Shared value with .{method}() — contents "
+                          f"stay shared", node)
+            if isinstance(recv, (ast.Name, ast.Attribute, ast.Subscript)):
+                self._err("SE002", "missing-move",
+                          f".{method}() consumes its receiver (Owned self) — write "
+                          f"'move({ast.unparse(recv)}).{method}(...)'", node,
+                          help=f"the receiver's ownership ends inside .{method}()")
         if sig.params[0].conv == CONV_MUT and not shared_recv:
             self._mut_receiver(node)
             self._check_narrow_invalidation_by_mut(recv, narrow)

@@ -85,6 +85,23 @@ change tied to the "iterators as first-class borrows" backlog item.
   block — this keeps "file closed at block end" true on both sides of the dual-execution
   guarantee (CPython would allow touching the closed file object; Serpentine rejects it).
 
+## Phase-4 backlog decisions (2026-07-18)
+
+- **Named element borrows are lexically block-scoped** (not NLL): `first = rows[0]` freezes
+  `rows` until the end of the enclosing block, and `first` is unknown afterwards. Stricter
+  than rustc (policy-only difference) but keeps the CPython alias unobservable: neither
+  alias can be mutated while both exist. Ref-only (no `Mut` element borrows in v1).
+- **`iter()`/`next()` ride the same block-region machinery.** Copy elements only (`next`
+  copies out); `StopIteration` joins the known exception classes. `for` over an iterator
+  handle stays rejected — `for` loops already borrow directly.
+- **Owned self call syntax is `move(x).method()`** — the move is spelled at the receiver,
+  reusing J3's explicit-transfer rule; no new syntax.
+- **Field narrowing never applies through `Shared`** — runtime-shared aliases could
+  invalidate the narrow between test and use.
+- **String runtime = SSO enum** (≤22 bytes inline / `Rc<str>` beyond), after measuring
+  `Rc<String>` as a regression (double allocation for small strings). O(1)-copy contract
+  unchanged (23-byte memcpy or refcount bump).
+
 ---
 
 ## Phase-3 incidental decisions (recorded for transparency)

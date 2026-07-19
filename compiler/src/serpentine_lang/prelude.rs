@@ -35,12 +35,57 @@ impl SerpErr {
 
 type SRes<T> = Result<T, SerpErr>;
 
-// ---------- Rc<str> strings (SPEC section 3.7: O(1) string copies) ----------
+// ---------- strings (SPEC section 3.7: O(1) copies + SSO) ----------
+// Small-string optimization: strings up to 22 bytes live inline (no allocation —
+// covers split() parts, chars, keys); longer strings are Rc<str> (O(1) clones).
 
-type SStr = Rc<str>;
+#[derive(Clone)]
+enum SStr {
+    Small { len: u8, buf: [u8; 22] },
+    Big(Rc<str>),
+}
 
-fn sstr(s: &str) -> SStr { Rc::from(s) }
-fn sstring(s: String) -> SStr { Rc::from(s) }
+impl SStr {
+    fn from_str_slice(s: &str) -> SStr {
+        if s.len() <= 22 {
+            let mut buf = [0u8; 22];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            SStr::Small { len: s.len() as u8, buf }
+        } else {
+            SStr::Big(Rc::from(s))
+        }
+    }
+    fn as_str(&self) -> &str {
+        match self {
+            SStr::Small { len, buf } => unsafe {
+                std::str::from_utf8_unchecked(&buf[..*len as usize])
+            },
+            SStr::Big(r) => r,
+        }
+    }
+}
+
+impl std::fmt::Display for SStr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::ops::Deref for SStr {
+    type Target = str;
+    fn deref(&self) -> &str { self.as_str() }
+}
+impl PartialEq for SStr {
+    fn eq(&self, other: &SStr) -> bool { self.as_str() == other.as_str() }
+}
+impl PartialOrd for SStr {
+    fn partial_cmp(&self, other: &SStr) -> Option<std::cmp::Ordering> {
+        self.as_str().partial_cmp(other.as_str())
+    }
+}
+
+fn sstr(s: &str) -> SStr { SStr::from_str_slice(s) }
+fn sstring(s: String) -> SStr { SStr::from_str_slice(&s) }
 
 fn serp_err<T>(kind: &str, msg: String) -> SRes<T> {
     Err(SerpErr::new(kind, msg))
@@ -175,9 +220,9 @@ impl PyShow for String {
     fn py_str(&self) -> String { self.clone() }
     fn py_repr(&self) -> String { self.as_str().py_repr() }
 }
-impl PyShow for Rc<str> {
-    fn py_str(&self) -> String { self.to_string() }
-    fn py_repr(&self) -> String { (**self).py_repr() }
+impl PyShow for SStr {
+    fn py_str(&self) -> String { self.as_str().to_string() }
+    fn py_repr(&self) -> String { self.as_str().py_repr() }
 }
 impl PyShow for SerpErr {
     fn py_str(&self) -> String { self.msg.clone() }
@@ -399,14 +444,17 @@ impl<K: PyShow, V: PyShow> PyShow for SerpDict<K, V> {
 
 // ---------- str operations ----------
 
-fn py_len_str(s: &str) -> i64 { s.chars().count() as i64 }
-fn py_split_ws(s: &str) -> Vec<SStr> { s.split_whitespace().map(Rc::from).collect() }
+fn py_len_str(s: &str) -> i64 {
+    if s.is_ascii() { return s.len() as i64; }
+    s.chars().count() as i64
+}
+fn py_split_ws(s: &str) -> Vec<SStr> { s.split_whitespace().map(sstr).collect() }
 fn py_split(s: &str, sep: &str) -> SRes<Vec<SStr>> {
     if sep.is_empty() { return serp_err("ValueError", "empty separator".into()); }
-    Ok(s.split(sep).map(Rc::from).collect())
+    Ok(s.split(sep).map(sstr).collect())
 }
 fn py_join(sep: &str, v: &Vec<SStr>) -> SStr {
-    let parts: Vec<&str> = v.iter().map(|s| &**s).collect();
+    let parts: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
     sstring(parts.join(sep))
 }
 fn py_strip(s: &str) -> SStr { sstr(s.trim()) }
@@ -429,13 +477,19 @@ fn py_chars(s: &str) -> impl Iterator<Item = SStr> + '_ {
     s.chars().map(|c| sstring(c.to_string()))
 }
 fn py_str_idx(s: &str, i: i64) -> SRes<SStr> {
+    if s.is_ascii() {
+        let n = s.len() as i64;
+        let j = if i < 0 { i + n } else { i };
+        if j < 0 || j >= n { return serp_err("IndexError", "string index out of range".into()); }
+        return Ok(sstr(&s[j as usize..j as usize + 1]));
+    }
     let n = s.chars().count() as i64;
     let j = if i < 0 { i + n } else { i };
     if j < 0 || j >= n { return serp_err("IndexError", "string index out of range".into()); }
     Ok(sstring(s.chars().nth(j as usize).unwrap().to_string()))
 }
 fn py_str_slice(s: &str, lo: Option<i64>, hi: Option<i64>) -> SStr {
-    let n = s.chars().count() as i64;
+    let n = if s.is_ascii() { s.len() as i64 } else { s.chars().count() as i64 };
     let norm = |v: i64| -> i64 {
         let x = if v < 0 { v + n } else { v };
         x.clamp(0, n)
@@ -443,6 +497,9 @@ fn py_str_slice(s: &str, lo: Option<i64>, hi: Option<i64>) -> SStr {
     let a = norm(lo.unwrap_or(0));
     let b = norm(hi.unwrap_or(n));
     if a >= b { return sstr(""); }
+    if s.is_ascii() {
+        return sstr(&s[a as usize..b as usize]);
+    }
     sstring(s.chars().skip(a as usize).take((b - a) as usize).collect::<String>())
 }
 fn py_ord(s: &str) -> SRes<i64> {
@@ -490,6 +547,13 @@ fn serp_sorted<T: PartialOrd + Clone>(v: &Vec<T>) -> Vec<T> {
     let mut c = v.clone();
     c.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     c
+}
+
+fn serp_next<T: Clone>(it: &mut std::slice::Iter<'_, T>) -> SRes<T> {
+    match it.next() {
+        Some(v) => Ok(v.clone()),
+        None => serp_err("StopIteration", String::new()),
+    }
 }
 
 // ---------- conversions ----------
@@ -578,5 +642,5 @@ impl SerpFile {
 // ---------- sys ----------
 
 fn serp_argv() -> Vec<SStr> {
-    std::env::args().map(Rc::from).collect()
+    std::env::args().map(sstring).collect()
 }
