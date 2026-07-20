@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/serpentine-lang/serpentine"
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
 
 [tool.setuptools.packages.find]
 where = ["src"]
