@@ -17,16 +17,21 @@ jobs:
       - name: Build sdists + wheels for both packages
         run: |
           python -m pip install build twine
-          python -m build --outdir dist shim
-          python -m build --outdir dist compiler
-          python -m twine check dist/*
+          python -m build --outdir dist-shim shim
+          python -m build --outdir dist-lang compiler
+          python -m twine check dist-shim/* dist-lang/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: dist/
+          name: dist-shim
+          path: dist-shim/
 
-  publish:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-lang
+          path: dist-lang/
+
+  publish-lang:
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -37,8 +42,25 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: dist-lang
           path: dist/
 
-      - name: Publish to PyPI (trusted publishing)
+      - name: Publish serpentine-lang to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-shim:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-shim
+      url: https://pypi.org/project/serpentine-shim/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-shim
+          path: dist/
+
+      - name: Publish serpentine-shim to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
