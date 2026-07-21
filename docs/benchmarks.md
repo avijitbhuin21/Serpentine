@@ -1,7 +1,7 @@
 # Benchmarks — Phase 3 (§5.11)
 
 > Measured 2026-07-17 on the development machine (Windows, x86_64), `tools/run_benchmarks.py`,
-> median of 3 runs. serp = Backend A native binary (`serp build`, rustc `-C opt-level=2`).
+> median of 3 runs. serp = Backend A native binary (`serp build --backend rust`, rustc `-C opt-level=2`).
 > Outputs of every runner are byte-compared before timing counts.
 
 ## Comparison targets
@@ -44,7 +44,7 @@ critical path.
 
 ### Phase-5 update (2026-07-21): Backend B (direct LLVM) vs Backend A
 
-Backend B (`serp build --backend llvm`) compiles SIR-checked programs straight to native
+Backend B (`serp build`, now the default; direct LLVM) compiles SIR-checked programs straight to native
 objects via llvmlite and links against the cached Rust runtime. In release mode the
 runtime's LLVM **bitcode is merged and internalized into the program module before O3**,
 so runtime primitives inline into hot loops (the same whole-program advantage rustc gives

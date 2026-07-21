@@ -46,8 +46,44 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _oracle_verify(tc, entry: Path, keep_rust: bool) -> int:
+    """Release-build oracle pass: transpile to Rust and let rustc re-validate
+    every type/ownership decision (--emit=metadata: full analysis, no codegen).
+    Returns 0 on agreement; non-zero aborts the build."""
+    try:
+        rust_src = generate_rust(tc)
+    except CodegenError as exc:
+        print(f"serp: internal codegen error (oracle pass): {exc}", file=sys.stderr)
+        return 2
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        print("serp: rustc not found on PATH — needed for the release oracle pass "
+              "(use --no-verify or --debug to skip)", file=sys.stderr)
+        return 2
+    rs_dir = Path(tempfile.mkdtemp(prefix="serp_verify_"))
+    rs_file = rs_dir / f"{entry.stem}.rs"
+    rs_file.write_text(rust_src, encoding="utf-8")
+    if keep_rust:
+        keep = entry.with_suffix(".rs")
+        keep.write_text(rust_src, encoding="utf-8")
+        print(f"serp: rust source kept at {keep}")
+    proc = subprocess.run(
+        [rustc, "--edition", "2021", "--emit=metadata",
+         "-o", str(rs_dir / "verify.rmeta"), str(rs_file)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        print("serp: ORACLE DISAGREEMENT — rustc rejected the generated program.\n"
+              "This means the Serpentine checker accepted something unsound; the\n"
+              "build was aborted. Please report this. rustc says:", file=sys.stderr)
+        print(proc.stderr, file=sys.stderr)
+        return 2
+    print("serp: oracle pass OK (rustc re-validated ownership)")
+    return 0
+
+
 def cmd_build(args: argparse.Namespace) -> int:
-    """serp build: check, then compile natively (Rust backend or direct LLVM)."""
+    """serp build: check, then compile natively (direct LLVM by default;
+    release builds are first re-validated through the Rust oracle)."""
     rep = Reporter()
     try:
         tc = run_check(Path(args.file), rep)
@@ -61,6 +97,10 @@ def cmd_build(args: argparse.Namespace) -> int:
         out = out.with_suffix(".exe")
 
     if args.backend == "llvm":
+        if not args.debug and not args.no_verify:
+            rc = _oracle_verify(tc, entry, args.keep_rust)
+            if rc != 0:
+                return rc
         from .llvmbuild import LLVMBuildError
         from .llvmgen import LLVMUnsupported, build_llvm_native
         try:
@@ -150,8 +190,10 @@ def main() -> int:
     p_build = sub.add_parser("build", help="compile to a native binary")
     p_build.add_argument("file")
     p_build.add_argument("-o", "--output", default=None)
-    p_build.add_argument("--backend", choices=["rust", "llvm"], default="rust",
-                         help="code generator: rust (default, oracle-checked) or llvm (direct)")
+    p_build.add_argument("--backend", choices=["llvm", "rust"], default="llvm",
+                         help="code generator: llvm (default, direct) or rust (oracle backend)")
+    p_build.add_argument("--no-verify", action="store_true",
+                         help="skip the release-build rustc oracle pass")
     p_build.add_argument("--keep-rust", action="store_true", help="write the generated .rs next to the source")
     p_build.add_argument("--debug", action="store_true", help="fast unoptimized build")
     p_build.add_argument("--debuginfo", action="store_true",

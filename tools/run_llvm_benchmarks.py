@@ -40,9 +40,10 @@ def timed(cmd: list[str], cwd: Path) -> tuple[float, bytes]:
 
 
 def build(backend: str, src: Path, out: Path) -> None:
-    cmd = [sys.executable, "-m", "serpentine_lang.cli", "build", str(src), "-o", str(out)]
+    cmd = [sys.executable, "-m", "serpentine_lang.cli", "build", str(src), "-o", str(out),
+           "--backend", backend]
     if backend == "llvm":
-        cmd += ["--backend", "llvm"]
+        cmd.append("--no-verify")      # timing the LLVM backend, not the oracle
     proc = subprocess.run(cmd, capture_output=True, timeout=600, cwd=str(BENCH))
     if proc.returncode != 0:
         raise RuntimeError(f"{backend} build of {src.name} failed:\n"

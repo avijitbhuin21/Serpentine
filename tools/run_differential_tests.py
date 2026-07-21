@@ -57,7 +57,7 @@ def main() -> int:
             continue
         exe = bindir / (test.parent.name + "_" + test.stem + (".exe" if sys.platform == "win32" else ""))
         bld = run([sys.executable, "-m", "serpentine_lang.cli", "build", str(test),
-                   "-o", str(exe), "--debug"], test.parent)
+                   "-o", str(exe), "--backend", "rust", "--debug"], test.parent)
         if bld.returncode != 0:
             failures.append(rel)
             print(f"FAIL {rel}: serp build failed")

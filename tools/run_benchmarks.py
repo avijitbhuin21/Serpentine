@@ -48,7 +48,7 @@ def main() -> int:
             continue
         exe = tmp / (bench.stem + ".exe")
         bld = subprocess.run([sys.executable, "-m", "serpentine_lang.cli", "build",
-                              str(bench), "-o", str(exe)],
+                              str(bench), "-o", str(exe), "--backend", "rust"],
                              capture_output=True, timeout=600, cwd=str(BENCH))
         if bld.returncode != 0:
             print(f"BUILD FAIL {bench.name}: {(bld.stderr or bld.stdout).decode()[:400]}")

@@ -23,9 +23,8 @@ from llvmlite import ir
 
 from .frontend import Module
 from .ptypes import (Type, TBool, TClass, TDict, TExc, TFile, TFloat, TInt, TList, TNone,
-                     TOptional, TShared, TStr, TTuple, TVar, TWeak, mangle_type, subst_type,
-                     walk_types)
-from .typecheck import FuncSig, TIter, TIterObj, TypeChecker
+                     TOptional, TShared, TStr, TTuple, TWeak, mangle_type, subst_type)
+from .typecheck import FuncSig, TIterObj, TypeChecker
 
 I64 = ir.IntType(64)
 I32 = ir.IntType(32)

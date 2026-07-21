@@ -119,8 +119,8 @@ def word_lengths(text: str) -> dict[str, int]:
 | Command | What it does |
 |---|---|
 | `serp check tool.py` | type + borrow check, rustc-quality diagnostics |
-| `serp build tool.py` | native binary via Rust (rustc is the oracle for the checker) |
-| `serp llvm tool.py` | JIT-run the numeric core via LLVM (Backend B) |
+| `serp build tool.py` | native binary via direct LLVM (release runs a rustc oracle pass; `--backend rust` for the Rust backend) |
+| `serp llvm tool.py` | build via the LLVM backend and run (`--release`, `--emit-ir`) |
 | `serp lsp` | LSP server for editor diagnostics |
 
 A complete worked example — a JSON parser developed under CPython and deployed as a native
