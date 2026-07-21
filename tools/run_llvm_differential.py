@@ -21,7 +21,8 @@ def main() -> int:
     release = "--release" in sys.argv[1:]
     pattern = args[0] if args else ""
     extra = ["--release"] if release else []
-    tests = sorted(ACCEPT.glob("*.py")) + [ACCEPT / "034_two_module" / "main.py"]
+    tests = sorted(ACCEPT.glob("*.py"))
+    tests += sorted(d / "main.py" for d in ACCEPT.iterdir() if d.is_dir() and (d / "main.py").exists())
     if pattern:
         tests = [t for t in tests if pattern in str(t)]
     passed = failed = 0

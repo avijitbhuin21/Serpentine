@@ -4,8 +4,22 @@
 > compiled to native machine code with **no garbage collector** — while the exact same file
 > remains valid, runnable CPython. One codebase, two execution modes.
 
-**Status:** Phase 0 — spec & foundations. Nothing compiles yet; the spec and test corpus are
-the deliverables.
+**Status:** v0.5 — full compiler shipped: LLVM-direct native builds (default backend) with a
+rustc oracle pass on release builds, project tooling (`serp init` / `add` / `run`), packages,
+LSP, and a 59-program dual-run corpus, byte-identical on Windows/Linux/macOS.
+
+## Quick start
+
+```console
+pip install serpentine-lang        # brings uv + the shim along
+serp new myapp --git               # scaffold: serp.toml, main.py, .venv (shim installed), git
+cd myapp
+serp run                           # build (LLVM, debug) + run
+serp build main.py                 # native binary (release: O3 + runtime LTO + rustc oracle)
+serp add somelib                   # add a Serpentine library from PyPI (pinned in serp.lock)
+```
+
+`serp check` gives ownership/type diagnostics; `serp lsp` serves them to your editor.
 
 ## The Dual-Execution Guarantee
 

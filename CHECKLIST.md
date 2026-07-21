@@ -144,3 +144,30 @@
 - [x] `benchmarks/` suite: Backend B release within 5% of Backend A across fib/floats/alloc/strings — **worst B/A ratio 0.947 (B faster on all four)**; two key fixes recorded in docs/benchmarks.md (internal linkage for IPO; runtime-bitcode LTO)
 - [x] CI: LLVM-backend differential job (llvmlite install + full corpus) on all three OS runners — `.github/workflows/ci.yml` (job now runs the full-corpus harness; rustc already present for the Backend-A steps)
 - [x] **Milestone: whole corpus builds + dual-runs byte-identical through direct LLVM; debug builds ≥2x faster than Backend A debug (backend-only, 2.05x geomean); Backend A retained as oracle (§9)**
+
+## Phase 6 — Project tooling: packages, scaffolding, distribution (2026-07-21)
+
+> Goal: turn the compiler into a language people can start a project in — implement
+> `docs/packages.md`, uv-grade project scaffolding, a serp-library package manager,
+> and prebuilt runtime distribution.
+
+### 6.0 Multi-package import resolution (packages.md §2)
+- [x] Dotted `from a.b import x` imports (any depth) resolved as `<root>/a/b.py`; relative imports refused (SE213) — `frontend.py` + new `project.py`
+- [x] `serp.toml` discovery (walk up from entry), `[build] roots` extra import roots, dependency-gated venv site-packages resolution; SE213 lists searched roots
+- [x] Generated-identifier collision check (`util.text` vs `util_text`); rustgen module quals sanitized
+- [x] Tests: `tests/accept/059_package_import` (dual-run + LLVM byte-identical), `tests/reject/r054_relative_import.py`; full suites 59/59 + 54/54
+
+### 6.1 Scaffolding & project commands (`manage.py`)
+- [x] `serp init` / `serp new <name>`: serp.toml, main.py, .gitignore, `.venv` with the shim (uv preferred, stdlib venv+pip fallback), `--git`, `--no-venv`
+- [x] `serp run [file] [--release] [args...]`: project-aware (finds main.py next to serp.toml), builds debug via the default backend to a temp binary, forwards args + exit code
+- [x] uv + serpentine-shim are hard dependencies of serpentine-lang (one install gets everything)
+
+### 6.2 Dependency management (`pkg.py`)
+- [x] `serp add [name[==ver]]`: PyPI JSON API resolution, pure-wheel-only, refuses non-serp libraries (any dep beyond the shim), sha256-verified content-addressed cache (`SERP_PKG_CACHE`, temp-dir fallback), installs into the project venv (dual execution + compiler resolution see the same files)
+- [x] Exact pins written to `serp.toml [dependencies]` + `serp.lock` (name/version/sha256/filename)
+- [x] `serp remove`: manifest + lock + venv uninstall
+
+### 6.3 Runtime distribution
+- [x] `tools/build_rt_asset.py` + release-workflow matrix job: per-OS `serp-rt-<ver>-<platform>.zip` (lib + native-static-libs + bitcode + meta.json) uploaded as GitHub release assets
+- [x] `ensure_runtime` resolution order: local rustc-keyed cache → prebuilt asset (cache hit or download-on-first-use; source-hash validated, Windows additionally requires matching rustc for the rlib) → local rustc build; rustc-free error message points at rustup
+- [ ] Verify the release-asset job on the next tag push (CI-only; cannot be exercised locally)

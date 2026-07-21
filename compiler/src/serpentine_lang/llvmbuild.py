@@ -83,17 +83,125 @@ def runtime_key(rustc: str) -> str:
     return h.hexdigest()[:16]
 
 
+RELEASE_URL = ("https://github.com/avijitbhuin21/Serpentine/releases/download/"
+               "v{version}/serp-rt-{version}-{tag}.zip")
+
+
+def sources_hash() -> str:
+    """Hash of the runtime sources alone (rustc-independent)."""
+    h = hashlib.sha256()
+    for src in RT_SOURCES:
+        h.update(src.read_bytes())
+    return h.hexdigest()
+
+
+def platform_tag() -> str:
+    """Platform identifier used in prebuilt runtime asset names."""
+    import platform
+    mach = platform.machine().lower()
+    mach = {"amd64": "x86_64", "x64": "x86_64", "aarch64": "arm64"}.get(mach, mach)
+    osname = {"win32": "windows", "darwin": "macos"}.get(sys.platform, "linux")
+    return f"{osname}-{mach}"
+
+
+def serp_version() -> str:
+    """Installed serpentine-lang version (asset names are tied to releases)."""
+    try:
+        from importlib.metadata import version
+        return version("serpentine-lang")
+    except Exception:
+        from . import __version__
+        return __version__
+
+
+def _rustc_version(rustc: str) -> str:
+    return subprocess.run([rustc, "--version"], capture_output=True,
+                          text=True).stdout.strip()
+
+
+def _try_prebuilt(rustc: str | None, verbose: bool) -> tuple[Path, list[str], Path] | None:
+    """Reuse or download the prebuilt runtime for this release + platform.
+
+    The asset is trusted only when its runtime-source hash matches the local
+    sources; on Windows the rlib additionally requires the same rustc version
+    (rlib metadata is rustc-version-specific)."""
+    dirname = f"prebuilt-{serp_version()}-{platform_tag()}"
+    roots = (_cache_root(), _fallback_cache_root())
+    for root in roots:
+        if _prebuilt_valid(root / dirname, rustc):
+            hit = _runtime_hit(root / dirname)
+            if hit is not None:
+                return hit
+    url = RELEASE_URL.format(version=serp_version(), tag=platform_tag())
+    import io
+    import urllib.request
+    import zipfile
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "serp-rt/1"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception:
+        return None
+    for root in roots:
+        cache = root / dirname
+        try:
+            cache.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                zf.extractall(cache)
+        except OSError:
+            continue
+        if _prebuilt_valid(cache, rustc):
+            hit = _runtime_hit(cache)
+            if hit is not None:
+                if verbose:
+                    print(f"serp: using prebuilt runtime (downloaded to {cache})",
+                          file=sys.stderr)
+                return hit
+        return None
+    return None
+
+
+def _prebuilt_valid(cache: Path, rustc: str | None) -> bool:
+    """Check a prebuilt runtime dir's metadata against the local environment."""
+    import json
+    meta_file = cache / "meta.json"
+    if not meta_file.is_file():
+        return False
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if meta.get("sources_sha256") != sources_hash():
+        return False
+    if sys.platform == "win32":
+        if rustc is None or meta.get("rustc_version") != _rustc_version(rustc):
+            return False
+    return True
+
+
 def ensure_runtime(verbose: bool = False) -> tuple[Path, list[str], Path]:
     """Build (or reuse) the cached runtime artifacts.
 
+    Resolution order: local rustc-keyed cache, prebuilt release asset
+    (download-on-first-use), local rustc build, in that order.
+
     Returns (library path, extra native link args for the Unix cc link,
     runtime LLVM bitcode path for release-mode cross-runtime inlining)."""
-    rustc = _rustc()
-    key = runtime_key(rustc)
-    for root in (_cache_root(), _fallback_cache_root()):
-        hit = _runtime_hit(root / key)
-        if hit is not None:
-            return hit
+    rustc = shutil.which("rustc")
+    if rustc is not None:
+        key = runtime_key(rustc)
+        for root in (_cache_root(), _fallback_cache_root()):
+            hit = _runtime_hit(root / key)
+            if hit is not None:
+                return hit
+    hit = _try_prebuilt(rustc, verbose)
+    if hit is not None:
+        return hit
+    if rustc is None:
+        raise LLVMBuildError(
+            "rustc not found on PATH and no prebuilt runtime is available for "
+            f"serpentine-lang {serp_version()} on {platform_tag()} — install Rust "
+            "(https://rustup.rs) to build the runtime locally")
     try:
         return _ensure_runtime_at(_cache_root() / key, rustc, verbose)
     except LLVMBuildError as exc:

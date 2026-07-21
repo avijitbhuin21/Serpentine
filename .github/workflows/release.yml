@@ -5,6 +5,30 @@ on:
     tags: ["v*"]
 
 jobs:
+  runtime-assets:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build the prebuilt runtime asset
+        run: |
+          python -m pip install ./compiler
+          python tools/build_rt_asset.py
+
+      - name: Upload runtime asset to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-rt/*.zip
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -47,6 +71,8 @@ jobs:
 
       - name: Publish serpentine-lang to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   publish-shim:
     needs: build
@@ -64,3 +90,5 @@ jobs:
 
       - name: Publish serpentine-shim to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

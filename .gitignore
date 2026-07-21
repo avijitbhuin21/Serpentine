@@ -22,3 +22,4 @@ tests/accept/*.rs
 *.exe
 *.har
 testing/
+dist-rt/

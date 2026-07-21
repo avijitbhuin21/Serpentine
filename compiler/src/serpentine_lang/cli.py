@@ -210,6 +210,11 @@ def main() -> int:
     p_lsp = sub.add_parser("lsp", help="run the LSP server on stdio (editor diagnostics)")
     p_lsp.set_defaults(func=cmd_lsp)
 
+    from .manage import register as register_manage
+    register_manage(sub)
+    from .pkg import register as register_pkg
+    register_pkg(sub)
+
     args = parser.parse_args()
     return args.func(args)
 

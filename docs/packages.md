@@ -1,9 +1,10 @@
 # Multi-Package Design — Modules, Libraries, and Cross-Library Conventions
 
-> Phase-4-backlog design item. Serpentine today is whole-program, single-directory
-> (bin-1 imports). This document is the committed design for growing to packages and
-> third-party libraries without changing the ownership model. It is a design of record,
-> not yet an implementation.
+> **Status: implemented (v0.4)** — dotted imports, `serp.toml` discovery, declared
+> roots, and dependency-gated venv resolution ship in `serp`; `serp init` / `serp new`
+> scaffold projects and `serp add` / `serp remove` manage pinned PyPI dependencies
+> (recorded in `serp.lock`). Sections below are the design of record; §2 notes the
+> shipped semantics.
 
 ## 1. Where we are (v0.3)
 
@@ -27,12 +28,37 @@ myproject/
 ```
 
 - `import util.text` resolves to `<root>/util/text.py`; the module name is the full
-  dotted path. One level of nesting in v1 (`a.b`), deeper by demand.
+  dotted path. **Shipped form: `from util.text import name` (any nesting depth);
+  plain `import util.text` with attribute access stays out (only `import sys` is
+  special-cased).** Relative imports are refused (SE213).
 - No package-level `__init__.py` execution — imports stay side-effect-free (SPEC §9's
-  "import has no side effects" rule scales as-is).
-- Resolution order: (1) entry-file directory tree, (2) declared library roots from
-  `serp.toml`, (3) refuse (`SE213`). CPython sees the same files via ordinary `sys.path`
-  semantics (the project root on the path), preserving dual execution.
+  "import has no side effects" rule scales as-is). Under CPython the directories
+  resolve as namespace packages.
+- Resolution order (shipped): (1) entry-file directory tree, (2) `[build] roots`
+  declared in `serp.toml` (found by walking up from the entry file), (3) the project
+  venv's site-packages, gated to distributions listed under `[dependencies]`,
+  (4) refuse (`SE213`). CPython sees the same files via ordinary `sys.path` semantics,
+  preserving dual execution — venv dependencies are on `sys.path` automatically;
+  extra `[build] roots` need `PYTHONPATH` (or a `.pth` file) for the CPython run.
+- Two module names that mangle to the same generated identifier (`util.text` vs
+  `util_text`) are refused at load time.
+
+### 2.1 serp.toml (shipped schema)
+
+```toml
+[project]
+name = "myproject"
+version = "0.1.0"
+
+[dependencies]          # written by `serp add`, exact pins
+mylib = "==1.2.0"
+
+[build]
+roots = ["vendor"]      # optional extra import roots, relative to serp.toml
+```
+
+`serp.lock` (written by `serp add`) records name, version, sha256, and wheel
+filename per dependency for reproducible installs.
 
 ## 3. Libraries ship as source
 

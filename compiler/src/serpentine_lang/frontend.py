@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .diagnostics import Reporter, Span
+from .project import ManifestError, import_context
 
 
 @dataclass
@@ -42,7 +43,11 @@ def load_program(entry_path: Path, rep: Reporter,
     take precedence over the on-disk text (used by the LSP for unsaved edits).
     """
     entry_path = entry_path.resolve()
-    root = entry_path.parent
+    try:
+        ctx = import_context(entry_path.parent)
+    except ManifestError as exc:
+        rep.fatal("SE201", "unsupported-feature", f"invalid serp.toml: {exc}",
+                  Span(str(entry_path), 1, 0))
     entry = _load_module(entry_path, entry_path.stem, rep, overlay)
     program = Program(entry=entry, modules={entry.name: entry})
     queue = [entry]
@@ -51,17 +56,31 @@ def load_program(entry_path: Path, rep: Reporter,
         for local, (mod_name, _orig) in mod.imports.items():
             if mod_name in program.modules:
                 continue
-            candidate = root / f"{mod_name}.py"
-            if not candidate.exists():
+            candidate = ctx.resolve(mod_name)
+            if candidate is None:
                 span = _import_span(mod, mod_name)
+                roots = ", ".join(str(r) for r in ctx.searched_roots())
                 rep.fatal("SE213", "foreign-import",
-                          f"import of '{mod_name}' does not resolve to a Serpentine module — "
-                          f"the CPython interop boundary refuses foreign imports in native "
-                          f"builds (docs/interop.md); run under CPython to use them", span)
+                          f"import of '{mod_name}' does not resolve to a Serpentine module "
+                          f"(searched: {roots}) — the CPython interop boundary refuses foreign "
+                          f"imports in native builds (docs/interop.md); run under CPython to "
+                          f"use them", span)
             sub = _load_module(candidate, mod_name, rep, overlay)
+            _check_name_collision(program, sub, rep)
             program.modules[mod_name] = sub
             queue.append(sub)
     return program
+
+
+def _check_name_collision(program: Program, new: Module, rep: Reporter) -> None:
+    """Refuse two module names that mangle to the same generated identifier."""
+    key = new.name.replace(".", "_")
+    for existing in program.modules.values():
+        if existing.name != new.name and existing.name.replace(".", "_") == key:
+            rep.fatal("SE201", "unsupported-feature",
+                      f"module names '{existing.name}' and '{new.name}' collide in "
+                      f"generated code (both mangle to '{key}')",
+                      Span(str(new.path), 1, 0))
 
 
 def _import_span(mod: Module, mod_name: str) -> Span:
@@ -110,20 +129,22 @@ def _load_module(path: Path, name: str, rep: Reporter,
                     if alias.asname:
                         rep.fatal("SE201", "unsupported-feature", "aliased shim imports are not supported", span)
                     mod.shim_imports.add(alias.name)
-            elif node.module is not None and "." not in node.module and node.level == 0:
+            elif node.module is not None and node.level == 0:
                 for alias in node.names:
                     local = alias.asname or alias.name
                     mod.imports[local] = (node.module, alias.name)
             else:
                 rep.fatal("SE213", "foreign-import",
-                          f"import of '{node.module}' is not a Serpentine module or the shim", span)
+                          f"relative import is not supported — use the full dotted module "
+                          f"path from the project root", span)
         elif isinstance(node, ast.Import):
             if len(node.names) == 1 and node.names[0].name == "sys" and node.names[0].asname is None:
                 mod.imports_sys = True
                 continue
             rep.fatal("SE213", "foreign-import",
-                      f"import of '{node.names[0].name}' is not a Serpentine module or the shim "
-                      f"(only 'import sys' is special-cased) — the interop boundary refuses "
+                      f"import of '{node.names[0].name}' is not supported — use "
+                      f"'from {node.names[0].name} import ...' for Serpentine modules "
+                      f"(only 'import sys' is special-cased); the interop boundary refuses "
                       f"foreign imports in native builds (docs/interop.md)",
                       span)
         elif isinstance(node, ast.FunctionDef):

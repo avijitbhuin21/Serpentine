@@ -110,7 +110,7 @@ class RustGen:
                 for sig in sigs:
                     self._emit_function(mod, sig, public=False)
                 continue
-            self._line(f"mod m_{mod.name} {{")
+            self._line(f"mod m_{_sanitize(mod.name)} {{")
             self.indent += 1
             self._line("use super::*;")
             for sig in sigs:
@@ -1174,7 +1174,7 @@ class RustGen:
             args.append(self._default_code(p))
         qual = ""
         if sig.module != self.mod.name:
-            qual = f"m_{sig.module}::"
+            qual = f"m_{_sanitize(sig.module)}::"
         return self._q(f"{qual}f_{_sanitize(sig.name)}({', '.join(args)})")
 
     def _builtin_call(self, node: ast.Call, name: str) -> str:
@@ -1317,7 +1317,7 @@ class RustGen:
                                              self._t(a), p.typ))
             for p in sig.params[1 + len(args):]:
                 argv.append(self._default_code(p))
-            qual = f"m_{sig.module}::" if sig.module != self.mod.name else ""
+            qual = f"m_{_sanitize(sig.module)}::" if sig.module != self.mod.name else ""
             return self._q(f"{qual}f_{_sanitize(sig.name)}({', '.join(argv)})")
         if isinstance(inner, TFile):
             r = self._recv(recv, True)
