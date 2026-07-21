@@ -4,7 +4,7 @@
 
 ## Phase 0 — Spec & Foundations
 
-- [ ] Register `serpentine-lang` + `serpentine-shim` on PyPI and grab the GitHub org (§6.11) — *names verified free 2026-07-17; package is publish-ready; needs owner credentials*
+- [x] Register `serpentine-lang` + `serpentine-shim` on PyPI and grab the GitHub org (§6.11) — *published 2026-07-20 via trusted publishing (repo `avijitbhuin21/Serpentine`, `release.yml` on `v*` tags)*
 - [x] Init repo: license, README, `.gitignore`, CI skeleton pinned to CPython 3.12 (§4 version pin)
 - [x] Write `SPEC.md`: Tier-0 grammar (types, statements, expressions) (§3.1)
 - [x] Spec ownership rules as judgments (move, borrow, drop, Copy types) (§3.2)
@@ -73,7 +73,7 @@
 - [x] Refactor checker-as-library, ship LSP for editor diagnostics (§5.13) — `serpentine_lang.api` (check_file/check_source with buffer overlays) + `serp lsp` (stdio, dependency-free); `tools/run_lsp_smoke.py`
 - [x] North-star demo: JSON parser developed under CPython, deployed as native binary (§9) — `examples/json_parser.py` (full escapes incl. surrogate pairs, error recovery); byte-identical dual-run; locked into the corpus as `tests/accept/055_json_roundtrip.py`
 - [x] Docs: language tour, ownership guide, divergence page, migration notes — `docs/tour.md`, `docs/ownership.md`, `docs/divergences.md`, `docs/migration.md` (+ `docs/interop.md`)
-- [ ] Publish `serpentine-lang` v0.1 + announce — *sdists + wheels built (`dist/`, serpentine-shim 0.3.0 + serpentine-lang 0.3.0), twine-checked; the upload itself and the announcement need the owner's PyPI credentials (same blocker as the Phase-0 registration box)*
+- [x] Publish `serpentine-lang` v0.1 + announce — *published 2026-07-20: serpentine-lang 0.4.0 + serpentine-shim 0.3.0 live on PyPI (trusted publishing, tag `v0.4.0`); verified end-to-end (fresh venv, pip install, dual-run). Announcement still open — venues in `docs/publishing.md`*
 
 ## Bonus — Phase 4 backlog (readiness-report findings, 2026-07-17)
 
@@ -103,4 +103,44 @@
 ### Housekeeping
 - [x] Bump CI actions (checkout@v4 / setup-python@v5) to silence Node-20 deprecation annotations — *bumped to checkout@v5 / setup-python@v6; LSP smoke test added to CI*
 - [x] `Owned` (consuming) `self` methods (deferred from Phase 2, SE202) — *landed 2026-07-18: `move(x).method()` call discipline (SE002 without move, SE001 after); SPEC §14.1; tests/accept/058, tests/reject/r048*
-- [x] Backend B: grow the LLVM numeric core (float printing via shortest-roundtrip, strings) or fold into Phase-4 priorities — *folded into Phase-4 priorities per this box's own alternative: Backend A (full language) + tooling carried the phase; Backend B remains the numeric-core demo (`serp llvm`, harness green)*
+- [x] Backend B: grow the LLVM numeric core (float printing via shortest-roundtrip, strings) or fold into Phase-4 priorities — *folded into Phase-4 priorities; Backend B stayed the numeric-core demo (`serp llvm`, harness green); now superseded by Phase 5 below*
+
+## Phase 5 — Backend B grows up: direct-to-LLVM native builds
+
+> Goal: `serp build` can skip the Rust round-trip entirely — SIR → LLVM IR → object → linked
+> native binary — with a **debug mode** (minimal LLVM work, fast links) targeting 2–3x faster
+> builds and a **release mode** (full optimization pipeline) matching Backend A's runtime perf.
+> Backend A (Rust) stays as the reference backend and rustc-as-oracle for the borrow checker.
+
+### 5.0 Design & runtime strategy
+- [ ] Decision doc: runtime via `prelude.rs` compiled ONCE as a `staticlib` with a C ABI (reuse everything: SStr/SSO, Vec lists, SerpDict, Rc/Weak, SerpErr) vs. hand-written C runtime — record in `DECISIONS.md`
+- [ ] Define the C ABI surface (`serp_rt.h` equivalent): naming, ownership transfer rules at the boundary, error-value returns (`SRes<T>` as out-param + status), panic-free guarantees
+- [ ] Build + cache the runtime staticlib per compiler version/target (`%LOCALAPPDATA%/serp/rt/<ver>-<target>/serp_rt.lib`); rebuild only on prelude change
+- [ ] Spec debug vs release semantics: identical program behavior, only compile-time/optimization differ (divergences doc gets a "none" entry)
+
+### 5.1 Lowering: full language coverage in `llvmgen.py`
+- [ ] Strings: SStr through the runtime ABI (construction, concat, methods, f-string formatting, repr parity incl. float shortest-roundtrip)
+- [ ] Lists: literals, index/slice, methods (append/pop/extend/sort/…), iteration, element borrows
+- [ ] Dicts: SerpDict ABI, literals, methods, insertion-order iteration, `in`
+- [ ] Tuples + Copy semantics table parity with Backend A
+- [ ] Tier-1 classes: struct layout, methods (Ref/Mut/Owned self), dataclass repr/eq parity, generics via monomorphized instantiations
+- [ ] `Shared[T]`/`Weak[T]`: Rc/Weak ABI incl. runtime borrow-error parity
+- [ ] Exceptions: error-value scheme (no unwinding/landing pads) — SRes checks + early-return blocks, try/except lowering, catchable runtime errors, CPython-parity messages + exit code 1
+- [ ] Drops: scope-exit + unwind-path drop insertion mirrored from SIR drop ops
+- [ ] Tier-1/2 builtins: `open()`/`with` (drop closes), `sys.argv`/`sys.exit`, comprehensions, `sorted` + `key=` closures, `zip`/`reversed`/`enumerate`/`range`, `round`/`ord`/`chr`
+- [ ] Multi-module programs (same three-bin import rules as Backend A)
+
+### 5.2 Emit, link, modes
+- [ ] `serp build --backend llvm` (Backend A remains default until 5.3 exit criteria met)
+- [ ] Object emission via llvmlite `emit_object`; link with the platform linker (link.exe / lld) against the runtime staticlib
+- [ ] **Debug mode** (`--debug`): opt-level 0, no LLVM pass pipeline, fast link → measure and document the 2–3x build-time win vs Backend A `--debug`
+- [ ] **Release mode**: full -O2/O3 + targeted passes; runtime perf within noise of Backend A on `benchmarks/`
+- [ ] Debug info: source-line mapping (DWARF/PDB) so native stack traces point at `.py` lines
+- [ ] Build-time benchmark harness: compile-time comparison A vs B (debug + release) on the corpus + a synthetic large program
+
+### 5.3 Verification & exit criteria
+- [ ] Extend `tools/run_llvm_differential.py` to the ENTIRE accept corpus: byte-identical stdout vs CPython (same bar as Backend A)
+- [ ] All runtime-error accept/reject behaviors match (messages, exit codes)
+- [ ] `benchmarks/` suite: Backend B release within 5% of Backend A across fib/floats/alloc/strings
+- [ ] CI: LLVM-backend differential job (llvmlite install + full corpus) on all three OS runners
+- [ ] **Milestone: whole corpus builds + dual-runs byte-identical through direct LLVM; debug builds ≥2x faster than Backend A debug; Backend A retained as oracle (§9)**
