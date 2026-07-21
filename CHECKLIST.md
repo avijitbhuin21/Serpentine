@@ -170,4 +170,29 @@
 ### 6.3 Runtime distribution
 - [x] `tools/build_rt_asset.py` + release-workflow matrix job: per-OS `serp-rt-<ver>-<platform>.zip` (lib + native-static-libs + bitcode + meta.json) uploaded as GitHub release assets
 - [x] `ensure_runtime` resolution order: local rustc-keyed cache → prebuilt asset (cache hit or download-on-first-use; source-hash validated, Windows additionally requires matching rustc for the rlib) → local rustc build; rustc-free error message points at rustup
-- [ ] Verify the release-asset job on the next tag push (CI-only; cannot be exercised locally)
+- [x] Verify the release-asset job on the next tag push — **verified 2026-07-21: v0.5.0 release green, all three platform assets live**
+
+## Phase 7 — Libraries: the Serpentine standard library + ecosystem flagships
+
+> Full per-library tracker with waves, naming conventions, and implementation paths:
+> **[LIBRARIES.md](LIBRARIES.md)**. Naming: stdlib mirrors are `serp-<name>` on PyPI;
+> flagships get snake codenames (Coil=numpy, Scales=pandas, Fang=httpx, Venom=FastAPI,
+> Molt=pydantic). This section tracks only the compiler/tooling prerequisites.
+
+### 7.0 Prerequisites (compiler + tooling)
+- [ ] Runtime-backed module mechanism: a compiler-known whitelist mapping `from serp_math import sqrt` to rt.rs `extern "C"` primitives, with the PyPI package's CPython side delegating to the real stdlib (the [R] path in LIBRARIES.md)
+- [ ] `serp add`: allow serp libraries to depend on OTHER serp libraries (transitive resolution + lock; today only the shim is an allowed dependency in `pkg.py`)
+- [ ] `serp test` subcommand (discovery + run harness for serp-test)
+- [ ] User-defined exception classes (libraries need their own error types; Tier-3 item, currently ValueError-with-prefix convention)
+- [ ] General closures (library callback APIs; only `sorted key=` subset exists)
+- [ ] Operator overloading (`__add__`/`__mul__`/`__getitem__` on user classes) — blocks Coil/Scales ergonomics
+- [ ] `bytes` type + binary file IO — blocks serp-io/zlib/hashlib-streaming/subprocess/sockets
+- [ ] Concurrency decision (scoped threads + Send-checked captures vs. single-threaded-forever) — blocks Wave 4 servers and Wave 6
+
+### 7.1 Waves (see LIBRARIES.md for the full checklist)
+- [ ] Wave 1 — foundations: serp-math, serp-random, serp-time, serp-json, serp-test, serp-log
+- [ ] Wave 2 — daily-tool stdlib (strings/structs/itertools/csv/cli/pathlib/os/datetime/hashlib/re/...)
+- [ ] Wave 3 — files/compression/persistence (io, zlib, zipfile, sqlite)
+- [ ] Wave 4 — networking (socket, url, Fang, http-server, Venom)
+- [ ] Wave 5 — data flagships (Molt, Coil, Scales)
+- [ ] Wave 6 — language-level: concurrency story, async/await, subprocess
