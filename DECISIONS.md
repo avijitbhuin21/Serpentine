@@ -85,6 +85,53 @@ change tied to the "iterators as first-class borrows" backlog item.
   block — this keeps "file closed at block end" true on both sides of the dual-execution
   guarantee (CPython would allow touching the closed file object; Serpentine rejects it).
 
+## D8 — Phase-5 LLVM backend runtime strategy (2026-07-21)
+
+**Decision:** the Backend-B runtime is **`prelude.rs` compiled once behind a C ABI**, not a
+hand-written C runtime. A thin wrapper file (`rt.rs`, ~60 `extern "C"` symbols) is
+concatenated with `prelude.rs` and built ONCE per (source hash, rustc version, platform)
+into a cached library under `%LOCALAPPDATA%/serp/rt/<key>/` (Unix: `~/.cache/serp/rt`;
+`SERP_RT_CACHE` overrides; falls back to the system temp dir when the per-user dir is
+virtualized). Everything is reused: SStr/SSO, shortest-roundtrip float repr, CPython error
+messages, file IO — so repr/message parity is inherited, not re-implemented.
+
+**ABI shape:** values cross the boundary as raw blobs — `SStr` is an opaque 24-byte blob,
+lists/dicts are `{ptr, len, cap}` raw buffers with the element size passed per call (a dict
+is a scan-based insertion-ordered list of key/value pairs, same as Backend A's `SerpDict`).
+All type-directed logic (clone/drop/eq/ord/repr, dict scans, list element access, Shared
+refcount+borrow-flag manipulation) is EMITTED as LLVM IR per type; the runtime stays
+monomorphic and panic-free. Errors are error values: the runtime sets a pending
+`SerpErr` and returns a status byte; generated functions return `{i1 err, T}` and branch to
+per-function cleanup blocks (drop flags), giving unwind-path drops without landing pads.
+
+**Linking (platform split):** on Windows the runtime is an **rlib** and the final link
+compiles a 3-line Rust stub (`fn main` → `serp_entry()`) with `--extern serp_rt` plus the
+LLVM object as a link-arg — rustc handles MSVC linker/CRT discovery, and MSVC `link.exe`
+resolves archive symbols order-independently. On Unix the runtime is a **staticlib**, the
+LLVM module defines `main` itself, and the link is `cc prog.o libserp_rt.a
+<native-static-libs>` (the flag list is captured from rustc at runtime-build time). This
+deviates from the checklist's literal "staticlib everywhere" on Windows to avoid duplicate
+Rust-std symbols in a stub link; the "compile the runtime once, cache it, link objects
+against it" contract is unchanged.
+
+**Modes:** debug = opt 0, no pass pipeline; release = opt 3 + LLVM new-pass-manager O3
+**with runtime-bitcode LTO**: the cached runtime is also emitted as LLVM bitcode
+(`serp_rt.bc`, single CGU), merged into the program module, internalized, and optimized
+together — runtime primitives inline into hot loops, and the final link then omits the
+runtime library entirely (the object is runtime-complete; rustc's merge-functions aliases
+would otherwise produce duplicate symbols). Generated functions carry `internal` linkage so
+LLVM performs the same whole-program const-prop/inlining rustc gives Backend A. Identical
+program behavior in both modes (divergence list gets a "none" entry). `serp llvm`
+AOT-builds to a temp binary and runs it (the numeric-core MCJIT path is retired — one code
+path, and Windows MCJIT required ELF hacks). Backend A remains the default `serp build`
+backend and the rustc-as-oracle reference.
+
+**Known bounded leaks (invisible to program semantics, recorded for honesty):** caught
+exception values propagated across `try` re-raise clones may leak their message strings, and
+temporaries leak on error edges (borrow flags are still released). Files, lists, dicts,
+strings, and Shared boxes are dropped deterministically — Shared strong/weak counts are
+exact (weak-upgrade observability), and drop-closes-file semantics are preserved.
+
 ## Phase-4 backlog decisions (2026-07-18)
 
 - **Named element borrows are lexically block-scoped** (not NLL): `first = rows[0]` freezes

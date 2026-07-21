@@ -1,48 +1,50 @@
-"""LLVM-backend differential harness: numeric-core accept tests run under CPython
-AND via `serp llvm` (Backend B, JIT); stdout is byte-compared. Tests outside the
-numeric core are skipped (exit code 3 from the CLI).
+"""LLVM-backend differential harness (Phase 5.3): EVERY accept test is compiled
+natively via Backend B (`serp llvm` = check -> LLVM object -> link) and executed;
+stdout and exit code are byte-compared against CPython. Same bar as Backend A.
 
 Usage: python tools/run_llvm_differential.py [pattern]
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCEPT = ROOT / "tests" / "accept"
+ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
 
 
 def main() -> int:
-    """Run the LLVM differential suite; at least the numeric corpus must pass."""
-    pattern = sys.argv[1] if len(sys.argv) > 1 else ""
-    tests = sorted(ACCEPT.glob("*.py"))
+    """Run the LLVM differential suite over the entire accept corpus."""
+    args = [a for a in sys.argv[1:] if a != "--release"]
+    release = "--release" in sys.argv[1:]
+    pattern = args[0] if args else ""
+    extra = ["--release"] if release else []
+    tests = sorted(ACCEPT.glob("*.py")) + [ACCEPT / "034_two_module" / "main.py"]
     if pattern:
         tests = [t for t in tests if pattern in str(t)]
-    passed = skipped = failed = 0
+    passed = failed = 0
     for test in tests:
         rel = test.relative_to(ROOT)
-        jit = subprocess.run([sys.executable, "-m", "serpentine_lang.cli", "llvm", str(test)],
-                             capture_output=True, timeout=120, cwd=str(test.parent))
-        if jit.returncode == 3:
-            skipped += 1
-            print(f"skip {rel}: outside the numeric core")
-            continue
+        native = subprocess.run(
+            [sys.executable, "-m", "serpentine_lang.cli", "llvm", str(test)] + extra,
+            capture_output=True, timeout=300, cwd=str(test.parent), env=ENV)
         py = subprocess.run([sys.executable, str(test)], capture_output=True,
-                            timeout=120, cwd=str(test.parent))
-        jit_out = jit.stdout.replace(b"\r\n", b"\n")
+                            timeout=120, cwd=str(test.parent), env=ENV)
+        n_out = native.stdout.replace(b"\r\n", b"\n")
         py_out = py.stdout.replace(b"\r\n", b"\n")
-        if jit_out != py_out or jit.returncode != py.returncode:
+        if n_out != py_out or native.returncode != py.returncode:
             failed += 1
             print(f"FAIL {rel}: outputs differ (py exit {py.returncode}, "
-                  f"llvm exit {jit.returncode})")
+                  f"llvm exit {native.returncode})")
             print(f"  cpython: {py_out[:300]!r}")
-            print(f"  llvm   : {jit_out[:300]!r}")
-            print(f"  stderr : {jit.stderr[:300]!r}")
+            print(f"  llvm   : {n_out[:300]!r}")
+            print(f"  stderr : {native.stderr[-400:]!r}")
             continue
         passed += 1
-        print(f"ok   {rel} (LLVM JIT identical, {len(py_out)} bytes)")
-    print(f"\nLLVM backend: {passed} identical, {skipped} outside core, {failed} failed")
+        print(f"ok   {rel} (LLVM native identical, {len(py_out)} bytes)")
+    print(f"\nLLVM backend: {passed} identical, {failed} failed")
     return 1 if failed or passed == 0 else 0
 
 

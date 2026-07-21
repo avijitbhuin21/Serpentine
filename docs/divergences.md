@@ -4,6 +4,14 @@ The Dual-Execution Guarantee promises identical behavior for every accepted prog
 This page is the **complete** list of deliberate exceptions; anything else that differs
 is a Serpentine bug. (Normative table: `SPEC.md` §10; decisions: `DECISIONS.md`.)
 
+## Backends and build modes: none
+
+There are **no behavioral divergences between Backend A (Rust) and Backend B (direct
+LLVM)**, and **none between `--debug` and release builds** of either backend — debug and
+release differ only in compile time and optimization level. The full accept corpus runs
+byte-identically through both backends (`tools/run_differential_tests.py`,
+`tools/run_llvm_differential.py`); any difference between them is a bug.
+
 ## The one you must know
 
 **Integers are 64-bit** and overflow **traps** with

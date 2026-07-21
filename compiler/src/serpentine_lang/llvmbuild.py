@@ -1,0 +1,309 @@
+"""Backend B build pipeline: cached runtime library + object emission + native link.
+
+Runtime strategy (CHECKLIST Phase 5.0, DECISIONS.md): prelude.rs + rt.rs are
+compiled ONCE per (source hash, rustc version, target) into a cached Rust
+library; Backend-B objects link against it. Two platform link paths:
+
+- Windows (MSVC): runtime is an rlib; the final link compiles a 3-line Rust stub
+  with `--extern serp_rt` and passes the LLVM object via `-C link-arg` (MSVC
+  link.exe resolves symbols order-independently). rustc handles all linker and
+  CRT discovery.
+- Unix: runtime is a staticlib; the LLVM module defines `main` itself and we
+  link with the system C driver: `cc prog.o libserp_rt.a <native-static-libs>`.
+"""
+
+import hashlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PKG = Path(__file__).parent
+RT_SOURCES = [PKG / "prelude.rs", PKG / "rt.rs"]
+
+STUB_RS = """\
+extern crate serp_rt;
+extern "C" { fn serp_entry(); }
+fn main() { unsafe { serp_entry(); } }
+"""
+
+STUB_RS_BARE = """\
+extern "C" { fn serp_entry(); }
+fn main() { unsafe { serp_entry(); } }
+"""
+
+
+class LLVMBuildError(Exception):
+    """Backend-B build failure (toolchain missing or link error)."""
+
+
+def _run(cmd: list[str], what: str) -> subprocess.CompletedProcess:
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace")
+    if proc.returncode != 0:
+        raise LLVMBuildError(f"{what} failed:\n{proc.stderr}")
+    return proc
+
+
+def _rustc() -> str:
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        raise LLVMBuildError("rustc not found on PATH (needed once to build the "
+                             "Backend-B runtime library)")
+    return rustc
+
+
+def _cache_root() -> Path:
+    import os
+    override = os.environ.get("SERP_RT_CACHE")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path.home() / ".cache"
+    return base / "serp" / "rt"
+
+
+def _fallback_cache_root() -> Path:
+    """Sandboxes may virtualize per-user dirs so child processes can't see our
+    writes; the system temp dir is visible to every process."""
+    return Path(tempfile.gettempdir()) / "serp" / "rt"
+
+
+def runtime_key(rustc: str) -> str:
+    """Cache key: runtime sources + rustc version identify the artifact."""
+    h = hashlib.sha256()
+    for src in RT_SOURCES:
+        h.update(src.read_bytes())
+    ver = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout
+    h.update(ver.encode())
+    h.update(sys.platform.encode())
+    return h.hexdigest()[:16]
+
+
+def ensure_runtime(verbose: bool = False) -> tuple[Path, list[str], Path]:
+    """Build (or reuse) the cached runtime artifacts.
+
+    Returns (library path, extra native link args for the Unix cc link,
+    runtime LLVM bitcode path for release-mode cross-runtime inlining)."""
+    rustc = _rustc()
+    key = runtime_key(rustc)
+    for root in (_cache_root(), _fallback_cache_root()):
+        hit = _runtime_hit(root / key)
+        if hit is not None:
+            return hit
+    try:
+        return _ensure_runtime_at(_cache_root() / key, rustc, verbose)
+    except LLVMBuildError as exc:
+        if "couldn't read" not in str(exc):
+            raise
+        return _ensure_runtime_at(_fallback_cache_root() / key, rustc, verbose)
+
+
+def _runtime_hit(cache: Path) -> tuple[Path, list[str], Path] | None:
+    is_win = sys.platform == "win32"
+    lib = cache / ("libserp_rt.rlib" if is_win else "libserp_rt.a")
+    libs_file = cache / "native-static-libs.txt"
+    bc = cache / "serp_rt.bc"
+    if lib.exists() and libs_file.exists() and bc.exists():
+        return lib, libs_file.read_text().split(), bc
+    return None
+
+
+def _ensure_runtime_at(cache: Path, rustc: str, verbose: bool) -> tuple[Path, list[str], Path]:
+    is_win = sys.platform == "win32"
+    lib = cache / ("libserp_rt.rlib" if is_win else "libserp_rt.a")
+    libs_file = cache / "native-static-libs.txt"
+    bc = cache / "serp_rt.bc"
+    hit = _runtime_hit(cache)
+    if hit is not None:
+        return hit
+    cache.mkdir(parents=True, exist_ok=True)
+    combined = cache / "serp_rt.rs"
+    combined.write_text("\n".join(s.read_text(encoding="utf-8") for s in RT_SOURCES),
+                        encoding="utf-8")
+    if verbose:
+        import sys as _s
+        print(f"serp: building Backend-B runtime (one-time, cached at {cache})",
+              file=_s.stderr)
+    crate_type = "rlib" if is_win else "staticlib"
+    cmd = [rustc, "--edition", "2021", "--crate-type", crate_type,
+           "--crate-name", "serp_rt", "-C", "opt-level=3",
+           "--print", "native-static-libs",
+           "-o", str(lib), str(combined)]
+    proc = _run(cmd, "runtime library build (rustc)")
+    native = []
+    for line in proc.stderr.splitlines():
+        if "native-static-libs:" in line:
+            native = line.split("native-static-libs:", 1)[1].split()
+    libs_file.write_text(" ".join(native))
+    _run([rustc, "--edition", "2021", "--crate-type", "rlib",
+          "--crate-name", "serp_rt", "-C", "opt-level=3",
+          "-C", "codegen-units=1", "--emit", f"llvm-bc={bc}", str(combined)],
+         "runtime bitcode build (rustc)")
+    return lib, native, bc
+
+
+def _win_fastlink_setup(cache: Path, rustc: str) -> dict | None:
+    """One-time (cached) capture of a direct link.exe command template.
+
+    rustc's stub link costs ~0.2s per build; capturing the linker path and the
+    std rlib list once lets debug builds invoke link.exe directly (~0.02s).
+    Returns None when the environment doesn't match expectations (the caller
+    falls back to the rustc-driven link)."""
+    import json
+    meta = cache / "fastlink.json"
+    if meta.exists():
+        info = json.loads(meta.read_text())
+        if all(Path(o).exists() for o in info.get("stub_objs", [])):
+            return info
+    try:
+        stub = cache / "stub_bare.rs"
+        stub.write_text(STUB_RS_BARE, encoding="utf-8")
+        proc = subprocess.run(
+            [rustc, "--edition", "2021", "--print", "link-args",
+             "-C", "opt-level=0", "-C", "save-temps",
+             "-o", str(cache / "stub_probe.exe"), str(stub)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(cache))
+        line = proc.stdout.strip().splitlines()[0]
+        import shlex
+        args = [a.strip('"') for a in shlex.split(line, posix=False)]
+        linker = args[0].replace("\\\\", "\\")
+        if "link.exe" not in linker.lower():
+            return None
+        # save-temps leaves the stub's codegen objects (incl. the allocator
+        # shim) next to the output; they replace rustc's temp objects
+        stub_objs = sorted(str(p) for p in cache.glob("stub_probe*.rcgu.o"))
+        if not stub_objs:
+            return None
+        rlibs = [a.replace("\\\\", "\\") for a in args[1:] if a.endswith(".rlib")]
+        libs = [a for a in args[1:] if a.endswith(".lib") or a.startswith("/defaultlib:")]
+        # MSVC + Windows SDK lib dirs from the standard layout
+        msvc_lib = Path(linker).parents[3] / "lib" / "x64"
+        libpaths = [str(msvc_lib)]
+        import os
+        kits = Path(os.environ.get("ProgramFiles(x86)",
+                                   r"C:\Program Files (x86)")) / "Windows Kits" / "10" / "Lib"
+        if kits.exists():
+            best = sorted(kits.iterdir())[-1]
+            libpaths += [str(best / "um" / "x64"), str(best / "ucrt" / "x64")]
+        if not msvc_lib.exists():
+            return None
+        info = {"linker": linker, "stub_objs": stub_objs, "rlibs": rlibs,
+                "libs": libs, "libpaths": libpaths}
+        meta.write_text(json.dumps(info))
+        return info
+    except Exception:
+        return None
+
+
+def _win_fastlink(obj: Path, out: Path, debuginfo: bool, lib: Path,
+                  runtime_merged: bool) -> bool:
+    """Try the direct link.exe path; returns False to fall back to rustc."""
+    rustc = _rustc()
+    cache = lib.parent
+    info = _win_fastlink_setup(cache, rustc)
+    if info is None:
+        return False
+    cmd = [info["linker"], "/NOLOGO"] + info["stub_objs"] + [str(obj)]
+    if not runtime_merged:
+        cmd.append(str(lib))
+    cmd += info["rlibs"] + info["libs"]
+    cmd += [f"/LIBPATH:{p}" for p in info["libpaths"]]
+    cmd += ["/NXCOMPAT", f"/OUT:{out}"]
+    if debuginfo:
+        cmd.append("/DEBUG")
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                          errors="replace")
+    return proc.returncode == 0
+
+
+def emit_object(ir_text: str, out_obj: Path, opt: int) -> bool:
+    """Compile LLVM IR text to a native object file via llvmlite.
+
+    In release mode the cached runtime BITCODE is linked into the program
+    module and internalized first, so LLVM can inline runtime primitives into
+    hot loops (poor man's cross-language LTO). Returns True when the runtime
+    was merged in (the final link must then omit the runtime library — the
+    object is runtime-complete and rustc's merge-functions aliases would
+    otherwise collide)."""
+    import llvmlite.binding as llvm
+
+    llvm.initialize_native_target()
+    llvm.initialize_native_asmprinter()
+    mod = llvm.parse_assembly(ir_text)
+    mod.verify()
+    merged = False
+    if opt > 0:
+        try:
+            _, _, bc = ensure_runtime(verbose=True)
+            rt_mod = llvm.parse_bitcode(bc.read_bytes())
+            rt_fns = [f.name for f in rt_mod.functions if not f.is_declaration]
+            rt_globals = [g.name for g in rt_mod.global_variables]
+            mod.link_in(rt_mod)
+            for name in rt_fns:
+                try:
+                    mod.get_function(name).linkage = "internal"
+                except NameError:
+                    pass
+            for name in rt_globals:
+                try:
+                    mod.get_global_variable(name).linkage = "internal"
+                except NameError:
+                    pass
+            merged = True
+        except Exception as exc:                      # pragma: no cover — fallback
+            print(f"serp: runtime bitcode inlining unavailable ({exc}); "
+                  f"linking runtime as a plain library", file=sys.stderr)
+    target = llvm.Target.from_default_triple()
+    reloc = "pic" if sys.platform != "win32" else "default"
+    tm = target.create_target_machine(opt=opt, reloc=reloc, codemodel="default")
+    if opt > 0:
+        pto = llvm.create_pipeline_tuning_options(speed_level=opt)
+        pb = llvm.create_pass_builder(tm, pto)
+        mpm = pb.getModulePassManager()
+        mpm.run(mod, pb)
+    out_obj.write_bytes(tm.emit_object(mod))
+    return merged
+
+
+def link(obj: Path, out: Path, debug: bool, runtime_merged: bool = False,
+         debuginfo: bool = False) -> None:
+    """Link the emitted object against the cached runtime into a native binary."""
+    lib, native, _bc = ensure_runtime(verbose=True)
+    if sys.platform == "win32":
+        if _win_fastlink(obj, out, debuginfo, lib, runtime_merged):
+            return
+        rustc = _rustc()
+        with tempfile.TemporaryDirectory(prefix="serp_link_") as td:
+            stub = Path(td) / "stub.rs"
+            stub_src = STUB_RS_BARE if runtime_merged else STUB_RS
+            stub.write_text(stub_src, encoding="utf-8")
+            cmd = [rustc, "--edition", "2021", "-C", "opt-level=0",
+                   "-C", f"link-arg={obj}",
+                   "-o", str(out), str(stub)]
+            if not runtime_merged:
+                cmd[5:5] = ["--extern", f"serp_rt={lib}"]
+            if debuginfo:
+                cmd[3:3] = ["-C", "debuginfo=2"]
+            _run(cmd, "final link (rustc stub)")
+        return
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
+    if cc is None:
+        raise LLVMBuildError("no C linker driver (cc/clang/gcc) found on PATH")
+    cmd = [cc, str(obj), str(lib), "-o", str(out)] + native
+    if debuginfo:
+        cmd.append("-g")
+    _run(cmd, "final link (cc)")
+
+
+def build_native(ir_text: str, out: Path, debug: bool, debuginfo: bool = False) -> None:
+    """Full Backend-B build: IR -> object -> linked native binary."""
+    opt = 0 if debug else 3
+    with tempfile.TemporaryDirectory(prefix="serp_obj_") as td:
+        obj = Path(td) / ("prog.obj" if sys.platform == "win32" else "prog.o")
+        merged = emit_object(ir_text, obj, opt)
+        link(obj, out, debug, runtime_merged=merged, debuginfo=debuginfo)

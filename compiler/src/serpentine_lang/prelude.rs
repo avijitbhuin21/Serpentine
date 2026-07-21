@@ -3,7 +3,7 @@
 // messages (SPEC.md section 11), repr rules, and an insertion-ordered dict.
 // Phase 2: fatal runtime errors are ERROR VALUES (SerpErr), not aborts, so
 // try/except can catch them (DECISIONS.md D1).
-#![allow(dead_code, unused_mut, unused_variables, unused_imports, non_snake_case, unused_parens, non_camel_case_types, unreachable_code, unused_labels)]
+#![allow(dead_code, unused_mut, unused_variables, unused_imports, non_snake_case, unused_parens, non_camel_case_types, unreachable_code, unused_labels, private_interfaces, static_mut_refs, unsafe_op_in_unsafe_fn)]
 
 use std::process;
 use std::cell::RefCell;

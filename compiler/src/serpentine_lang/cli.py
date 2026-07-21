@@ -47,23 +47,38 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    """serp build: check, transpile to Rust, invoke rustc."""
+    """serp build: check, then compile natively (Rust backend or direct LLVM)."""
     rep = Reporter()
     try:
         tc = run_check(Path(args.file), rep)
     except SerpError:
         print(rep.render_all(), file=sys.stderr)
         return 1
-    try:
-        rust_src = generate_rust(tc)
-    except CodegenError as exc:
-        print(f"serp: internal codegen error: {exc}", file=sys.stderr)
-        return 2
 
     entry = Path(args.file).resolve()
     out = Path(args.output) if args.output else entry.with_suffix("")
     if sys.platform == "win32" and out.suffix != ".exe":
         out = out.with_suffix(".exe")
+
+    if args.backend == "llvm":
+        from .llvmbuild import LLVMBuildError
+        from .llvmgen import LLVMUnsupported, build_llvm_native
+        try:
+            build_llvm_native(tc, out, debug=args.debug, debuginfo=args.debuginfo)
+        except LLVMUnsupported as exc:
+            print(f"serp: internal LLVM codegen error: {exc}", file=sys.stderr)
+            return 2
+        except LLVMBuildError as exc:
+            print(f"serp: {exc}", file=sys.stderr)
+            return 2
+        print(f"serp: built {out} (llvm backend)")
+        return 0
+
+    try:
+        rust_src = generate_rust(tc)
+    except CodegenError as exc:
+        print(f"serp: internal codegen error: {exc}", file=sys.stderr)
+        return 2
 
     rustc = shutil.which("rustc")
     if rustc is None:
@@ -93,7 +108,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_llvm(args: argparse.Namespace) -> int:
-    """serp llvm: check, lower to LLVM IR (Backend B numeric core), JIT-run or dump IR."""
+    """serp llvm: check, build via Backend B (LLVM), run — or dump the IR."""
+    from .llvmbuild import LLVMBuildError
     from .llvmgen import LLVMUnsupported, generate_llvm, run_llvm
     rep = Reporter()
     try:
@@ -105,11 +121,14 @@ def cmd_llvm(args: argparse.Namespace) -> int:
         if args.emit_ir:
             print(generate_llvm(tc))
             return 0
-        return run_llvm(tc)
+        return run_llvm(tc, debug=not args.release)
     except LLVMUnsupported as exc:
-        print(f"serp: program is outside the LLVM numeric core ({exc}) — "
+        print(f"serp: program is outside the LLVM backend's coverage ({exc}) — "
               f"use `serp build` (Rust backend)", file=sys.stderr)
         return 3
+    except LLVMBuildError as exc:
+        print(f"serp: {exc}", file=sys.stderr)
+        return 2
 
 
 def cmd_lsp(args: argparse.Namespace) -> int:
@@ -128,16 +147,22 @@ def main() -> int:
     p_check.add_argument("--dump-sir", action="store_true", help="print the SIR after checking")
     p_check.set_defaults(func=cmd_check)
 
-    p_build = sub.add_parser("build", help="compile to a native binary via Rust")
+    p_build = sub.add_parser("build", help="compile to a native binary")
     p_build.add_argument("file")
     p_build.add_argument("-o", "--output", default=None)
+    p_build.add_argument("--backend", choices=["rust", "llvm"], default="rust",
+                         help="code generator: rust (default, oracle-checked) or llvm (direct)")
     p_build.add_argument("--keep-rust", action="store_true", help="write the generated .rs next to the source")
-    p_build.add_argument("--debug", action="store_true", help="opt-level=0 for faster builds")
+    p_build.add_argument("--debug", action="store_true", help="fast unoptimized build")
+    p_build.add_argument("--debuginfo", action="store_true",
+                         help="emit source-line debug info (PDB/DWARF) — llvm backend")
     p_build.set_defaults(func=cmd_build)
 
-    p_llvm = sub.add_parser("llvm", help="run via the LLVM backend (numeric core, JIT)")
+    p_llvm = sub.add_parser("llvm", help="build via the LLVM backend and run")
     p_llvm.add_argument("file")
     p_llvm.add_argument("--emit-ir", action="store_true", help="print LLVM IR instead of running")
+    p_llvm.add_argument("--release", action="store_true",
+                        help="full optimization pipeline (default: fast debug build)")
     p_llvm.set_defaults(func=cmd_llvm)
 
     p_lsp = sub.add_parser("lsp", help="run the LSP server on stdio (editor diagnostics)")

@@ -113,34 +113,34 @@
 > Backend A (Rust) stays as the reference backend and rustc-as-oracle for the borrow checker.
 
 ### 5.0 Design & runtime strategy
-- [ ] Decision doc: runtime via `prelude.rs` compiled ONCE as a `staticlib` with a C ABI (reuse everything: SStr/SSO, Vec lists, SerpDict, Rc/Weak, SerpErr) vs. hand-written C runtime — record in `DECISIONS.md`
-- [ ] Define the C ABI surface (`serp_rt.h` equivalent): naming, ownership transfer rules at the boundary, error-value returns (`SRes<T>` as out-param + status), panic-free guarantees
-- [ ] Build + cache the runtime staticlib per compiler version/target (`%LOCALAPPDATA%/serp/rt/<ver>-<target>/serp_rt.lib`); rebuild only on prelude change
-- [ ] Spec debug vs release semantics: identical program behavior, only compile-time/optimization differ (divergences doc gets a "none" entry)
+- [x] Decision doc: runtime via `prelude.rs` compiled ONCE as a `staticlib` with a C ABI (reuse everything: SStr/SSO, Vec lists, SerpDict, Rc/Weak, SerpErr) vs. hand-written C runtime — recorded as **DECISIONS.md D8** (prelude.rs + rt.rs wrappers; rlib+rustc-stub link on Windows, staticlib+cc on Unix)
+- [x] Define the C ABI surface (`serp_rt.h` equivalent): naming, ownership transfer rules at the boundary, error-value returns (`SRes<T>` as out-param + status), panic-free guarantees — `compiler/src/serpentine_lang/rt.rs` (~60 `extern "C"` symbols; SStr = opaque 24-byte blob, lists/dicts = `{ptr,len,cap}` raw buffers, pending-error + status bytes)
+- [x] Build + cache the runtime staticlib per compiler version/target (`%LOCALAPPDATA%/serp/rt/<ver>-<target>/serp_rt.lib`); rebuild only on prelude change — `llvmbuild.ensure_runtime` (key = sha256(prelude+rt+rustc version+platform); also caches runtime LLVM bitcode + a fast-link template; `SERP_RT_CACHE` override + temp-dir fallback)
+- [x] Spec debug vs release semantics: identical program behavior, only compile-time/optimization differ — `docs/divergences.md` "Backends and build modes: none" entry; verified by running the full corpus byte-identical in BOTH modes
 
 ### 5.1 Lowering: full language coverage in `llvmgen.py`
-- [ ] Strings: SStr through the runtime ABI (construction, concat, methods, f-string formatting, repr parity incl. float shortest-roundtrip)
-- [ ] Lists: literals, index/slice, methods (append/pop/extend/sort/…), iteration, element borrows
-- [ ] Dicts: SerpDict ABI, literals, methods, insertion-order iteration, `in`
-- [ ] Tuples + Copy semantics table parity with Backend A
-- [ ] Tier-1 classes: struct layout, methods (Ref/Mut/Owned self), dataclass repr/eq parity, generics via monomorphized instantiations
-- [ ] `Shared[T]`/`Weak[T]`: Rc/Weak ABI incl. runtime borrow-error parity
-- [ ] Exceptions: error-value scheme (no unwinding/landing pads) — SRes checks + early-return blocks, try/except lowering, catchable runtime errors, CPython-parity messages + exit code 1
-- [ ] Drops: scope-exit + unwind-path drop insertion mirrored from SIR drop ops
-- [ ] Tier-1/2 builtins: `open()`/`with` (drop closes), `sys.argv`/`sys.exit`, comprehensions, `sorted` + `key=` closures, `zip`/`reversed`/`enumerate`/`range`, `round`/`ord`/`chr`
-- [ ] Multi-module programs (same three-bin import rules as Backend A)
+- [x] Strings: SStr through the runtime ABI (construction, concat, methods, f-string formatting, repr parity incl. float shortest-roundtrip)
+- [x] Lists: literals, index/slice, methods (append/pop/extend/sort/…), iteration, element borrows — element access/push inline in IR; grow/free/sort in the runtime
+- [x] Dicts: SerpDict ABI, literals, methods, insertion-order iteration, `in` — lowered as scan-based key/value pair lists (same semantics as Backend A's SerpDict), all type-directed logic emitted per type
+- [x] Tuples + Copy semantics table parity with Backend A (`needs_clone` mirrored; moves zero the source so partial-move drops are safe)
+- [x] Tier-1 classes: struct layout, methods (Ref/Mut/Owned self), dataclass repr/eq parity, generics via monomorphized instantiations
+- [x] `Shared[T]`/`Weak[T]`: Rc/Weak ABI incl. runtime borrow-error parity — refcount box `{strong, weak, borrow}` + payload; statement-scoped borrow flags; exact weak-upgrade observability
+- [x] Exceptions: error-value scheme (no unwinding/landing pads) — functions return `{i1 err, T}`, pending-error thread state, try/except/finally lowering, catchable runtime errors, CPython-parity messages + exit code 1
+- [x] Drops: scope-exit + unwind-path drop insertion mirrored from SIR drop ops — per-local drop flags + single per-function cleanup/exit block shared by return, error, and fall-through paths
+- [x] Tier-1/2 builtins: `open()`/`with` (drop closes), `sys.argv`/`sys.exit`, comprehensions, `sorted` + `key=` closures, `zip`/`reversed`/`enumerate`/`range`, `round`/`ord`/`chr`
+- [x] Multi-module programs (same three-bin import rules as Backend A) — `tests/accept/034_two_module` byte-identical
 
 ### 5.2 Emit, link, modes
-- [ ] `serp build --backend llvm` (Backend A remains default until 5.3 exit criteria met)
-- [ ] Object emission via llvmlite `emit_object`; link with the platform linker (link.exe / lld) against the runtime staticlib
-- [ ] **Debug mode** (`--debug`): opt-level 0, no LLVM pass pipeline, fast link → measure and document the 2–3x build-time win vs Backend A `--debug`
-- [ ] **Release mode**: full -O2/O3 + targeted passes; runtime perf within noise of Backend A on `benchmarks/`
-- [ ] Debug info: source-line mapping (DWARF/PDB) so native stack traces point at `.py` lines
-- [ ] Build-time benchmark harness: compile-time comparison A vs B (debug + release) on the corpus + a synthetic large program
+- [x] `serp build --backend llvm` (Backend A remains default; `serp llvm` = build+run, `--emit-ir` to inspect)
+- [x] Object emission via llvmlite `emit_object`; link with the platform linker against the runtime — Windows: cached direct-`link.exe` fast path (~0.02s) with rustc-stub fallback; Unix: `cc prog.o libserp_rt.a <native-static-libs>`
+- [x] **Debug mode** (`--debug`): opt-level 0, no LLVM pass pipeline, fast link — **backend-only debug builds 2.05x geomean faster than Backend A `--debug`** (2.3–2.8x on typical corpus programs; a 120-function synthetic is Python-IR-gen-bound at 0.95x) — `tools/run_build_bench.py`
+- [x] **Release mode**: full O3 **+ runtime-bitcode LTO** (runtime .bc merged + internalized before the pass pipeline) — **faster than Backend A on all four benchmarks** (B/A: alloc 0.76x, fib 0.90x, floats 0.95x, strings 0.89x) — `tools/run_llvm_benchmarks.py`
+- [x] Debug info: source-line mapping (DWARF/PDB) so native stack traces point at `.py` lines — DICompileUnit/DISubprogram/DILocation per statement; `--debuginfo` links with /DEBUG (verified: PDB references the `.py` source file); `-g` on Unix
+- [x] Build-time benchmark harness: compile-time comparison A vs B (debug + release) on the corpus + a synthetic large program — `tools/run_build_bench.py`
 
 ### 5.3 Verification & exit criteria
-- [ ] Extend `tools/run_llvm_differential.py` to the ENTIRE accept corpus: byte-identical stdout vs CPython (same bar as Backend A)
-- [ ] All runtime-error accept/reject behaviors match (messages, exit codes)
-- [ ] `benchmarks/` suite: Backend B release within 5% of Backend A across fib/floats/alloc/strings
-- [ ] CI: LLVM-backend differential job (llvmlite install + full corpus) on all three OS runners
-- [ ] **Milestone: whole corpus builds + dual-runs byte-identical through direct LLVM; debug builds ≥2x faster than Backend A debug; Backend A retained as oracle (§9)**
+- [x] Extend `tools/run_llvm_differential.py` to the ENTIRE accept corpus: byte-identical stdout vs CPython (same bar as Backend A) — **58/58 identical, in debug AND release (`--release`) modes**
+- [x] All runtime-error accept/reject behaviors match (messages, exit codes) — error-value scheme reuses the prelude's message strings; caught-error tests (042/046) and IndexError/KeyError/StopIteration paths byte-identical; uncaught errors exit 1 with the same class: message
+- [x] `benchmarks/` suite: Backend B release within 5% of Backend A across fib/floats/alloc/strings — **worst B/A ratio 0.947 (B faster on all four)**; two key fixes recorded in docs/benchmarks.md (internal linkage for IPO; runtime-bitcode LTO)
+- [x] CI: LLVM-backend differential job (llvmlite install + full corpus) on all three OS runners — `.github/workflows/ci.yml` (job now runs the full-corpus harness; rustc already present for the Backend-A steps)
+- [x] **Milestone: whole corpus builds + dual-runs byte-identical through direct LLVM; debug builds ≥2x faster than Backend A debug (backend-only, 2.05x geomean); Backend A retained as oracle (§9)**

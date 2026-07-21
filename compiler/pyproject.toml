@@ -24,4 +24,4 @@ serp = "serpentine_lang.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-serpentine_lang = ["prelude.rs"]
+serpentine_lang = ["prelude.rs", "rt.rs"]

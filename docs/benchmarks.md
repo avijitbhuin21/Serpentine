@@ -42,6 +42,51 @@ same loaded host reports 0.8x; the interleaved min-of-5 above reports parity). R
 headroom (arena allocation, buffer-reusing producing ops) is documented, not on the
 critical path.
 
+### Phase-5 update (2026-07-21): Backend B (direct LLVM) vs Backend A
+
+Backend B (`serp build --backend llvm`) compiles SIR-checked programs straight to native
+objects via llvmlite and links against the cached Rust runtime. In release mode the
+runtime's LLVM **bitcode is merged and internalized into the program module before O3**,
+so runtime primitives inline into hot loops (the same whole-program advantage rustc gives
+Backend A). Measured with `tools/run_llvm_benchmarks.py` (workloads scaled ~7–20x so
+runtimes dominate process startup; best of 5; outputs byte-compared before timing):
+
+| benchmark | A (rust, `-C opt-level=2`) | B (llvm, O3 + runtime inlining) | B/A |
+|---|---:|---:|---:|
+| `bench_alloc.py` (3M iters) | 1.115 s | 0.847 s | **0.76x** |
+| `bench_fib.py` (fib 38) | 0.284 s | 0.255 s | **0.90x** |
+| `bench_floats.py` (200M iters) | 0.233 s | 0.220 s | **0.95x** |
+| `bench_strings.py` (2M rows) | 2.399 s | 2.135 s | **0.89x** |
+
+**Backend B release is within the 5% bar on all four — in fact faster than Backend A
+across the board** (worst ratio 0.947). Two findings worth recording: generated functions
+must be `internal` linkage or LLVM skips the interprocedural const-prop/unrolling rustc
+gets for free (floats went 1.40x → 0.95x on that one change); and the runtime-bitcode
+merge is what closes allocation/string-heavy gaps (alloc 1.15x → 0.76x, strings 1.21x
+→ 0.89x).
+
+Build times (`tools/run_build_bench.py`, backend-only: codegen + compile + link, the
+shared Python front end excluded; best of 3):
+
+| program | A debug | B debug | speedup | A release | B release |
+|---|---:|---:|---:|---:|---:|
+| `006_fib_iterative.py` | 0.35 s | 0.13 s | **2.62x** | 0.42 s | 0.43 s |
+| `026_sort_reverse.py` | 0.39 s | 0.14 s | **2.84x** | 0.53 s | 0.70 s |
+| `037_dataclass_basics.py` | 0.36 s | 0.14 s | **2.51x** | 0.51 s | 0.42 s |
+| `051_comprehensions.py` | 0.43 s | 0.18 s | **2.34x** | 0.90 s | 0.77 s |
+| `055_json_roundtrip.py` | 0.58 s | 0.33 s | **1.76x** | 2.35 s | 1.57 s |
+| synthetic (120 functions) | 0.91 s | 0.96 s | 0.95x | 1.68 s | 1.94 s |
+
+Debug geomean: **2.05x** — the win comes from skipping the rustc round-trip entirely
+(LLVM O0 emission + a cached direct `link.exe` invocation, ~0.02s vs rustc's ~0.2s stub
+link). The honest caveat: for very large programs the Python-side IR construction becomes
+the bottleneck (the synthetic row), so the speedup shrinks as programs grow.
+
+```
+python tools/run_llvm_benchmarks.py       # A vs B, all four
+python tools/run_build_bench.py           # compile-time comparison
+```
+
 ## Reading the numbers
 
 - **Numeric milestone: met.** 36–143x over CPython is the Codon-class band (Codon reports
