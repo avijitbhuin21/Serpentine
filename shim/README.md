@@ -22,4 +22,4 @@ Under CPython this package does nothing except make the imports resolve: the wra
 and `move` returns its argument. All semantics live in the static checker, `serp check`.
 
 This package is intentionally frozen and tiny: its public API is part of the Serpentine
-language spec (SPEC.md).
+language spec (docs/spec.md).

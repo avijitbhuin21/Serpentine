@@ -103,6 +103,10 @@ class Lowerer:
             self._lower_stmt(stmt)
 
     def _lower_stmt(self, stmt: ast.stmt) -> None:
+        lowered = self.tc.for_lowered.get(id(stmt))
+        if lowered is not None:
+            self._lower_block(lowered)
+            return
         if isinstance(stmt, ast.With):
             item = stmt.items[0]
             self._lower_expr(item.context_expr)
@@ -341,6 +345,11 @@ class Lowerer:
     def _lower_expr(self, e: ast.expr) -> None:
         """Emit use/move/mut_use ops for every place read in an expression."""
         facts = self.tc.facts[(self.sig.module, self.sig.name)]
+        if isinstance(e, ast.Lambda):
+            for a in e.args.args:
+                self._emit("def", a.arg, e)
+            self._lower_expr(e.body)
+            return
         if isinstance(e, (ast.ListComp, ast.DictComp)):
             gen = e.generators[0]
             self._lower_expr(gen.iter)
@@ -377,6 +386,10 @@ class Lowerer:
             self._lower_expr(e.value)
             return
         if isinstance(e, ast.Call):
+            oc = self.tc.op_calls.get(id(e))
+            if oc is not None and oc is not e:
+                self._lower_expr(oc)
+                return
             if isinstance(e.func, ast.Name) and id(e) in self.tc.move_calls:
                 arg = e.args[0]
                 if isinstance(arg, ast.Name) and not self._is_copy_var(arg.id):

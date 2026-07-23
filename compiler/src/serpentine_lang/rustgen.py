@@ -1,4 +1,4 @@
-"""Backend A: typed AST -> Rust source. rustc is the borrow-check oracle (RESEARCH.md section 4).
+"""Backend A: typed AST -> Rust source. rustc is the borrow-check oracle (docs/archive/research.md section 4).
 
 Emits structured Rust (not linearized SIR) so the generated code stays readable
 and rustc's own borrow checker re-validates every ownership decision.
@@ -9,10 +9,10 @@ import ast
 import re
 from pathlib import Path
 
-from .frontend import Module, Program
-from .ptypes import (Type, TBool, TClass, TDict, TExc, TFile, TFloat, TInt, TList, TNone,
-                     TOptional, TShared, TStr, TTuple, TWeak, mangle_type, subst_type,
-                     walk_types)
+from .frontend import Module, Program, exc_handler_names
+from .ptypes import (Type, TBool, TByteArray, TBytes, TClass, TDict, TExc, TFile, TFloat,
+                     TFunc, TInt, TList, TNone, TOptional, TPyVal, TShared, TStr, TTuple,
+                     TWeak, mangle_type, subst_type, walk_types)
 from .typecheck import FuncSig, TIter, TypeChecker
 
 PRELUDE = (Path(__file__).parent / "prelude.rs").read_text(encoding="utf-8")
@@ -60,6 +60,15 @@ def rust_type(t: Type) -> str:
         return "SerpErr"
     if isinstance(t, TFile):
         return "SerpFile"
+    if isinstance(t, TBytes):
+        return "SBytes"
+    if isinstance(t, TByteArray):
+        return "SByteArray"
+    if isinstance(t, TPyVal):
+        return "PVal"
+    if isinstance(t, TFunc):
+        params = ", ".join(rust_type(p) for p in t.params)
+        return f"Rc<dyn Fn({params}) -> SRes<{rust_type(t.ret)}>>"
     raise CodegenError(f"no Rust type for {t}")
 
 
@@ -69,7 +78,7 @@ class CodegenError(Exception):
 
 def needs_clone(t: Type) -> bool:
     """Copy-semantics types that are not Rust-Copy (String, Shared handles, tuples of them)."""
-    if isinstance(t, (TStr, TShared, TWeak, TExc)):
+    if isinstance(t, (TStr, TShared, TWeak, TExc, TFunc, TBytes, TPyVal)):
         return True
     if isinstance(t, TTuple):
         return any(needs_clone(i) for i in t.items)
@@ -178,6 +187,25 @@ class RustGen:
                     return True
         return False
 
+    def _class_has_func(self, t: TClass, visiting: set | None = None) -> bool:
+        """Whether a class instantiation (transitively) stores a function value."""
+        visiting = visiting or set()
+        key = struct_name(t)
+        if key in visiting:
+            return False
+        visiting.add(key)
+        info = self.tc.classes.get((t.module, t.name))
+        if info is None:
+            return False
+        sub = dict(zip(info.typevars, t.args))
+        for ft in info.fields.values():
+            for inner in walk_types(subst_type(ft, sub)):
+                if isinstance(inner, TFunc):
+                    return True
+                if isinstance(inner, TClass) and self._class_has_func(inner, visiting):
+                    return True
+        return False
+
     def _emit_struct(self, t: TClass) -> None:
         """Emit the struct, PyShow impl, and derives for one class instantiation."""
         info = self.tc.classes.get((t.module, t.name))
@@ -185,8 +213,9 @@ class RustGen:
             raise CodegenError(f"unknown class {t}")
         sub = dict(zip(info.typevars, t.args))
         name = struct_name(t)
+        has_func = self._class_has_func(t)
         derives = ["Clone"]
-        if not self._class_has_weak(t):
+        if not self._class_has_weak(t) and not has_func:
             derives.append("PartialEq")
         self._line(f"#[derive({', '.join(derives)})]")
         self._line(f"struct {name} {{")
@@ -194,11 +223,28 @@ class RustGen:
             ft = subst_type(info.fields[f], sub)
             self._line(f"    a_{f}: {rust_type(ft)},")
         self._line("}")
-        parts = ", ".join(f"{f}={{}}" for f in info.field_order)
-        args = ", ".join(f"self.a_{f}.py_repr()" for f in info.field_order)
         self._line(f"impl PyShow for {name} {{")
-        self._line(f'    fn py_str(&self) -> String {{ self.py_repr() }}')
-        self._line(f'    fn py_repr(&self) -> String {{ format!("{info.name}({parts})", {args}) }}')
+        qual = "" if t.module == self.program.entry.name else f"m_{_sanitize(t.module)}::"
+        has_repr = not info.typevars and "__repr__" in info.methods
+        repr_body = (f"match {qual}f_{_sanitize(info.name + '.__repr__')}(self) "
+                     f"{{ Ok(__s) => __s.py_str(), Err(__e) => serp_abort(__e) }}")
+        str_body = (f"match {qual}f_{_sanitize(info.name + '.__str__')}(self) "
+                    f"{{ Ok(__s) => __s.py_str(), Err(__e) => serp_abort(__e) }}")
+        has_str = not info.typevars and "__str__" in info.methods
+        if has_str:
+            self._line(f"    fn py_str(&self) -> String {{ {str_body} }}")
+        elif has_repr or not has_func:
+            self._line(f"    fn py_str(&self) -> String {{ self.py_repr() }}")
+        else:
+            self._line(f"    fn py_str(&self) -> String {{ unreachable!() }}")
+        if has_repr:
+            self._line(f"    fn py_repr(&self) -> String {{ {repr_body} }}")
+        elif has_func:
+            self._line(f"    fn py_repr(&self) -> String {{ unreachable!() }}")
+        else:
+            parts = ", ".join(f"{f}={{}}" for f in info.field_order)
+            args = ", ".join(f"self.a_{f}.py_repr()" for f in info.field_order)
+            self._line(f'    fn py_repr(&self) -> String {{ format!("{info.name}({parts})", {args}) }}')
         self._line("}")
         self._line("")
 
@@ -231,6 +277,7 @@ class RustGen:
         self._line(f"{pub}fn f_{_sanitize(sig.name)}({', '.join(params)}){ret} {{")
         self.indent += 1
         loop_bound = self._loop_bound_names(fn)
+        self.loop_bound = loop_bound
         param_names = {p.name for p in sig.params}
         for name, t in self.facts.locals.items():
             if name in param_names or name in loop_bound:
@@ -252,7 +299,7 @@ class RustGen:
     def _loop_bound_names(self, fn: ast.FunctionDef) -> set[str]:
         names = set()
         for node in ast.walk(fn):
-            if isinstance(node, ast.For):
+            if isinstance(node, ast.For) and id(node) not in self.tc.for_lowered:
                 targets = [node.target] if isinstance(node.target, ast.Name) else list(node.target.elts)
                 for t in targets:
                     if isinstance(t, ast.Name):
@@ -424,11 +471,16 @@ class RustGen:
 
     def _handler_class_names(self, h: ast.ExceptHandler) -> list[str]:
         if h.type is None:
-            return ["Exception"]
-        if isinstance(h.type, ast.Name):
-            return [h.type.id]
-        assert isinstance(h.type, ast.Tuple)
-        return [e.id for e in h.type.elts if isinstance(e, ast.Name)]
+            named = ["Exception"]
+        elif isinstance(h.type, ast.Name):
+            named = [h.type.id]
+        else:
+            assert isinstance(h.type, ast.Tuple)
+            named = [e.id for e in h.type.elts if isinstance(e, ast.Name)]
+        out: list[str] = []
+        for c in named:
+            out += [n for n in exc_handler_names(c, self.tc.user_exc) if n not in out]
+        return out
 
     def _emit_expr_stmt(self, e: ast.expr) -> None:
         if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id == "print":
@@ -458,6 +510,10 @@ class RustGen:
             self._line(f'println!("{{}}", [{", ".join(parts)}].join(" "));')
 
     def _emit_assign(self, stmt: ast.Assign | ast.AnnAssign) -> None:
+        oc = self.tc.op_calls.get(id(stmt))
+        if oc is not None:
+            self._line(f"{self._expr(oc, 'val')};")
+            return
         target = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
         assert stmt.value is not None
         bind = self.tc.elem_borrow_binds.get(id(stmt))
@@ -501,6 +557,12 @@ class RustGen:
                 key = self._expr(target.slice, "val")
                 self._line(f"({recv}).set({key}, {val});")
                 return
+            if isinstance(cont_t, TByteArray):
+                recv = self._recv(target.value, True) if shared else self._expr(target.value, "mut")
+                idx = self._expr(target.slice, "val")
+                val = self._expr(stmt.value, "val")
+                self._line(f"{self._q(f'({recv}).set({idx}, {val})')};")
+                return
         if isinstance(target, ast.Attribute):
             base_t = self._t(target.value)
             ft = self._t(target)
@@ -541,6 +603,8 @@ class RustGen:
 
     def _emit_if(self, stmt: ast.If) -> None:
         cond = self._expr(stmt.test, "val")
+        if isinstance(self._t(stmt.test), TPyVal):
+            cond = f"pyval_truthy(&({cond}))"
         self._line(f"if {cond} {{")
         self.indent += 1
         self._emit_block(stmt.body)
@@ -565,7 +629,10 @@ class RustGen:
         if isinstance(stmt.test, ast.Constant) and stmt.test.value is True:
             self._line("loop {")
         else:
-            self._line(f"while {self._expr(stmt.test, 'val')} {{")
+            cond = self._expr(stmt.test, "val")
+            if isinstance(self._t(stmt.test), TPyVal):
+                cond = f"pyval_truthy(&({cond}))"
+            self._line(f"while {cond} {{")
         self.indent += 1
         self._emit_block(stmt.body)
         self.indent -= 1
@@ -611,6 +678,13 @@ class RustGen:
         if kind == "str":
             seq = self._expr(iter_node, "ref")
             return f"for v_{names[0]} in py_chars({seq})", cast_lines, new_refs
+        if kind in ("bytes", "bytearray"):
+            seq = self._expr(iter_node, "ref")
+            fn = "pyb_ints" if kind == "bytes" else "pyba_ints"
+            return f"for v_{names[0]} in {fn}({seq})", cast_lines, new_refs
+        if kind == "pyval":
+            seq = self._expr(iter_node, "ref")
+            return f"for v_{names[0]} in {self._q(f'pyval_iter({seq})')}", cast_lines, new_refs
         if kind in ("keys", "values", "items"):
             assert isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Attribute)
             recv = self._expr(iter_node.func.value, "ref")
@@ -634,11 +708,17 @@ class RustGen:
             return (it_t.elem,)
         if isinstance(it_t, TStr):
             return (TStr(),)
+        if isinstance(it_t, TPyVal):
+            return (TPyVal(),)
         if isinstance(it_t, TIter):
             return it_t.elem
         raise CodegenError("unknown iterator element type")
 
     def _emit_for(self, stmt: ast.For) -> None:
+        lowered = self.tc.for_lowered.get(id(stmt))
+        if lowered is not None:
+            self._emit_lowered_for(stmt, lowered)
+            return
         kind = self.tc.loop_iter_kind.get(id(stmt), "list")
         targets = [stmt.target] if isinstance(stmt.target, ast.Name) else list(stmt.target.elts)
         names = [t.id for t in targets if isinstance(t, ast.Name)]
@@ -651,6 +731,39 @@ class RustGen:
         self.ref_bound |= new_refs
         self._emit_block(stmt.body)
         self.ref_bound = saved
+        self.indent -= 1
+        self._line("}")
+
+    def _emit_lowered_for(self, stmt: ast.For, lowered: list) -> None:
+        """Emit a user-iterator for loop: labeled loop + __next__ match skeleton."""
+        for name in self.tc.for_lowered_names.get(id(stmt), []):
+            if name in self.loop_bound:
+                self._line(f"let mut v_{name}: {rust_type(self.facts.locals[name])};")
+        wh = lowered[-1]
+        if len(lowered) == 2:
+            self._emit_stmt(lowered[0])
+        tr = wh.body[0]
+        step = tr.body[0]
+        call = step.value
+        tgt = step.targets[0].id
+        self.sfor_counter = getattr(self, "sfor_counter", 0) + 1
+        lbl = f"sfor{self.sfor_counter}"
+        self._line(f"'{lbl}: loop {{")
+        self.indent += 1
+        raw = self._class_method_call_code(call)
+        if self.try_ctx:
+            outer, exc_var = self.try_ctx[-1]
+            prop = f"{exc_var} = Some(__e); break '{outer};"
+        else:
+            prop = "return Err(__e);"
+        self._line(f"match {raw} {{")
+        self.indent += 1
+        self._line(f"Ok(__v) => {{ v_{tgt} = __v; }}")
+        self._line(f'Err(__e) => {{ if __e.matches("StopIteration") '
+                   f'{{ break \'{lbl}; }} {prop} }}')
+        self.indent -= 1
+        self._line("}")
+        self._emit_block(wh.body[1:])
         self.indent -= 1
         self._line("}")
 
@@ -672,15 +785,51 @@ class RustGen:
 
     def _coerce(self, code: str, src: Type, dst: Type) -> str:
         """Wrap a value expression when the static type needs Option adaptation."""
+        if isinstance(dst, TNone) and isinstance(src, TNone):
+            return "()"
         if isinstance(dst, TOptional) and not isinstance(src, (TOptional, TNone)):
-            return f"Some({code})"
+            return f"Some({self._coerce(code, src, dst.inner)})"
         if isinstance(dst, TOptional) and isinstance(src, TNone):
             return "None"
         if isinstance(dst, TFloat) and isinstance(src, TInt):
             return f"(({code}) as f64)"
+        if isinstance(dst, TPyVal) and not isinstance(src, TPyVal):
+            return self._pyval_from(code, src)
         return code
 
+    def _pyval_from(self, code: str, src: Type) -> str:
+        """Convert a typed Rust value expression into a PVal."""
+        if isinstance(src, TPyVal):
+            return code
+        if isinstance(src, TNone):
+            return "pyval_none()"
+        if isinstance(src, TBool):
+            return f"pyval_bool({code})"
+        if isinstance(src, TInt):
+            return f"pyval_int({code})"
+        if isinstance(src, TFloat):
+            return f"pyval_float({code})"
+        if isinstance(src, TStr):
+            return f"pyval_str({code})"
+        if isinstance(src, TBytes):
+            return f"pyval_bytes({code})"
+        if isinstance(src, TList):
+            inner = self._pyval_from("__e", src.elem)
+            return (f"pyval_list(({code}).into_iter().map(|__e| {inner})"
+                    f".collect::<Vec<PVal>>())")
+        if isinstance(src, TDict):
+            inner = self._pyval_from("__v.clone()", src.value)
+            return (f"{{ let __src = {code}; let mut __m: SerpDict<SStr, PVal> = "
+                    f"SerpDict::new(); for (__k, __v) in __src.items_it() "
+                    f"{{ __m.set(__k.clone(), {inner}); }} pyval_dict(__m) }}")
+        raise CodegenError(f"cannot convert {src} to PyVal")
+
     def _expr(self, node: ast.expr, mode: str, expect: Type | None = None) -> str:
+        oc = self.tc.op_calls.get(id(node))
+        if oc is not None:
+            return self._expr(oc, mode, expect)
+        if isinstance(node, ast.Lambda):
+            return self._wrap_ref(self._lambda_code(node), mode)
         if isinstance(node, (ast.ListComp, ast.DictComp)):
             return self._comp_expr(node, mode)
         if isinstance(node, ast.Constant):
@@ -823,7 +972,11 @@ class RustGen:
             if needs_clone(t) or not t.is_copy():
                 return f"{code}.clone()"
             return code
-        code = f"{self._place(node.value, mut=(mode == 'mut'))}.a_{node.attr}"
+        place = self._place(node.value, mut=(mode == "mut"))
+        if isinstance(node.value, ast.Name) and id(node.value) in self.tc.narrowed_uses:
+            place = f"{place}.as_mut().unwrap()" if mode == "mut" \
+                else f"{place}.as_ref().unwrap()"
+        code = f"{place}.a_{node.attr}"
         if mode == "mut":
             return f"&mut {code}"
         if mode == "ref":
@@ -836,7 +989,7 @@ class RustGen:
         if mode == "ref":
             return f"&({code})"
         if mode == "mut":
-            raise CodegenError("temporary cannot be mutably borrowed")
+            return f"&mut ({code})"
         return code
 
     def _const(self, node: ast.Constant, mode: str) -> str:
@@ -846,24 +999,42 @@ class RustGen:
         if isinstance(v, int):
             return self._wrap_ref(f"{v}i64", mode)
         if isinstance(v, float):
+            if v != v:
+                return self._wrap_ref("f64::NAN", mode)
+            if v == float("inf"):
+                return self._wrap_ref("f64::INFINITY", mode)
+            if v == float("-inf"):
+                return self._wrap_ref("f64::NEG_INFINITY", mode)
             return self._wrap_ref(f"{v!r}f64", mode)
         if isinstance(v, str):
             esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") \
                 .replace("\r", "\\r").replace("\t", "\\t")
             return self._wrap_ref(f'sstr("{esc}")', mode)
+        if isinstance(v, bytes):
+            if not v:
+                return self._wrap_ref("sbytes(Vec::new())", mode)
+            items = ", ".join(f"{b}u8" for b in v)
+            return self._wrap_ref(f"sbytes(vec![{items}])", mode)
         if v is None:
             return self._wrap_ref("None", mode)
         raise CodegenError(f"cannot emit literal {v!r}")
 
     def _name(self, node: ast.Name, mode: str) -> str:
         name = node.id
+        fref = self.tc.func_value_refs.get(id(node))
+        if fref is not None:
+            ft = self._t(node)
+            return self._wrap_ref(self._func_ref_code(fref, ft), mode)
         t = self.scope_types.get(name)
         if t is None:
             t = self.facts.locals.get(name)
         if t is None:
-            const = self.tc.constants.get((self.mod.name, name))
+            cmod, cname = self.mod.name, name
+            if (cmod, cname) not in self.tc.constants and name in self.mod.imports:
+                cmod, cname = self.mod.imports[name]
+            const = self.tc.constants.get((cmod, cname))
             if const is not None:
-                cnode = self.mod.constants[name].value
+                cnode = self.tc.program.modules[cmod].constants[cname].value
                 assert isinstance(cnode, ast.Constant)
                 self.tc.expr_types[id(cnode)] = const
                 return self._const(cnode, mode)
@@ -874,13 +1045,18 @@ class RustGen:
              next(p.conv for p in self.sig.params if p.name == name) in ("ref", "mut"))
         base = f"v_{name}"
         if mode == "mut":
+            if narrowed:
+                return f"{base}.as_mut().unwrap()"
             if name in {p.name for p in self.sig.params} and \
                     next(p.conv for p in self.sig.params if p.name == name) == "mut":
                 return base
             return f"&mut {base}"
         if mode == "ref":
             if narrowed:
-                return f"&({self._name(node, 'val')})"
+                t0 = self._t(node)
+                if isinstance(t0, TOptional) and isinstance(t0.inner, (TInt, TFloat, TBool)):
+                    return f"&({self._name(node, 'val')})"
+                return f"{base}.as_ref().unwrap()"
             return base if is_ref else f"&{base}"
         if narrowed:
             assert isinstance(t, TOptional)
@@ -912,6 +1088,33 @@ class RustGen:
                 return self._wrap_ref(f"py_str_slice({recv}, {lo}, {hi})", mode)
             idx = self._expr(node.slice, "val")
             return self._wrap_ref(self._q(f"py_str_idx({recv}, {idx})"), mode)
+        if isinstance(inner0, (TBytes, TByteArray)):
+            recv = self._recv(node.value, False) if isinstance(base_t, TShared) \
+                else self._expr(node.value, "ref")
+            is_b = isinstance(inner0, TBytes)
+            if isinstance(node.slice, ast.Slice):
+                lo = "None" if node.slice.lower is None \
+                    else f"Some({self._expr(node.slice.lower, 'val')})"
+                hi = "None" if node.slice.upper is None \
+                    else f"Some({self._expr(node.slice.upper, 'val')})"
+                fn = "pyb_slice" if is_b else "pyba_slice"
+                return self._wrap_ref(f"{fn}({recv}, {lo}, {hi})", mode)
+            idx = self._expr(node.slice, "val")
+            if is_b:
+                return self._wrap_ref(self._q(f"pyb_index({recv}, {idx})"), mode)
+            return self._wrap_ref(self._q(f"({recv}).get({idx})"), mode)
+        if isinstance(inner0, TPyVal):
+            recv = self._recv(node.value, False) if isinstance(base_t, TShared) \
+                else self._expr(node.value, "ref")
+            idx_t = self._t(node.slice)
+            if isinstance(idx_t, TStr):
+                idx = self._expr(node.slice, "ref")
+                return self._wrap_ref(self._q(f"pyval_getitem_s({recv}, {idx})"), mode)
+            if isinstance(idx_t, TPyVal):
+                idx = self._expr(node.slice, "ref")
+                return self._wrap_ref(self._q(f"pyval_getitem_v({recv}, {idx})"), mode)
+            idx = self._expr(node.slice, "val")
+            return self._wrap_ref(self._q(f"pyval_getitem_i({recv}, {idx})"), mode)
         if isinstance(base_t, TShared):
             inner = base_t.inner
             idx = self._expr(node.slice, "val")
@@ -1021,6 +1224,8 @@ class RustGen:
         t = self._t(node.operand)
         v = self._expr(node.operand, "val")
         if isinstance(node.op, ast.Not):
+            if isinstance(t, TPyVal):
+                return self._wrap_ref(f"(!pyval_truthy(&({v})))", mode)
             return self._wrap_ref(f"(!({v}))", mode)
         if isinstance(node.op, ast.USub):
             if isinstance(t, TInt):
@@ -1033,6 +1238,12 @@ class RustGen:
     def _binop_code(self, op: ast.operator, l: str, r: str, lt: Type, rt: Type) -> str:
         if isinstance(lt, TStr) and isinstance(rt, TStr) and isinstance(op, ast.Add):
             return f'sstring(format!("{{}}{{}}", {l}, {r}))'
+        if isinstance(lt, TBytes) and isinstance(rt, TBytes) and isinstance(op, ast.Add):
+            return f"pyb_concat(&({l}), &({r}))"
+        if isinstance(op, ast.Mult) and isinstance(lt, TBytes) and isinstance(rt, TInt):
+            return f"pyb_repeat(&({l}), {r})"
+        if isinstance(op, ast.Mult) and isinstance(lt, TInt) and isinstance(rt, TBytes):
+            return f"pyb_repeat(&({r}), {l})"
         both_int = isinstance(lt, TInt) and isinstance(rt, TInt)
         if both_int:
             table = {ast.Add: "serp_add_i", ast.Sub: "serp_sub_i", ast.Mult: "serp_mul_i",
@@ -1069,17 +1280,34 @@ class RustGen:
             return f"({ref}).{method}()"
         if isinstance(op0, (ast.In, ast.NotIn)):
             ct = self._t(node.comparators[0])
+            if isinstance(ct, TPyVal):
+                c = self._expr(node.comparators[0], "ref")
+                l = self._coerce(self._expr(node.left, "val", expect=TPyVal()),
+                                 self._t(node.left), TPyVal())
+                code = self._q(f"pyval_contains({c}, &({l}))")
+                return f"(!{code})" if isinstance(op0, ast.NotIn) else code
             l = self._expr(node.left, "val")
             c = self._expr(node.comparators[0], "ref")
             if isinstance(ct, TDict):
                 code = f"({c}).contains(&({l}))"
             elif isinstance(ct, TList):
                 code = f"({c}).contains(&({l}))"
+            elif isinstance(ct, TBytes):
+                code = f"pyb_contains({c}, &({l}))"
             else:
                 code = f"py_contains_str({c}, &({l}))"
             return f"(!{code})" if isinstance(op0, ast.NotIn) else code
         operands = [node.left] + list(node.comparators)
         types = [self._t(o) for o in operands]
+        if any(isinstance(t, TPyVal) for t in types):
+            if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.NotEq)):
+                raise CodegenError("PyVal supports only single ==/!= comparisons")
+            a = self._coerce(self._expr(operands[0], "val", expect=TPyVal()),
+                             types[0], TPyVal())
+            b = self._coerce(self._expr(operands[1], "val", expect=TPyVal()),
+                             types[1], TPyVal())
+            code = f"pyval_eq(&({a}), &({b}))"
+            return f"(!{code})" if isinstance(node.ops[0], ast.NotEq) else code
         has_float = any(isinstance(t, TFloat) for t in types)
         vals = []
         for o, t in zip(operands, types):
@@ -1100,7 +1328,51 @@ class RustGen:
 
     # ---------- calls ----------
 
+    def _func_ref_code(self, key: tuple[str, str], ft: TFunc) -> str:
+        """Wrap a module function as an Rc closure value."""
+        fmod, fname = key
+        qual = f"m_{_sanitize(fmod)}::" if fmod != self.mod.name else ""
+        params = ", ".join(f"p{i}: {rust_type(t)}" for i, t in enumerate(ft.params))
+        argl = ", ".join(f"p{i}" for i in range(len(ft.params)))
+        return (f"(Rc::new(move |{params}| -> SRes<{rust_type(ft.ret)}> "
+                f"{{ {qual}f_{_sanitize(fname)}({argl}) }}) as {rust_type(ft)})")
+
+    def _lambda_code(self, node: ast.Lambda) -> str:
+        """Emit a capturing lambda as an Rc closure (captures cloned by value)."""
+        ft = self._t(node)
+        assert isinstance(ft, TFunc)
+        caps = self.tc.lambda_caps.get(id(node), [])
+        lets = " ".join(f"let v_{n} = v_{n}.clone();" for n, t in caps if needs_clone(t))
+        saved_scope = {}
+        for a, pt in zip(node.args.args, ft.params):
+            saved_scope[a.arg] = self.scope_types.get(a.arg)
+            self.scope_types[a.arg] = pt
+        saved_ctx, self.try_ctx = self.try_ctx, []
+        body = self._coerce(self._expr(node.body, "val", expect=ft.ret),
+                            self._t(node.body), ft.ret)
+        self.try_ctx = saved_ctx
+        for arg_name, prev in saved_scope.items():
+            if prev is None:
+                self.scope_types.pop(arg_name, None)
+            else:
+                self.scope_types[arg_name] = prev
+        params = ", ".join(f"v_{a.arg}: {rust_type(pt)}"
+                           for a, pt in zip(node.args.args, ft.params))
+        ret = "()" if isinstance(ft.ret, TNone) else rust_type(ft.ret)
+        return (f"{{ {lets} (Rc::new(move |{params}| -> SRes<{ret}> "
+                f"{{ Ok({body}) }}) as {rust_type(ft)}) }}")
+
+    def _func_value_call(self, node: ast.Call, ft: TFunc) -> str:
+        """Emit a call through a first-class function value."""
+        fcode = self._expr(node.func, "val")
+        args = [self._coerce(self._expr(a, "val", expect=pt), self._t(a), pt)
+                for a, pt in zip(node.args, ft.params)]
+        return self._q(f"((*({fcode}))({', '.join(args)}))")
+
     def _call(self, node: ast.Call, mode: str) -> str:
+        ftv = self.tc.expr_types.get(id(node.func))
+        if isinstance(ftv, TFunc):
+            return self._wrap_ref(self._func_value_call(node, ftv), mode)
         if isinstance(node.func, ast.Attribute):
             return self._wrap_ref(self._method_call(node), mode)
         assert isinstance(node.func, ast.Name)
@@ -1118,10 +1390,25 @@ class RustGen:
         if name == "upgrade":
             w = self._expr(node.args[0], "ref")
             return self._wrap_ref(f"serp_upgrade({w})", mode)
+        if name == "pyval_kind":
+            return self._wrap_ref(f"pyval_kind({self._expr(node.args[0], 'ref')})", mode)
         if name == "open":
             path = self._expr(node.args[0], "ref")
             fmode = self._expr(node.args[1], "ref") if len(node.args) > 1 else '"r"'
             return self._wrap_ref(self._q(f"serp_open({path}, {fmode})"), mode)
+        if name in self.mod.rtlib_imports:
+            rf = self.mod.rtlib_imports[name]
+            parts = []
+            for a, p in zip(node.args, rf.params):
+                if p in ("s", "y"):
+                    parts.append(self._expr(a, "ref"))
+                    continue
+                pt = TFloat() if p == "f" else TInt()
+                parts.append(self._coerce(self._expr(a, "val", expect=pt), self._t(a), pt))
+            code = f"{rf.rust}({', '.join(parts)})"
+            if rf.can_raise:
+                code = self._q(code)
+            return self._wrap_ref(code, mode)
         target = self.tc.call_targets.get(id(node))
         if target is not None:
             return self._wrap_ref(self._user_call(node, self.tc.sigs[target]), mode)
@@ -1140,7 +1427,12 @@ class RustGen:
             ft = subst_type(info.fields[fname], sub)
             parts.append(f"a_{fname}: "
                          + self._coerce(self._expr(arg, "val", expect=ft), self._t(arg), ft))
-        return f"{struct_name(t)} {{ {', '.join(parts)} }}"
+        lit = f"{struct_name(t)} {{ {', '.join(parts)} }}"
+        if not info.typevars and "__post_init__" in info.methods:
+            qual = "" if cmod == self.mod.name else f"m_{_sanitize(cmod)}::"
+            call = f"{qual}f_{_sanitize(cname + '.__post_init__')}(&mut __o)"
+            return self._q(f"{{ let mut __o = {lit}; {call}.map(move |_| __o) }}")
+        return lit
 
     def _default_code(self, p) -> str:
         """Render a parameter's literal default value as Rust code."""
@@ -1148,7 +1440,7 @@ class RustGen:
         assert isinstance(c, ast.Constant)
         v = c.value
         if v is None:
-            return "None"
+            return self._coerce("None", TNone(), p.typ)
         if isinstance(v, bool):
             code, vt = ("true" if v else "false"), TBool()
         elif isinstance(v, int):
@@ -1192,6 +1484,10 @@ class RustGen:
                 return f"(({r}).len() as i64)"
             if isinstance(t, TDict):
                 return f"({r}).len_i()"
+            if isinstance(t, (TBytes, TByteArray)):
+                return f"({r}).len_i()"
+            if isinstance(t, TPyVal):
+                return self._q(f"pyval_len({r})")
             return f"py_len_str({r})"
         if name == "sum":
             t = self._t(args[0])
@@ -1213,6 +1509,8 @@ class RustGen:
             return f"sstring(py_str({self._expr(args[0], 'ref')}))"
         if name == "int":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                return self._q(f"pyval_to_int({self._expr(args[0], 'ref')})")
             if isinstance(t, TStr):
                 return self._q(f"py_int_from_str({self._expr(args[0], 'ref')})")
             if isinstance(t, TFloat):
@@ -1222,6 +1520,8 @@ class RustGen:
             return self._expr(args[0], "val")
         if name == "float":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                return self._q(f"pyval_to_float({self._expr(args[0], 'ref')})")
             if isinstance(t, TStr):
                 return self._q(f"py_float_from_str({self._expr(args[0], 'ref')})")
             if isinstance(t, TInt):
@@ -1229,6 +1529,8 @@ class RustGen:
             return self._expr(args[0], "val")
         if name == "bool":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                return f"pyval_truthy({self._expr(args[0], 'ref')})"
             v = self._expr(args[0], "val")
             if isinstance(t, TInt):
                 return f"(({v}) != 0)"
@@ -1280,6 +1582,26 @@ class RustGen:
             return self._q(f"py_chr({self._expr(args[0], 'val')})")
         if name == "input":
             return self._q("serp_input()")
+        if name in ("bytes", "bytearray"):
+            is_b = name == "bytes"
+            if not args:
+                return "sbytes(Vec::new())" if is_b else "pyba_new()"
+            t0 = self._t(args[0])
+            if is_b and isinstance(t0, TPyVal):
+                return self._q(f"pyval_to_bytes({self._expr(args[0], 'ref')})")
+            if isinstance(t0, TInt):
+                fn = "pyb_zeros" if is_b else "pyba_zeros"
+                return self._q(f"{fn}({self._expr(args[0], 'val')})")
+            if isinstance(t0, TList):
+                fn = "pyb_from_ints" if is_b else "pyba_from_ints"
+                return self._q(f"{fn}({self._expr(args[0], 'ref')})")
+            if isinstance(t0, TBytes):
+                if is_b:
+                    return self._expr(args[0], "val")
+                return f"pyba_from_bytes({self._expr(args[0], 'ref')})"
+            if is_b:
+                return f"({self._expr(args[0], 'ref')}).as_bytes()"
+            return f"({self._expr(args[0], 'ref')}).clone()"
         raise CodegenError(f"cannot emit builtin '{name}'")
 
     def _recv(self, recv: ast.expr, want_mut: bool) -> str:
@@ -1292,6 +1614,31 @@ class RustGen:
             return f"(&*{self._q(f'shared_ref({r})')})"
         return self._expr(recv, "mut" if want_mut else "ref")
 
+    def _class_method_call_code(self, node: ast.Call) -> str:
+        """The raw (unpropagated) Rust call expression for a user-class method call."""
+        assert isinstance(node.func, ast.Attribute)
+        recv = node.func.value
+        args = node.args
+        target = self.tc.call_targets[id(node)]
+        sig = self.tc.sigs[target]
+        conv0 = sig.params[0].conv
+        if conv0 == "owned":
+            argv = [self._expr(recv, "val")]
+        else:
+            argv = [self._recv(recv, conv0 == "mut")]
+        for a, p in zip(args, sig.params[1:]):
+            if p.conv == "ref":
+                argv.append(self._expr(a, "ref"))
+            elif p.conv == "mut":
+                argv.append(self._expr(a, "mut"))
+            else:
+                argv.append(self._coerce(self._expr(a, "val", expect=p.typ),
+                                         self._t(a), p.typ))
+        for p in sig.params[1 + len(args):]:
+            argv.append(self._default_code(p))
+        qual = f"m_{_sanitize(sig.module)}::" if sig.module != self.mod.name else ""
+        return f"{qual}f_{_sanitize(sig.name)}({', '.join(argv)})"
+
     def _method_call(self, node: ast.Call) -> str:
         assert isinstance(node.func, ast.Attribute)
         recv = node.func.value
@@ -1300,30 +1647,17 @@ class RustGen:
         inner = rt.inner if isinstance(rt, TShared) else rt
         args = node.args
         if isinstance(inner, TClass):
-            target = self.tc.call_targets[id(node)]
-            sig = self.tc.sigs[target]
-            conv0 = sig.params[0].conv
-            if conv0 == "owned":
-                argv = [self._expr(recv, "val")]
-            else:
-                argv = [self._recv(recv, conv0 == "mut")]
-            for a, p in zip(args, sig.params[1:]):
-                if p.conv == "ref":
-                    argv.append(self._expr(a, "ref"))
-                elif p.conv == "mut":
-                    argv.append(self._expr(a, "mut"))
-                else:
-                    argv.append(self._coerce(self._expr(a, "val", expect=p.typ),
-                                             self._t(a), p.typ))
-            for p in sig.params[1 + len(args):]:
-                argv.append(self._default_code(p))
-            qual = f"m_{_sanitize(sig.module)}::" if sig.module != self.mod.name else ""
-            return self._q(f"{qual}f_{_sanitize(sig.name)}({', '.join(argv)})")
+            return self._q(self._class_method_call_code(node))
         if isinstance(inner, TFile):
             r = self._recv(recv, True)
             if method == "read":
-                return self._q(f"({r}).read_all()")
+                fn = "read_all_bytes" if inner.binary else "read_all"
+                return self._q(f"({r}).{fn}()")
             if method == "write":
+                if inner.binary:
+                    at = self._t(args[0])
+                    acc = ".v" if isinstance(at, (TBytes, TByteArray)) else ""
+                    return self._q(f"({r}).write_bytes(&({self._expr(args[0], 'ref')}){acc})")
                 return self._q(f"({r}).write_str(&({self._expr(args[0], 'val')}))")
             if method == "close":
                 return f"({r}).close()"
@@ -1356,6 +1690,40 @@ class RustGen:
                 return f"({self._recv(recv, False)}).get_opt(&({self._expr(args[0], 'val')}))"
             if method == "pop":
                 return self._q(f"({self._recv(recv, True)}).pop_key(&({self._expr(args[0], 'val')}))")
+        if isinstance(inner, TBytes):
+            if method == "fromhex":
+                return self._q(f"pyb_fromhex({self._expr(args[0], 'ref')})")
+            r = self._recv(recv, False) if isinstance(rt, TShared) else self._expr(recv, "ref")
+            argv = [f"&({self._expr(a, 'val')})" for a in args]
+            table = {"find": "pyb_find", "count": "pyb_count",
+                     "startswith": "pyb_startswith", "endswith": "pyb_endswith",
+                     "replace": "pyb_replace", "strip": "pyb_strip",
+                     "lstrip": "pyb_lstrip", "rstrip": "pyb_rstrip",
+                     "upper": "pyb_upper", "lower": "pyb_lower", "hex": "pyb_hex"}
+            if method == "split":
+                if args:
+                    return self._q(f"pyb_split({r}, {argv[0]})")
+                return f"pyb_split_ws({r})"
+            if method == "join":
+                return f"pyb_join({r}, {self._expr(args[0], 'ref')})"
+            if method == "decode":
+                return self._q(f"pyb_decode({r})")
+            if method in table:
+                return f"{table[method]}({r}{''.join(', ' + a for a in argv)})"
+            raise CodegenError(f"cannot emit bytes method '{method}'")
+        if isinstance(inner, TByteArray):
+            if method == "append":
+                return self._q(f"({self._recv(recv, True)}).push_i({self._expr(args[0], 'val')})")
+            if method == "extend":
+                at = self._t(args[0])
+                fn = "extend_bytes" if isinstance(at, TBytes) else "extend_arr"
+                return f"({self._recv(recv, True)}).{fn}(&({self._expr(args[0], 'ref')}))"
+            r = self._recv(recv, False) if isinstance(rt, TShared) else self._expr(recv, "ref")
+            if method == "hex":
+                return f"pyb_hex(&({r}).as_bytes())"
+            if method == "decode":
+                return self._q(f"pyb_decode(&({r}).as_bytes())")
+            raise CodegenError(f"cannot emit bytearray method '{method}'")
         if isinstance(inner, TStr):
             r = self._recv(recv, False)
             argv = [f"&({self._expr(a, 'val')})" for a in args]
@@ -1367,6 +1735,8 @@ class RustGen:
                 if args:
                     return self._q(f"py_split({r}, {argv[0]})")
                 return f"py_split_ws({r})"
+            if method == "encode":
+                return f"py_str_encode({r})"
             if method == "join":
                 return f"py_join({r}, {self._expr(args[0], 'ref')})"
             if method in table:

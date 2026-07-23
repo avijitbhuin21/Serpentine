@@ -1,9 +1,9 @@
 """Benchmark harness: CPython vs serp-native (Backend A, opt-level=2) vs
 handwritten Rust references (§5.11). Prints a table; results are recorded in
-docs/benchmarks.md.
+docs/guides/benchmarks.md.
 
 Codon and mypyc are not runnable on this Windows host (Codon has no Windows
-support; mypyc needs MSVC cl.exe) — documented in docs/benchmarks.md.
+support; mypyc needs MSVC cl.exe) — documented in docs/guides/benchmarks.md.
 
 Usage: python tools/run_benchmarks.py [pattern]
 """

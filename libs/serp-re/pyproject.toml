@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-re"
+version = "0.2.0"
+description = "Serpentine regex subset engine (literals, classes, * + ?, groups, alternation, anchors) written in the Serpentine subset"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "regex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["serpentine-shim"]
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_re"]

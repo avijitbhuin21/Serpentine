@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-sqlite"
+version = "0.2.0"
+description = "Serpentine drop-in sqlite3 subset: Connection/Cursor over the system SQLite library (runtime-backed; stdlib sqlite3 delegate under CPython)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "sqlite", "database"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_sqlite", "serp_sqlite_core"]

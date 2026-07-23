@@ -1,0 +1,6 @@
+[project]
+name = "serp-cli"
+version = "0.2.0"
+
+[build]
+roots = ["src"]

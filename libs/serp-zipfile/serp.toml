@@ -1,0 +1,9 @@
+[project]
+name = "serp-zipfile"
+version = "0.2.0"
+
+[build]
+roots = ["src", "../serp-zlib/src"]
+
+[dependencies]
+serp-zlib = "0.1.0"

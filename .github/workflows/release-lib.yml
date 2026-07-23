@@ -1,0 +1,56 @@
+name: Release library
+
+# Scoped library releases: pushing a tag like `serp-json-v0.1.0` builds
+# libs/serp-json and publishes it to PyPI via trusted publishing. The main
+# `v*` tags (release.yml) keep publishing the compiler + shim.
+
+on:
+  push:
+    tags: ["serp-*-v*"]
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      lib: ${{ steps.derive.outputs.lib }}
+      short: ${{ steps.derive.outputs.short }}
+    steps:
+      - id: derive
+        run: |
+          LIB="${GITHUB_REF_NAME%-v*}"
+          echo "lib=$LIB" >> "$GITHUB_OUTPUT"
+          echo "short=${LIB#serp-}" >> "$GITHUB_OUTPUT"
+
+  build-publish:
+    needs: meta
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-libs-${{ needs.meta.outputs.short }}
+    permissions:
+      id-token: write
+    env:
+      LIB: ${{ needs.meta.outputs.lib }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify the tag matches a library directory
+        run: |
+          if [ ! -d "libs/$LIB" ]; then
+            echo "tag $GITHUB_REF_NAME does not match a directory under libs/" >&2
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install build twine
+          python -m build --outdir dist "libs/$LIB"
+          python -m twine check dist/*
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

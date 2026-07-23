@@ -10,11 +10,11 @@ import copy
 from dataclasses import dataclass, field
 
 from .diagnostics import Reporter, Span
-from .frontend import Module, Program
+from .frontend import BUILTIN_EXC, Module, Program, collect_user_exceptions, exc_ancestors
 from .ptypes import (BOOL, CONV_COPY, CONV_MUT, CONV_OWNED, CONV_REF, FLOAT, INT, NONE, STR,
-                     Type, TBool, TClass, TDict, TExc, TFile, TFloat, TInt, TList, TNone,
-                     TOptional, TShared, TStr, TTuple, TVar, TWeak,
-                     has_tvar, mangle_type, parse_annotation, subst_type, unify)
+                     Type, TBool, TByteArray, TBytes, TClass, TDict, TExc, TFile, TFloat,
+                     TFunc, TInt, TList, TNone, TOptional, TPyVal, TShared, TStr, TTuple,
+                     TVar, TWeak, has_tvar, mangle_type, parse_annotation, subst_type, unify)
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,10 @@ class ClassInfo:
     node: ast.ClassDef
     fields: dict[str, Type] = field(default_factory=dict)
     field_order: list[str] = field(default_factory=list)
+    field_defaults: dict[str, ast.Constant] = field(default_factory=dict)
     methods: dict[str, FuncSig] = field(default_factory=dict)
+    properties: set[str] = field(default_factory=set)
+    statics: dict[str, str] = field(default_factory=dict)
     typevars: list[str] = field(default_factory=list)
 
 
@@ -80,10 +83,8 @@ class ProtoInfo:
     methods: dict[str, tuple[list[Param], Type]] = field(default_factory=dict)
 
 
-# Exception classes recognized by raise/except (SPEC.md section 11 + Tier-1 additions).
-KNOWN_EXC = {"Exception", "ValueError", "RuntimeError", "TypeError", "IndexError", "KeyError",
-             "ZeroDivisionError", "OverflowError", "EOFError", "FileNotFoundError",
-             "PermissionError", "OSError", "ArithmeticError", "LookupError", "StopIteration"}
+# Exception classes recognized by raise/except (docs/spec.md section 11 + Tier-1 additions).
+KNOWN_EXC = BUILTIN_EXC
 
 
 @dataclass
@@ -96,6 +97,18 @@ class FuncFacts:
 
 
 NUMERIC = (TInt, TFloat)
+
+# Operator dunders (Tier-2 operator overloading on user classes).
+BINOP_DUNDER = {ast.Add: "__add__", ast.Sub: "__sub__", ast.Mult: "__mul__",
+                ast.Div: "__truediv__", ast.FloorDiv: "__floordiv__",
+                ast.Mod: "__mod__", ast.Pow: "__pow__", ast.MatMult: "__matmul__"}
+CMP_DUNDER = {ast.Lt: "__lt__", ast.LtE: "__le__", ast.Gt: "__gt__", ast.GtE: "__ge__"}
+OP_DUNDERS = set(BINOP_DUNDER.values()) | set(CMP_DUNDER.values()) | \
+    {"__neg__", "__getitem__", "__setitem__", "__len__"}
+# Non-operator dunders with dedicated support (Tier-2 protocol forms).
+ALLOWED_DUNDERS = OP_DUNDERS | {"__str__", "__repr__", "__post_init__",
+                                "__next__", "__iter__",
+                                "__enter__", "__exit__"}
 
 
 class TypeChecker:
@@ -120,9 +133,17 @@ class TypeChecker:
         self.elem_borrow_binds: dict[int, tuple[str, str]] = {}  # stmt id -> (name, root)
         self.iter_binds: dict[int, tuple[str, str]] = {}         # stmt id -> (name, root)
         self.checked_bodies: set[tuple[str, str]] = set()
+        self.user_exc: dict[str, str] = {}
+        self.lambda_caps: dict[int, list[tuple[str, Type]]] = {}  # lambda id -> captures
+        self.func_value_refs: dict[int, tuple[str, str]] = {}     # Name id -> function key
+        self.op_calls: dict[int, ast.Call] = {}   # operator node id -> desugared dunder call
+        self.for_lowered: dict[int, list] = {}    # For stmt id -> lowered stmts (user iterators)
+        self.for_lowered_names: dict[int, list[str]] = {}  # For stmt id -> names the lowering assigns
+        self._for_counter = 0
 
     def run(self) -> None:
         """Check every module: classes and signatures first, then all bodies."""
+        self._collect_user_exceptions()
         for mod in self.program.modules.values():
             self._collect_classes(mod)
         for mod in self.program.modules.values():
@@ -134,6 +155,7 @@ class TypeChecker:
         self._check_class_cycles()
         for mod in self.program.modules.values():
             self._check_constants(mod)
+        for mod in self.program.modules.values():
             for fn in mod.functions.values():
                 sig = self.sigs[(mod.name, fn.name)]
                 if sig.is_template:
@@ -144,6 +166,8 @@ class TypeChecker:
                     continue
                 for m in cls.methods.values():
                     if m.is_template:
+                        continue
+                    if m.node.name in ("__enter__", "__iter__"):
                         continue
                     self._check_function(mod, m.node, m)
             if mod.entry_call and mod.entry_call not in mod.functions:
@@ -171,12 +195,60 @@ class TypeChecker:
         for cname, cnode in mod.classes.items():
             self.classes[(mod.name, cname)] = ClassInfo(mod.name, cname, cnode)
 
+    def _collect_user_exceptions(self) -> None:
+        """Merge + validate every module's exception classes (bases, collisions, cycles)."""
+        self.user_exc = collect_user_exceptions(self.program)
+        for mod in self.program.modules.values():
+            for name, base in mod.exceptions.items():
+                node = next((n for n in mod.tree.body
+                             if isinstance(n, ast.ClassDef) and n.name == name), mod.tree)
+                if name in BUILTIN_EXC:
+                    self.rep.fatal("SE214", "type-mismatch",
+                                   f"exception class '{name}' shadows a built-in exception",
+                                   self._span_of(mod, node))
+                other = next((m.exceptions[name] for m in self.program.modules.values()
+                              if m is not mod and name in m.exceptions), None)
+                if other is not None and other != base:
+                    self.rep.fatal("SE214", "type-mismatch",
+                                   f"exception class '{name}' is defined with conflicting "
+                                   f"bases '{base}' and '{other}' in two modules",
+                                   self._span_of(mod, node))
+                if base not in BUILTIN_EXC and base not in self.user_exc:
+                    self.rep.fatal("SE214", "type-mismatch",
+                                   f"exception base '{base}' of '{name}' is not a known "
+                                   f"exception class", self._span_of(mod, node))
+                if base in self.user_exc and name in exc_ancestors(base, self.user_exc):
+                    self.rep.fatal("SE214", "type-mismatch",
+                                   f"exception class '{name}' inherits from itself",
+                                   self._span_of(mod, node))
+
+    def _span_of(self, mod: Module, node) -> Span:
+        """Best-effort span for a module-level node."""
+        return Span(str(mod.path), getattr(node, "lineno", 1),
+                    getattr(node, "col_offset", 0))
+
+    def _exc_ok(self, name: str) -> bool:
+        """True when `name` is a raise/except-usable exception class in this module."""
+        if name in BUILTIN_EXC:
+            return True
+        if name not in self.user_exc:
+            return False
+        if name in self.mod.exceptions:
+            return True
+        imp = self.mod.imports.get(name)
+        if imp is not None:
+            tmod, orig = imp
+            src = self.program.modules.get(tmod)
+            return orig == name and src is not None and name in src.exceptions
+        return False
+
     def _collect_class_members(self, mod: Module) -> None:
         """Parse fields and method signatures of every class in a module."""
         file = str(mod.path)
         names = self._type_names(mod)
         for cname, cnode in mod.classes.items():
             info = self.classes[(mod.name, cname)]
+            info.statics = dict(mod.class_statics.get(cname, {}))
             for base in cnode.bases:
                 assert isinstance(base, ast.Subscript)
                 elts = base.slice.elts if isinstance(base.slice, ast.Tuple) else [base.slice]
@@ -193,11 +265,24 @@ class TypeChecker:
             for stmt in body:
                 span = Span(file, stmt.lineno, stmt.col_offset)
                 if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                    if stmt.value is not None:
-                        self.rep.fatal("SE201", "unsupported-feature",
-                                       "dataclass field defaults are not Tier 1", span)
                     parsed = parse_annotation(stmt.annotation, self.rep, file,
                                               allow_wrapper=False, names=names)
+                    if stmt.value is not None:
+                        if (isinstance(stmt.value, ast.List) and not stmt.value.elts
+                                and isinstance(parsed.typ, TList)) \
+                                or (isinstance(stmt.value, ast.Dict) and not stmt.value.keys
+                                    and isinstance(parsed.typ, TDict)):
+                            info.field_defaults[stmt.target.id] = stmt.value
+                        else:
+                            self._check_default(stmt.target.id, parsed.typ, CONV_COPY,
+                                                stmt.value, file)
+                            folded_default = self._default_const(stmt.value)
+                            assert folded_default is not None
+                            info.field_defaults[stmt.target.id] = folded_default
+                    elif info.field_defaults:
+                        self.rep.fatal("SE201", "unsupported-feature",
+                                       f"field '{stmt.target.id}' without a default cannot "
+                                       f"follow a defaulted field", span)
                     info.fields[stmt.target.id] = parsed.typ
                     info.field_order.append(stmt.target.id)
                     for t in self._walk(parsed.typ):
@@ -208,14 +293,61 @@ class TypeChecker:
                                 f"'{t.name}' — declare it: class {cname}(Generic[{t.name}])",
                                 span)
                 elif isinstance(stmt, ast.FunctionDef):
-                    if stmt.decorator_list:
+                    deco = stmt.decorator_list
+                    is_property = (len(deco) == 1 and isinstance(deco[0], ast.Name)
+                                   and deco[0].id == "property")
+                    if deco and not is_property:
                         self.rep.fatal("SE201", "unsupported-feature",
-                                       "method decorators are not Tier 1", span)
-                    if stmt.name.startswith("__"):
+                                       "method decorators are not Tier 1 (only @property "
+                                       "and @staticmethod)", span)
+                    if stmt.name.startswith("__") and stmt.name not in ALLOWED_DUNDERS:
                         self.rep.fatal("SE201", "unsupported-feature",
-                                       "dunder methods are not Tier 1 (dataclass generates "
-                                       "__init__/__repr__/__eq__)", span)
-                    info.methods[stmt.name] = self._parse_method_sig(mod, info, stmt, names)
+                                       f"dunder method '{stmt.name}' is not supported "
+                                       f"(supported: {', '.join(sorted(ALLOWED_DUNDERS))}; "
+                                       f"dataclass generates __init__/__repr__/__eq__)", span)
+                    sig = self._parse_method_sig(mod, info, stmt, names)
+                    if is_property:
+                        if len(sig.params) != 1 or sig.params[0].conv != CONV_REF:
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           f"@property '{stmt.name}' must take only "
+                                           f"'self: Ref[{cname}]'", span)
+                        info.properties.add(stmt.name)
+                    if stmt.name == "__str__":
+                        if len(sig.params) != 1 or sig.params[0].conv != CONV_REF \
+                                or not isinstance(sig.ret, TStr):
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           f"__str__ must be (self: Ref[{cname}]) -> str", span)
+                    if stmt.name == "__repr__":
+                        if info.typevars:
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           "__repr__ is not supported on generic classes", span)
+                        if len(sig.params) != 1 or sig.params[0].conv != CONV_REF \
+                                or not isinstance(sig.ret, TStr):
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           f"__repr__ must be (self: Ref[{cname}]) -> str", span)
+                    if stmt.name == "__post_init__":
+                        if info.typevars:
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           "__post_init__ is not supported on generic classes",
+                                           span)
+                        if len(sig.params) != 1 or sig.params[0].conv != CONV_MUT \
+                                or not isinstance(sig.ret, TNone):
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           f"__post_init__ must be (self: Mut[{cname}]) -> None",
+                                           span)
+                    if stmt.name == "__enter__":
+                        self._check_enter_shape(info, stmt, sig, span)
+                    if stmt.name == "__iter__":
+                        self._check_iter_shape(info, stmt, sig, span)
+                    if stmt.name == "__next__":
+                        if len(sig.params) != 1 or sig.params[0].conv != CONV_MUT \
+                                or isinstance(sig.ret, TNone):
+                            self.rep.fatal("SE201", "unsupported-feature",
+                                           f"__next__ must be (self: Mut[{cname}]) -> T "
+                                           f"where T is a non-None value type", span)
+                    if stmt.name == "__exit__":
+                        self._check_exit_shape(cname, sig, span)
+                    info.methods[stmt.name] = sig
                 elif isinstance(stmt, ast.Pass):
                     continue
                 else:
@@ -234,6 +366,52 @@ class TypeChecker:
     def _self_type(self, info: ClassInfo) -> TClass:
         return TClass(info.module, info.name,
                       tuple(TVar(tv) for tv in info.typevars))
+
+    def _check_enter_shape(self, info: ClassInfo, stmt: ast.FunctionDef,
+                           sig: FuncSig, span: Span) -> None:
+        """Enforce that __enter__ is exactly `return self` returning the class."""
+        ok = (len(sig.params) == 1 and sig.params[0].conv == CONV_REF
+              and sig.ret == self._self_type(info))
+        body = stmt.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        ok = ok and len(body) == 1 and isinstance(body[0], ast.Return) \
+            and isinstance(body[0].value, ast.Name) and body[0].value.id == "self"
+        if not ok:
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"__enter__ must be exactly 'def __enter__(self: "
+                           f"Ref[{info.name}]) -> {info.name}: return self' — the with "
+                           f"protocol binds the object itself", span)
+
+    def _check_iter_shape(self, info: ClassInfo, stmt: ast.FunctionDef,
+                          sig: FuncSig, span: Span) -> None:
+        """Enforce that __iter__ is exactly `return self` returning the class."""
+        ok = (len(sig.params) == 1 and sig.params[0].conv == CONV_REF
+              and sig.ret == self._self_type(info))
+        body = stmt.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        ok = ok and len(body) == 1 and isinstance(body[0], ast.Return) \
+            and isinstance(body[0].value, ast.Name) and body[0].value.id == "self"
+        if not ok:
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"__iter__ must be exactly 'def __iter__(self: "
+                           f"Ref[{info.name}]) -> {info.name}: return self' — iterators "
+                           f"are their own iterables", span)
+
+    def _check_exit_shape(self, cname: str, sig: FuncSig, span: Span) -> None:
+        """Enforce __exit__(self, exc_type: None, exc: None, tb: None) -> None."""
+        ok = (len(sig.params) == 4
+              and sig.params[0].conv in (CONV_REF, CONV_MUT)
+              and all(isinstance(p.typ, TNone) for p in sig.params[1:])
+              and isinstance(sig.ret, TNone))
+        if not ok:
+            self.rep.fatal("SE201", "unsupported-feature",
+                           f"__exit__ must be (self: Ref[{cname}]|Mut[{cname}], "
+                           f"exc_type: None, exc: None, tb: None) -> None (exception "
+                           f"details are not passed natively)", span)
 
     def _parse_method_sig(self, mod: Module, info: ClassInfo, fn: ast.FunctionDef,
                           names: dict[str, Type]) -> FuncSig:
@@ -282,6 +460,7 @@ class TypeChecker:
             default = a.defaults[i - defaults_off] if i >= defaults_off else None
             if default is not None:
                 self._check_default(arg.arg, p.typ, conv, default, file)
+                default = self._default_const(default)
             params.append(Param(arg.arg, conv, p.typ, default))
         if fn.returns is None:
             self.rep.fatal("SE203", "missing-annotation",
@@ -472,18 +651,32 @@ class TypeChecker:
         return Span(str(mod.path), node.lineno, node.col_offset,
                     getattr(node, "end_col_offset", None))
 
+    def _default_const(self, default: ast.expr) -> ast.Constant | None:
+        """Fold a literal default (including negated numbers) to a Constant node."""
+        if isinstance(default, ast.Constant):
+            return default
+        if (isinstance(default, ast.UnaryOp) and isinstance(default.op, ast.USub)
+                and isinstance(default.operand, ast.Constant)
+                and isinstance(default.operand.value, (int, float))
+                and not isinstance(default.operand.value, bool)):
+            c = ast.Constant(value=-default.operand.value)
+            ast.copy_location(c, default)
+            return c
+        return None
+
     def _check_default(self, pname: str, typ: Type, conv: str, default: ast.expr,
                        file: str) -> None:
         """Validate a Tier-2 default parameter value: literal, type-compatible."""
         span = Span(file, default.lineno, default.col_offset)
-        if not isinstance(default, ast.Constant):
+        folded = self._default_const(default)
+        if folded is None:
             self.rep.fatal("SE201", "unsupported-feature",
                            f"default value of '{pname}' must be a literal constant "
                            f"(mutable or computed defaults are not Tier 2)", span)
         if has_tvar(typ):
             self.rep.fatal("SE201", "unsupported-feature",
                            f"generic parameter '{pname}' cannot take a default value", span)
-        v = default.value
+        v = folded.value
         vt: Type
         if isinstance(v, bool):
             vt = BOOL
@@ -495,10 +688,12 @@ class TypeChecker:
             vt = STR
         elif v is None:
             vt = NONE
+        elif isinstance(v, bytes):
+            vt = TBytes()
         else:
             self.rep.fatal("SE201", "unsupported-feature",
-                           f"default value of '{pname}' must be an int/float/bool/str/None "
-                           f"literal", span)
+                           f"default value of '{pname}' must be an int/float/bool/str/bytes/"
+                           f"None literal", span)
             raise AssertionError
         if not self._assignable(vt, typ) and not (isinstance(typ, TFloat) and isinstance(vt, TInt)):
             self.rep.fatal("SE214", "type-mismatch",
@@ -538,6 +733,7 @@ class TypeChecker:
                 default = a.defaults[i - defaults_off] if i >= defaults_off else None
                 if default is not None:
                     self._check_default(arg.arg, parsed.typ, conv, default, file)
+                    default = self._default_const(default)
                 params.append(Param(arg.arg, conv, parsed.typ, default))
             if fn.returns is None:
                 self.rep.fatal("SE203", "missing-annotation",
@@ -583,6 +779,46 @@ class TypeChecker:
             return self.sigs.get((target_mod, orig))
         return None
 
+    def _apply_keywords(self, node: ast.Call, params: list, label: str) -> None:
+        """Rewrite keyword arguments into positional order, filling gaps with literal defaults."""
+        if not node.keywords:
+            return
+        names = [p.name for p in params]
+        kwmap: dict[str, ast.expr] = {}
+        for kw in node.keywords:
+            if kw.arg is None:
+                self._err("SE201", "unsupported-feature",
+                          f"**kwargs is not supported in a call to {label}", node)
+            if kw.arg not in names:
+                self._err("SE214", "type-mismatch",
+                          f"{label} has no parameter '{kw.arg}'", node)
+            if names.index(kw.arg) < len(node.args):
+                self._err("SE214", "type-mismatch",
+                          f"{label} got multiple values for parameter '{kw.arg}'", node)
+            if kw.arg in kwmap:
+                self._err("SE214", "type-mismatch",
+                          f"{label} got duplicate keyword argument '{kw.arg}'", node)
+            kwmap[kw.arg] = kw.value
+        last = max(names.index(k) for k in kwmap)
+        new_args = list(node.args)
+        for i in range(len(node.args), last + 1):
+            p = params[i]
+            if p.name in kwmap:
+                new_args.append(kwmap[p.name])
+            elif p.default is not None:
+                if isinstance(p.default, ast.Constant):
+                    c: ast.expr = ast.Constant(value=p.default.value)
+                else:
+                    c = copy.deepcopy(p.default)
+                ast.copy_location(c, node)
+                new_args.append(c)
+            else:
+                self._err("SE214", "type-mismatch",
+                          f"{label} missing required argument '{p.name}'", node)
+        node.args = new_args
+        node.keywords = []
+
+
     # ---------- function body checking ----------
 
     def _check_function(self, mod: Module, fn: ast.FunctionDef, sig: FuncSig) -> None:
@@ -606,6 +842,13 @@ class TypeChecker:
         self.loop_depth = 0
         self.try_stack: list[dict] = []
         self.handler_depth = 0
+        self.captured_frozen: set[str] = set()    # names captured by a lambda (immutable after)
+        self.loop_assigned = set()                # names stored anywhere inside a loop
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.For, ast.While)):
+                for sub in ast.walk(n):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                        self.loop_assigned.add(sub.id)
         for p in sig.params:
             self.env[p.name] = (p.typ, p.conv)
             facts.locals[p.name] = p.typ
@@ -639,6 +882,9 @@ class TypeChecker:
         node_copy = copy.deepcopy(template.node)
         inst = FuncSig(template.module, inst_name, params, ret, node_copy,
                        is_template=False, cls=template.cls, subst=dict(sub))
+        for p in inst.params:
+            self._enforce_func_copy(p.typ, node)
+        self._enforce_func_copy(ret, node)
         self.sigs[key] = inst
         # Fix conventions that were deferred while the type was still a TVar.
         for p in inst.params:
@@ -653,6 +899,17 @@ class TypeChecker:
          self.loop_depth, self.try_stack, self.handler_depth, self.comp_borrows,
          self.with_targets, self.ref_locals, self.elem_borrows, self.borrow_scopes) = saved
         return inst
+
+    def _enforce_func_copy(self, t: Type, node: ast.AST) -> None:
+        """Reject Callable signatures whose substituted types are not Copy."""
+        for s in self._walk(t):
+            if isinstance(s, TFunc):
+                bad = [str(x) for x in (*s.params, s.ret) if not x.is_copy()]
+                if bad:
+                    self._err("SE201", "unsupported-feature",
+                              f"Callable signatures must use Copy types (function values "
+                              f"are O(1)-copy handles); {', '.join(bad)} is not Copy "
+                              f"(from generic instantiation)", node)
 
     def _err(self, code: str, name: str, msg: str, node: ast.AST, label: str = "",
              help: str = "") -> None:
@@ -761,7 +1018,8 @@ class TypeChecker:
         for h in stmt.handlers:
             classes = self._handler_classes(h)
             for c in classes:
-                if c in seen_classes or "Exception" in seen_classes:
+                covered = {c} | exc_ancestors(c, self.user_exc)
+                if covered & set(seen_classes):
                     self._err("SE201", "unsupported-feature",
                               f"except clause for '{c}' is unreachable — already handled", h)
             seen_classes.extend(classes)
@@ -795,15 +1053,15 @@ class TypeChecker:
         if h.type is None:
             return ["Exception"]
         if isinstance(h.type, ast.Name):
-            if h.type.id not in KNOWN_EXC:
+            if not self._exc_ok(h.type.id):
                 self._err("SE214", "type-mismatch",
-                          f"unknown exception class '{h.type.id}' — user exception classes "
-                          f"are Tier 2", h.type)
+                          f"unknown exception class '{h.type.id}' — define it as "
+                          f"'class {h.type.id}(Exception): pass' or import it", h.type)
             return [h.type.id]
         if isinstance(h.type, ast.Tuple):
             out = []
             for e in h.type.elts:
-                if not isinstance(e, ast.Name) or e.id not in KNOWN_EXC:
+                if not isinstance(e, ast.Name) or not self._exc_ok(e.id):
                     self._err("SE214", "type-mismatch",
                               "except tuple entries must be known exception classes", e)
                 out.append(e.id)
@@ -821,16 +1079,16 @@ class TypeChecker:
             return
         e = stmt.exc
         if isinstance(e, ast.Name):
-            if e.id not in KNOWN_EXC:
+            if not self._exc_ok(e.id):
                 self._err("SE214", "type-mismatch",
-                          f"unknown exception class '{e.id}' — user exception classes are "
-                          f"Tier 2", e)
+                          f"unknown exception class '{e.id}' — define it as "
+                          f"'class {e.id}(Exception): pass' or import it", e)
             return
         if isinstance(e, ast.Call) and isinstance(e.func, ast.Name):
-            if e.func.id not in KNOWN_EXC:
+            if not self._exc_ok(e.func.id):
                 self._err("SE214", "type-mismatch",
-                          f"unknown exception class '{e.func.id}' — user exception classes "
-                          f"are Tier 2", e)
+                          f"unknown exception class '{e.func.id}' — define it as "
+                          f"'class {e.func.id}(Exception): pass' or import it", e)
             if e.keywords or len(e.args) > 1:
                 self._err("SE214", "type-mismatch",
                           "exceptions take at most one positional message argument", e)
@@ -854,7 +1112,7 @@ class TypeChecker:
                 and ctx.func.id == "open"):
             self._err("SE201", "unsupported-feature",
                       "with supports only open(...) in Tier 2", ctx)
-        self._type_expr(ctx, narrow)
+        ctx_t = self._type_expr(ctx, narrow)
         if item.optional_vars is None or not isinstance(item.optional_vars, ast.Name):
             self._err("SE201", "unsupported-feature",
                       "with open(...) needs a single 'as <name>' target", stmt)
@@ -863,8 +1121,8 @@ class TypeChecker:
             self._err("SE201", "unsupported-feature",
                       f"with target '{name}' shadows an existing variable — use a fresh name",
                       item.optional_vars)
-        self.env[name] = (TFile(), "local")
-        self.expr_types[id(item.optional_vars)] = TFile()
+        self.env[name] = (ctx_t, "local")
+        self.expr_types[id(item.optional_vars)] = ctx_t
         self.with_targets.append(name)
         assigned = self._assigned_names(stmt.body)
         body_narrow = self._filter_narrow(narrow, assigned)
@@ -879,7 +1137,7 @@ class TypeChecker:
                 self._err("SE214", "type-mismatch",
                           f"bare return in function returning {self.sig.ret}", stmt)
             return
-        t = self._type_expr(stmt.value, narrow)
+        t = self._type_expr(stmt.value, narrow, expect=self.sig.ret)
         if not self._assignable(t, self.sig.ret):
             self._err("SE214", "type-mismatch",
                       f"return type mismatch: expected {self.sig.ret}, got {t}", stmt)
@@ -971,6 +1229,10 @@ class TypeChecker:
     def _check_annassign(self, stmt: ast.AnnAssign, narrow: dict[str, Type]) -> dict[str, Type]:
         if not isinstance(stmt.target, ast.Name):
             self._err("SE201", "unsupported-feature", "annotated assignment target must be a name", stmt)
+        if stmt.target.id in self.captured_frozen:
+            self._err("SE004", "conflicting-borrow",
+                      f"'{stmt.target.id}' was captured by a lambda and is frozen — "
+                      f"reassigning it would diverge from CPython's late binding", stmt)
         parsed = parse_annotation(stmt.annotation, self.rep, str(self.mod.path),
                                   allow_wrapper=True, names=self._cur_names())
         if parsed.conv in (CONV_REF, CONV_MUT):
@@ -1004,6 +1266,10 @@ class TypeChecker:
         if isinstance(target, ast.Tuple):
             self._err("SE201", "unsupported-feature", "tuple unpacking is not Tier 0", stmt)
         if isinstance(target, ast.Name):
+            if target.id in self.captured_frozen:
+                self._err("SE004", "conflicting-borrow",
+                          f"'{target.id}' was captured by a lambda and is frozen — "
+                          f"reassigning it would diverge from CPython's late binding", stmt)
             t = self._type_expr(stmt.value, narrow,
                                 expect=self.env[target.id][0] if target.id in self.env else None)
             if isinstance(t, TIter):
@@ -1041,6 +1307,27 @@ class TypeChecker:
             cont_t = self._type_expr(target.value, narrow)
             if isinstance(cont_t, TShared):
                 cont_t = cont_t.inner
+            if isinstance(cont_t, TByteArray):
+                idx_t0 = self._type_expr(target.slice, narrow)
+                if not isinstance(idx_t0, TInt):
+                    self._err("SE214", "type-mismatch",
+                              f"bytearray index must be int, got {idx_t0}", target.slice)
+                vt0 = self._type_expr(stmt.value, narrow, expect=INT)
+                if not isinstance(vt0, TInt):
+                    self._err("SE214", "type-mismatch",
+                              f"bytearray items must be int, got {vt0}", stmt.value)
+                self._mut_borrow_place(target.value, stmt)
+                self._check_narrow_invalidation_by_mut(target.value, narrow)
+                return narrow
+            if isinstance(cont_t, TClass):
+                self._type_expr(stmt.value, narrow)
+                t = self._op_method_call(stmt, target.value, "__setitem__",
+                                         [target.slice, stmt.value], narrow, require=NONE)
+                if t is None:
+                    self._err("SE214", "type-mismatch",
+                              f"{cont_t} does not support item assignment — define "
+                              f"__setitem__()", target)
+                return narrow
             idx_t = self._type_expr(target.slice, narrow)
             if isinstance(cont_t, TList):
                 if not isinstance(idx_t, TInt):
@@ -1093,9 +1380,13 @@ class TypeChecker:
         raise AssertionError
 
     def _check_augassign(self, stmt: ast.AugAssign, narrow: dict[str, Type]) -> dict[str, Type]:
+        if isinstance(stmt.target, ast.Name) and stmt.target.id in self.captured_frozen:
+            self._err("SE004", "conflicting-borrow",
+                      f"'{stmt.target.id}' was captured by a lambda and is frozen — "
+                      f"reassigning it would diverge from CPython's late binding", stmt)
         tt = self._type_expr_place(stmt.target, narrow)
         vt = self._type_expr(stmt.value, narrow)
-        rt = self._binop_type(stmt.op, tt, vt, stmt)
+        rt = self._binop_type(stmt.op, tt, vt, stmt, narrow)
         if not self._assignable(rt, tt):
             self._err("SE214", "type-mismatch", f"augmented assignment changes type {tt} -> {rt}", stmt)
         if isinstance(stmt.target, (ast.Subscript, ast.Attribute)):
@@ -1108,7 +1399,7 @@ class TypeChecker:
 
     def _check_if(self, stmt: ast.If, narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
         cond_t = self._type_expr(stmt.test, narrow)
-        if not isinstance(cond_t, TBool):
+        if not isinstance(cond_t, (TBool, TPyVal)):
             self._err("SE214", "type-mismatch", f"if condition must be bool, got {cond_t}", stmt.test)
         pos, neg = self._narrow_from_test(stmt.test, narrow)
         then_after, then_term = self._check_block(stmt.body, pos)
@@ -1157,7 +1448,7 @@ class TypeChecker:
         assigned = self._assigned_names(stmt.body)
         loop_narrow = self._filter_narrow(narrow, assigned)
         cond_t = self._type_expr(stmt.test, loop_narrow)
-        if not isinstance(cond_t, TBool):
+        if not isinstance(cond_t, (TBool, TPyVal)):
             self._err("SE214", "type-mismatch", f"while condition must be bool, got {cond_t}", stmt.test)
         pos, _neg = self._narrow_from_test(stmt.test, loop_narrow)
         self.loop_depth += 1
@@ -1171,6 +1462,10 @@ class TypeChecker:
         if stmt.orelse:
             self._err("SE201", "unsupported-feature", "for-else is not Tier 0", stmt)
         iter_t = self._type_expr(stmt.iter, narrow)
+        if isinstance(iter_t, TClass):
+            cinfo = self.classes.get((iter_t.module, iter_t.name))
+            if cinfo is not None and "__next__" in cinfo.methods:
+                return self._lower_class_for(stmt, narrow)
         kind = "list"
         elems: tuple[Type, ...]
         if isinstance(iter_t, TList):
@@ -1178,6 +1473,12 @@ class TypeChecker:
         elif isinstance(iter_t, TStr):
             kind = "str"
             elems = (STR,)
+        elif isinstance(iter_t, (TBytes, TByteArray)):
+            kind = "bytes" if isinstance(iter_t, TBytes) else "bytearray"
+            elems = (INT,)
+        elif isinstance(iter_t, TPyVal):
+            kind = "pyval"
+            elems = (TPyVal(),)
         elif isinstance(iter_t, TIter):
             kind = iter_t.kind
             elems = iter_t.elem
@@ -1220,6 +1521,62 @@ class TypeChecker:
             assigned.add(tgt.id)
         return self._filter_narrow(narrow, assigned), False
 
+    def _lower_class_for(self, stmt: ast.For, narrow: dict[str, Type]) -> tuple[dict[str, Type], bool]:
+        """Lower `for x in obj` over a user iterator class into while/__next__/except."""
+        self._for_counter += 1
+        n = self._for_counter
+        out: list[ast.stmt] = []
+        lowered_names: list[str] = []
+        it = stmt.iter
+        if isinstance(it, (ast.Name, ast.Attribute, ast.Subscript)):
+            recv: ast.expr = copy.deepcopy(it)
+        else:
+            tname = f"_serp_for_{n}"
+            hoist = ast.Assign(targets=[ast.Name(id=tname, ctx=ast.Store())], value=it)
+            ast.copy_location(hoist, stmt)
+            ast.fix_missing_locations(hoist)
+            self._declare(tname, self.expr_types[id(it)], stmt)
+            out.append(hoist)
+            lowered_names.append(tname)
+            recv = ast.Name(id=tname, ctx=ast.Load())
+        call = ast.Call(func=ast.Attribute(value=recv, attr="__next__", ctx=ast.Load()),
+                        args=[], keywords=[])
+        unpack: list[ast.stmt] = []
+        if isinstance(stmt.target, ast.Name):
+            step = ast.Assign(targets=[ast.Name(id=stmt.target.id, ctx=ast.Store())],
+                              value=call)
+            lowered_names.append(stmt.target.id)
+        elif isinstance(stmt.target, ast.Tuple) \
+                and all(isinstance(e, ast.Name) for e in stmt.target.elts):
+            ttmp = f"_serp_for_{n}_t"
+            step = ast.Assign(targets=[ast.Name(id=ttmp, ctx=ast.Store())], value=call)
+            lowered_names.append(ttmp)
+            for i, elt in enumerate(stmt.target.elts):
+                unpack.append(ast.Assign(
+                    targets=[ast.Name(id=elt.id, ctx=ast.Store())],
+                    value=ast.Subscript(value=ast.Name(id=ttmp, ctx=ast.Load()),
+                                        slice=ast.Constant(value=i), ctx=ast.Load())))
+                lowered_names.append(elt.id)
+        else:
+            self._err("SE201", "unsupported-feature",
+                      "for target must be one or more names", stmt.target)
+            raise AssertionError
+        handler = ast.ExceptHandler(type=ast.Name(id="StopIteration", ctx=ast.Load()),
+                                    name=None, body=[ast.Break()])
+        tr = ast.Try(body=[step], handlers=[handler], orelse=[], finalbody=[])
+        wh = ast.While(test=ast.Constant(value=True),
+                       body=[tr] + unpack + list(stmt.body), orelse=[])
+        for nd in (wh, tr, handler):
+            ast.copy_location(nd, stmt)
+        ast.fix_missing_locations(wh)
+        out.append(wh)
+        self.for_lowered[id(stmt)] = out
+        self.for_lowered_names[id(stmt)] = lowered_names
+        if out[0] is not wh:
+            self.cur_facts.events.append(("assign", lowered_names[0], stmt))
+        narrow, _term = self._check_stmt(wh, narrow)
+        return narrow, False
+
     def _borrowable_root(self, iter_expr: ast.expr) -> str | None:
         """The root variable Ref-borrowed by a for loop, if any (range borrows nothing)."""
         e = iter_expr
@@ -1247,9 +1604,21 @@ class TypeChecker:
         return (isinstance(node, ast.List) and not node.elts) or \
                (isinstance(node, ast.Dict) and not node.keys)
 
+    def _pyval_coercible(self, src: Type) -> bool:
+        """Whether src implicitly coerces into a PyVal at annotated boundaries."""
+        if isinstance(src, (TPyVal, TNone, TBool, TInt, TFloat, TStr, TBytes)):
+            return True
+        if isinstance(src, TList):
+            return self._pyval_coercible(src.elem)
+        if isinstance(src, TDict):
+            return isinstance(src.key, TStr) and self._pyval_coercible(src.value)
+        return False
+
     def _assignable(self, src: Type, dst: Type) -> bool:
         if src == dst:
             return True
+        if isinstance(dst, TPyVal):
+            return self._pyval_coercible(src)
         if isinstance(dst, TOptional):
             return isinstance(src, TNone) or self._assignable(src, dst.inner)
         if isinstance(dst, TList) and isinstance(src, TList):
@@ -1269,6 +1638,15 @@ class TypeChecker:
             return self.env[name][0]
         if (self.mod.name, name) in self.constants:
             return self.constants[(self.mod.name, name)]
+        if name in self.mod.imports:
+            tmod, orig = self.mod.imports[name]
+            if (tmod, orig) in self.constants:
+                return self.constants[(tmod, orig)]
+        sig = self._resolve_callee(self.mod, name)
+        if sig is not None:
+            ft = self._func_value_type(sig, node)
+            self.func_value_refs[id(node)] = (sig.module, sig.name)
+            return ft
         self._err("SE214", "type-mismatch", f"unknown name '{name}'", node)
         raise AssertionError
 
@@ -1278,10 +1656,12 @@ class TypeChecker:
         return t
 
     def _type_expr_inner(self, node: ast.expr, narrow: dict[str, Type], expect: Type | None) -> Type:
-        if isinstance(node, (ast.Lambda, ast.SetComp, ast.GeneratorExp, ast.NamedExpr,
+        if isinstance(node, (ast.SetComp, ast.GeneratorExp, ast.NamedExpr,
                              ast.Await, ast.Yield, ast.YieldFrom, ast.Starred, ast.Set)):
             self._err("SE201", "unsupported-feature",
                       f"'{type(node).__name__}' is not in the Tier-0 grammar", node)
+        if isinstance(node, ast.Lambda):
+            return self._type_lambda(node, narrow, expect)
         if isinstance(node, ast.Slice):
             self._err("SE201", "unsupported-feature",
                       "slices are only allowed directly inside a str subscript (s[a:b])", node)
@@ -1311,7 +1691,7 @@ class TypeChecker:
         if isinstance(node, ast.BinOp):
             lt = self._type_expr(node.left, narrow)
             rt = self._type_expr(node.right, narrow)
-            return self._binop_type(node.op, lt, rt, node)
+            return self._binop_type(node.op, lt, rt, node, narrow)
         if isinstance(node, ast.BoolOp):
             for v in node.values:
                 vt = self._type_expr(v, narrow)
@@ -1375,6 +1755,11 @@ class TypeChecker:
                       "attribute access on an optional — test 'is not None' first", node)
         cls_t = base.inner if isinstance(base, TShared) else base
         if isinstance(cls_t, TClass):
+            info = self.classes.get((cls_t.module, cls_t.name))
+            if info is not None and node.attr in info.properties:
+                t = self._op_method_call(node, node.value, node.attr, [], narrow)
+                if t is not None:
+                    return t
             return self._field_type(cls_t, node.attr, node)
         self._err("SE214", "type-mismatch", f"{base} has no attribute '{node.attr}'", node)
         raise AssertionError
@@ -1389,25 +1774,61 @@ class TypeChecker:
             return FLOAT
         if isinstance(v, str):
             return STR
+        if isinstance(v, bytes):
+            return TBytes()
         if v is None:
             return NONE
         self._err("SE201", "unsupported-feature", f"literal {v!r} is not Tier 0", node)
         raise AssertionError
 
+    def _contains_func(self, t: Type, _seen: frozenset = frozenset()) -> bool:
+        """Whether a type transitively contains a function value (no repr/eq parity)."""
+        for w in self._walk(t):
+            if isinstance(w, TFunc):
+                return True
+            if isinstance(w, TClass):
+                key = (w.module, w.name)
+                if key in _seen:
+                    continue
+                info = self.classes.get(key)
+                if info is not None:
+                    sub = dict(zip(info.typevars, w.args)) if info.typevars else {}
+                    for ft in info.fields.values():
+                        if self._contains_func(subst_type(ft, sub), _seen | {key}):
+                            return True
+        return False
+
     def _type_fstring(self, node: ast.JoinedStr, narrow: dict[str, Type]) -> Type:
         for part in node.values:
             if isinstance(part, ast.FormattedValue):
                 t = self._type_expr(part.value, narrow)
-                if isinstance(t, (TIter, TIterObj, TFile)):
+                if isinstance(t, (TIter, TIterObj, TFile)) or self._contains_func(t):
                     self._err("SE214", "type-mismatch", f"cannot format a {t}", part.value)
+                if part.conversion in (-1, 115):
+                    t0 = t.inner if isinstance(t, TShared) else t
+                    if isinstance(t0, TClass):
+                        info0 = self.classes.get((t0.module, t0.name))
+                        if info0 is not None and "__str__" in info0.methods:
+                            recv_copy = copy.copy(part.value)
+                            self.expr_types[id(recv_copy)] = t
+                            r = self._op_method_call(part.value, recv_copy, "__str__",
+                                                     [], narrow, require=STR)
+                            if r is not None:
+                                self.expr_types[id(part.value)] = STR
         return STR
 
     def _type_list_literal(self, node: ast.List, narrow: dict[str, Type], expect: Type | None) -> Type:
+        if isinstance(expect, TOptional):
+            expect = expect.inner
         if not node.elts:
             if isinstance(expect, TList):
                 return expect
+            if isinstance(expect, TPyVal):
+                return TList(TPyVal())
             return TList(NONE)
         elem_expect = expect.elem if isinstance(expect, TList) else None
+        if isinstance(expect, TPyVal):
+            elem_expect = TPyVal()
         if elem_expect is not None:
             for e in node.elts:
                 t = self._type_expr(e, narrow, expect=elem_expect)
@@ -1428,10 +1849,29 @@ class TypeChecker:
         return TList(elem_expect if elem_expect is not None else self.expr_types[id(node.elts[0])])
 
     def _type_dict_literal(self, node: ast.Dict, narrow: dict[str, Type], expect: Type | None) -> Type:
+        if isinstance(expect, TOptional):
+            expect = expect.inner
         if not node.keys:
             if isinstance(expect, TDict):
                 return expect
+            if isinstance(expect, TPyVal):
+                return TDict(STR, TPyVal())
             return TDict(NONE, NONE)
+        if isinstance(expect, TPyVal) or \
+                (isinstance(expect, TDict) and isinstance(expect.value, TPyVal)):
+            vexp: Type = TPyVal()
+            for k, v in zip(node.keys, node.values):
+                if k is None:
+                    self._err("SE201", "unsupported-feature", "dict unpacking is not Tier 0", node)
+                k2 = self._type_expr(k, narrow)
+                if not isinstance(k2, TStr):
+                    self._err("SE214", "type-mismatch",
+                              f"dynamic dict keys must be str, got {k2}", k)
+                v2 = self._type_expr(v, narrow, expect=vexp)
+                if not self._assignable(v2, vexp):
+                    self._err("SE214", "type-mismatch",
+                              f"dict value is {v2}, expected {vexp}", v)
+            return TDict(STR, vexp)
         kt = self._type_expr(node.keys[0], narrow)
         vt = self._type_expr(node.values[0], narrow)
         for k, v in zip(node.keys[1:], node.values[1:]):
@@ -1463,9 +1903,30 @@ class TypeChecker:
             if not isinstance(it, TInt):
                 self._err("SE214", "type-mismatch", f"str index must be int, got {it}", node.slice)
             return STR
+        if isinstance(base, (TBytes, TByteArray)):
+            if isinstance(node.slice, ast.Slice):
+                if node.slice.step is not None:
+                    self._err("SE201", "unsupported-feature", "slice steps are not supported", node.slice)
+                for part in (node.slice.lower, node.slice.upper):
+                    if part is not None and not isinstance(self._type_expr(part, narrow), TInt):
+                        self._err("SE214", "type-mismatch", "slice bounds must be int", part)
+                return TBytes() if isinstance(base, TBytes) else TByteArray()
+            idx0 = self._type_expr(node.slice, narrow)
+            if not isinstance(idx0, TInt):
+                self._err("SE214", "type-mismatch", f"{base} index must be int, got {idx0}", node.slice)
+            return INT
+        if isinstance(base, TPyVal):
+            if isinstance(node.slice, ast.Slice):
+                self._err("SE201", "unsupported-feature",
+                          "PyVal values do not support slicing", node.slice)
+            it0 = self._type_expr(node.slice, narrow)
+            if not isinstance(it0, (TInt, TStr, TPyVal)):
+                self._err("SE214", "type-mismatch",
+                          f"PyVal index must be int, str, or PyVal, got {it0}", node.slice)
+            return TPyVal()
         if isinstance(node.slice, ast.Slice):
             self._err("SE201", "unsupported-feature",
-                      "slicing is Tier-2 for str only (s[a:b])", node.slice)
+                      "slicing is Tier-2 for str/bytes/bytearray only (s[a:b])", node.slice)
         idx = self._type_expr(node.slice, narrow)
         if isinstance(base, TList):
             if not isinstance(idx, TInt):
@@ -1483,6 +1944,12 @@ class TypeChecker:
                     return base.items[i]
                 self._err("SE214", "type-mismatch", f"tuple index {i} out of range", node.slice)
             self._err("SE201", "unsupported-feature", "tuple indices must be integer literals", node.slice)
+        if isinstance(base, TClass):
+            if not isinstance(node.slice, ast.Slice):
+                t = self._op_method_call(node, node.value, "__getitem__",
+                                         [node.slice], narrow)
+                if t is not None:
+                    return t
         if isinstance(base, TOptional):
             self._err("SE210", "unnarrowed-optional",
                       "cannot index an optional — test 'is not None' first", node)
@@ -1492,10 +1959,15 @@ class TypeChecker:
     def _type_unary(self, node: ast.UnaryOp, narrow: dict[str, Type]) -> Type:
         t = self._type_expr(node.operand, narrow)
         if isinstance(node.op, ast.Not):
-            if not isinstance(t, TBool):
+            if not isinstance(t, (TBool, TPyVal)):
                 self._err("SE214", "type-mismatch", f"'not' operand must be bool, got {t}", node)
             return BOOL
         if isinstance(node.op, (ast.USub, ast.UAdd)):
+            t0 = t.inner if isinstance(t, TShared) else t
+            if isinstance(node.op, ast.USub) and isinstance(t0, TClass):
+                r = self._op_method_call(node, node.operand, "__neg__", [], narrow)
+                if r is not None:
+                    return r
             if isinstance(t, TBool):
                 self._err("SE208", "bool-arithmetic", "bool in arithmetic position — write int(b)", node)
             if not isinstance(t, NUMERIC):
@@ -1504,7 +1976,52 @@ class TypeChecker:
         self._err("SE201", "unsupported-feature", "unsupported unary operator", node)
         raise AssertionError
 
-    def _binop_type(self, op: ast.operator, lt: Type, rt: Type, node: ast.AST) -> Type:
+    def _op_method_call(self, node: ast.AST, recv: ast.expr, method: str,
+                        arg_exprs: list, narrow: dict[str, Type],
+                        require: Type | None = None) -> Type | None:
+        """Desugar an operator onto its dunder method call (None when not applicable)."""
+        rt = self.expr_types.get(id(recv))
+        if rt is None:
+            rt = self._type_expr(recv, narrow)
+        inner = rt.inner if isinstance(rt, TShared) else rt
+        if not isinstance(inner, TClass):
+            return None
+        info = self.classes.get((inner.module, inner.name))
+        if info is None or method not in info.methods:
+            return None
+        call = ast.Call(func=ast.Attribute(value=recv, attr=method, ctx=ast.Load()),
+                        args=list(arg_exprs), keywords=[])
+        anchor = node if hasattr(node, "lineno") else recv
+        ast.copy_location(call, anchor)
+        ast.copy_location(call.func, anchor)
+        ast.fix_missing_locations(call)
+        t = self._type_method_call(call, narrow)
+        self.expr_types[id(call)] = t
+        self.op_calls[id(node)] = call
+        if require is not None and t != require:
+            self._err("SE214", "type-mismatch",
+                      f".{method}() must return {require}, got {t}", anchor)
+        return t
+
+    def _binop_type(self, op: ast.operator, lt: Type, rt: Type, node: ast.AST,
+                    narrow: dict[str, Type] | None = None) -> Type:
+        linner = lt.inner if isinstance(lt, TShared) else lt
+        if isinstance(linner, TClass):
+            dunder = BINOP_DUNDER.get(type(op))
+            if isinstance(node, ast.AugAssign):
+                self._err("SE201", "unsupported-feature",
+                          "augmented assignment on class operands — write x = x + y", node)
+            elif dunder is not None and isinstance(node, ast.BinOp):
+                t = self._op_method_call(node, node.left, dunder,
+                                         [node.right], narrow or {})
+                if t is not None:
+                    return t
+                self._err("SE214", "type-mismatch",
+                          f"unsupported operand types: {lt} and {rt} — define "
+                          f"{dunder}() on {linner} to overload this operator", node)
+            else:
+                self._err("SE214", "type-mismatch",
+                          f"unsupported operand types: {lt} and {rt}", node)
         for t, operand in ((lt, "left"), (rt, "right")):
             if isinstance(t, TBool):
                 self._err("SE208", "bool-arithmetic",
@@ -1514,6 +2031,12 @@ class TypeChecker:
                           "optional value in arithmetic — test 'is not None' first", node)
         if isinstance(op, ast.Add) and isinstance(lt, TStr) and isinstance(rt, TStr):
             return STR
+        if isinstance(op, ast.Add) and isinstance(lt, TBytes) and isinstance(rt, TBytes):
+            return TBytes()
+        if isinstance(op, ast.Mult) and (
+                (isinstance(lt, TBytes) and isinstance(rt, TInt))
+                or (isinstance(lt, TInt) and isinstance(rt, TBytes))):
+            return TBytes()
         if isinstance(op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.LShift, ast.RShift,
                            ast.MatMult)):
             self._err("SE201", "unsupported-feature", "bitwise operators are not Tier 0", node)
@@ -1548,7 +2071,14 @@ class TypeChecker:
                 self._err("SE201", "unsupported-feature", "chained 'in' is not Tier 0", node)
             lt = self._type_expr(node.left, narrow)
             ct = self._type_expr(node.comparators[0], narrow)
-            if isinstance(ct, TDict):
+            if isinstance(lt, TFunc):
+                self._err("SE214", "type-mismatch",
+                          "function values cannot be compared, so 'in' is not supported", node)
+            if isinstance(ct, TPyVal):
+                if not (isinstance(lt, TPyVal) or self._pyval_coercible(lt)):
+                    self._err("SE214", "type-mismatch",
+                              f"'in' on PyVal needs a PyVal-compatible operand, got {lt}", node)
+            elif isinstance(ct, TDict):
                 if not self._assignable(lt, ct.key):
                     self._err("SE214", "type-mismatch", f"'in' key must be {ct.key}, got {lt}", node)
             elif isinstance(ct, TList):
@@ -1557,21 +2087,45 @@ class TypeChecker:
             elif isinstance(ct, TStr):
                 if not isinstance(lt, TStr):
                     self._err("SE214", "type-mismatch", "'in' on str needs a str operand", node)
+            elif isinstance(ct, TBytes):
+                if not isinstance(lt, TBytes):
+                    self._err("SE214", "type-mismatch",
+                              "'in' on bytes needs a bytes operand", node)
             else:
                 self._err("SE214", "type-mismatch", f"'in' is not supported on {ct}", node)
             return BOOL
         prev = self._type_expr(node.left, narrow)
         for op, comp in zip(ops, node.comparators):
             cur = self._type_expr(comp, narrow)
-            self._check_comparable(op, prev, cur, node)
+            self._check_comparable(op, prev, cur, node, narrow)
             prev = cur
         return BOOL
 
-    def _check_comparable(self, op: ast.cmpop, lt: Type, rt: Type, node: ast.AST) -> None:
-        if isinstance(lt, (TWeak, TFile, TExc)) or isinstance(rt, (TWeak, TFile, TExc)):
+    def _check_comparable(self, op: ast.cmpop, lt: Type, rt: Type, node: ast.AST,
+                          narrow: dict[str, Type] | None = None) -> None:
+        if isinstance(lt, (TWeak, TFile, TExc, TFunc)) or isinstance(rt, (TWeak, TFile, TExc, TFunc)):
             self._err("SE214", "type-mismatch", f"cannot compare {lt} and {rt}", node)
+        if isinstance(lt, TPyVal) or isinstance(rt, TPyVal):
+            other = rt if isinstance(lt, TPyVal) else lt
+            if isinstance(op, (ast.Eq, ast.NotEq)) and self._pyval_coercible(other):
+                return
+            self._err("SE214", "type-mismatch",
+                      f"PyVal supports only ==/!= against PyVal-compatible values "
+                      f"({lt} vs {rt})", node)
+        l0 = lt.inner if isinstance(lt, TShared) else lt
+        if isinstance(l0, TClass) and type(op) in CMP_DUNDER and isinstance(node, ast.Compare):
+            if len(node.ops) != 1:
+                self._err("SE201", "unsupported-feature",
+                          "chained comparisons on class operands are not supported", node)
+            r = self._op_method_call(node, node.left, CMP_DUNDER[type(op)],
+                                     [node.comparators[0]], narrow or {}, require=BOOL)
+            if r is not None:
+                return
+            self._err("SE214", "type-mismatch",
+                      f"{l0} does not define {CMP_DUNDER[type(op)]}() — ordering "
+                      f"comparisons need the dunder method", node)
         if isinstance(lt, TClass) or isinstance(rt, TClass):
-            if lt != rt or not isinstance(op, (ast.Eq, ast.NotEq)):
+            if lt != rt or not isinstance(op, (ast.Eq, ast.NotEq)) or self._contains_func(lt):
                 self._err("SE214", "type-mismatch",
                           f"class instances support only ==/!= against the same class "
                           f"({lt} vs {rt})", node)
@@ -1591,15 +2145,143 @@ class TypeChecker:
 
     # ---------- calls ----------
 
+    def _type_lambda(self, node: ast.Lambda, narrow: dict[str, Type],
+                     expect: Type | None) -> Type:
+        """Type a general lambda against an expected Callable type (Tier 2)."""
+        if not isinstance(expect, TFunc):
+            self._err("SE201", "unsupported-feature",
+                      "a lambda needs an expected Callable[...] type here — annotate the "
+                      "target or parameter it is assigned to", node)
+            raise AssertionError
+        la = node.args
+        if isinstance(expect.ret, TNone):
+            self._err("SE201", "unsupported-feature",
+                      "a lambda cannot have return type None — use a named function "
+                      "reference instead", node)
+        if la.posonlyargs or la.kwonlyargs or la.vararg or la.kwarg or la.defaults:
+            self._err("SE201", "unsupported-feature",
+                      "lambdas take plain positional parameters only", node)
+        if len(la.args) != len(expect.params):
+            self._err("SE214", "type-mismatch",
+                      f"lambda takes {len(la.args)} parameters but {expect} expects "
+                      f"{len(expect.params)}", node)
+        saved: dict[str, tuple | None] = {}
+        for a, pt in zip(la.args, expect.params):
+            if a.annotation is not None:
+                self._err("SE201", "unsupported-feature",
+                          "lambda parameters take no annotations (types come from the "
+                          "expected Callable)", node)
+            saved[a.arg] = self.env.get(a.arg)
+            self.env[a.arg] = (pt, "local")
+        inner_narrow = {k: v for k, v in narrow.items()
+                        if k.split(".")[0] not in saved}
+        bt = self._type_expr(node.body, inner_narrow, expect=expect.ret)
+        caps = self._lambda_captures(node)
+        for a in la.args:
+            if saved[a.arg] is None:
+                self.env.pop(a.arg, None)
+            else:
+                self.env[a.arg] = saved[a.arg]
+        if not self._assignable(bt, expect.ret):
+            self._err("SE214", "type-mismatch",
+                      f"lambda body returns {bt} but {expect} expects {expect.ret}",
+                      node.body)
+        for name, _t in caps:
+            self.captured_frozen.add(name)
+        self.lambda_caps[id(node)] = caps
+        return expect
+
+    def _lambda_captures(self, node: ast.Lambda) -> list[tuple[str, Type]]:
+        """Collect the enclosing locals a lambda reads (Copy-only, by value)."""
+        bound: set[str] = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Lambda):
+                bound |= {a.arg for a in n.args.args}
+            elif isinstance(n, (ast.ListComp, ast.DictComp)):
+                for gen in n.generators:
+                    for t in ast.walk(gen.target):
+                        if isinstance(t, ast.Name):
+                            bound.add(t.id)
+        caps: dict[str, Type] = {}
+        for n in ast.walk(node.body):
+            if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)):
+                continue
+            if n.id in bound or n.id in caps or n.id not in self.env:
+                continue
+            t = self.env[n.id][0]
+            if not t.is_copy():
+                self._err("SE003", "implicit-transfer",
+                          f"lambda captures non-Copy '{n.id}' ({t}) — captures are "
+                          f"by-value copies, so only Copy types can be captured", n)
+            if n.id in self.loop_assigned:
+                self._err("SE005", "move-while-borrowed",
+                          f"lambda captures '{n.id}', which is assigned inside a loop — "
+                          f"by-value capture would diverge from CPython's late binding; "
+                          f"pass it through a factory function instead", n)
+            caps[n.id] = t
+        return sorted(caps.items())
+
+    def _func_value_type(self, sig: FuncSig, node: ast.AST) -> Type:
+        """The Callable type of a module function used as a first-class value."""
+        if sig.is_template:
+            self._err("SE201", "unsupported-feature",
+                      f"generic function '{sig.name}' cannot be used as a value — "
+                      f"first-class functions must be concrete", node)
+        if sig.cls is not None:
+            self._err("SE201", "unsupported-feature",
+                      f"method '{sig.name}' cannot be used as a value", node)
+        if any(p.default is not None for p in sig.params):
+            self._err("SE201", "unsupported-feature",
+                      f"function '{sig.name}' has default parameters and cannot be used "
+                      f"as a value", node)
+        bad = [p.name for p in sig.params if not p.typ.is_copy()]
+        if bad or not (sig.ret.is_copy() or isinstance(sig.ret, TNone)):
+            self._err("SE201", "unsupported-feature",
+                      f"function '{sig.name}' cannot be used as a value — first-class "
+                      f"function signatures must use Copy types only", node)
+        return TFunc(tuple(p.typ for p in sig.params), sig.ret)
+
+    def _type_func_value_call(self, node: ast.Call, ft: TFunc,
+                              narrow: dict[str, Type]) -> Type:
+        """Type a call through a first-class function value."""
+        self._type_expr(node.func, narrow)
+        if node.keywords:
+            self._err("SE201", "unsupported-feature",
+                      "calls through function values take positional arguments only", node)
+        if len(node.args) != len(ft.params):
+            self._err("SE214", "type-mismatch",
+                      f"{ft} takes {len(ft.params)} arguments, got {len(node.args)}", node)
+        for a, pt in zip(node.args, ft.params):
+            at = self._type_expr(a, narrow, expect=pt)
+            if not self._assignable(at, pt):
+                self._err("SE214", "type-mismatch",
+                          f"argument expects {pt}, got {at}", a)
+        return ft.ret
+
     def _type_call(self, node: ast.Call, narrow: dict[str, Type], expect: Type | None) -> Type:
         is_sorted = isinstance(node.func, ast.Name) and node.func.id == "sorted"
-        if node.keywords and not is_sorted:
-            self._err("SE201", "unsupported-feature", "keyword arguments are not Tier 0", node)
+        if node.keywords and not is_sorted and not isinstance(node.func, ast.Attribute):
+            kw_ok = (isinstance(node.func, ast.Name)
+                     and node.func.id not in self.env
+                     and (self._resolve_callee(self.mod, node.func.id) is not None
+                          or self._resolve_class(self.mod, node.func.id) is not None))
+            if not kw_ok:
+                self._err("SE201", "unsupported-feature",
+                          "keyword arguments are only supported on user-defined "
+                          "functions and methods", node)
         if isinstance(node.func, ast.Attribute):
             return self._type_method_call(node, narrow)
         if not isinstance(node.func, ast.Name):
+            ft = self._type_expr(node.func, narrow)
+            if isinstance(ft, TFunc):
+                return self._type_func_value_call(node, ft, narrow)
             self._err("SE201", "unsupported-feature", "only named functions can be called", node)
         name = node.func.id
+        vt = narrow.get(name) if isinstance(narrow.get(name), TFunc) else \
+            (self.env[name][0] if name in self.env and
+             isinstance(self.env[name][0], TFunc) else None)
+        if vt is not None:
+            return self._type_func_value_call(node, vt, narrow)
         if name == "move":
             return self._type_move(node, narrow)
         if name == "share":
@@ -1619,21 +2301,59 @@ class TypeChecker:
             if not isinstance(t, TWeak):
                 self._err("SE214", "type-mismatch", f"upgrade() takes a Weak value, got {t}", node)
             return TOptional(TShared(t.inner))
+        if name == "pyval_kind":
+            if len(node.args) != 1:
+                self._err("SE214", "type-mismatch", "pyval_kind() takes exactly one argument", node)
+            t = self._type_expr(node.args[0], narrow, expect=TPyVal())
+            if not isinstance(t, TPyVal):
+                self._err("SE214", "type-mismatch", f"pyval_kind() takes a PyVal, got {t}", node)
+            return STR
         if name == "open":
             return self._type_open(node, narrow)
-        if name in KNOWN_EXC:
+        if name in KNOWN_EXC or (name in self.user_exc and self._exc_ok(name)):
             self._err("SE201", "unsupported-feature",
                       f"exception values can only be created in a raise statement", node)
         cls = self._resolve_class(self.mod, name)
         if cls is not None:
             return self._type_ctor(node, cls, narrow)
-        if name in ("eval", "exec", "globals", "locals", "compile", "id",
-                    "map", "filter", "any", "all", "type", "isinstance"):
-            self._err("SE201", "unsupported-feature", f"'{name}' is not a Tier-0/1 builtin", node)
+        if name in self.mod.rtlib_imports:
+            return self._type_rtlib_call(node, self.mod.rtlib_imports[name], narrow)
         sig = self._resolve_callee(self.mod, name)
         if sig is not None:
             return self._type_user_call(node, sig, narrow)
+        if name in ("eval", "exec", "globals", "locals", "compile", "id",
+                    "map", "filter", "any", "all", "type", "isinstance"):
+            self._err("SE201", "unsupported-feature", f"'{name}' is not a Tier-0/1 builtin", node)
         return self._type_builtin_call(node, name, narrow)
+
+    def _type_rtlib_call(self, node: ast.Call, rf, narrow: dict[str, Type]) -> Type:
+        """Type a call to a runtime-backed library function (rtlib.py)."""
+        if len(node.args) != len(rf.params):
+            self._err("SE214", "type-mismatch",
+                      f"{rf.name}() takes {len(rf.params)} argument(s), "
+                      f"got {len(node.args)}", node)
+        for a, p in zip(node.args, rf.params):
+            if p == "s":
+                t = self._type_expr(a, narrow, expect=STR)
+                if not isinstance(t, TStr):
+                    self._err("SE214", "type-mismatch",
+                              f"{rf.name}() expects a str, got {t}", a)
+                continue
+            if p == "y":
+                t = self._type_expr(a, narrow, expect=TBytes())
+                if not isinstance(t, TBytes):
+                    self._err("SE214", "type-mismatch",
+                              f"{rf.name}() expects bytes, got {t}", a)
+                continue
+            t = self._type_expr(a, narrow, expect=FLOAT if p == "f" else INT)
+            if p == "f" and (isinstance(t, TBool) or not isinstance(t, NUMERIC)):
+                self._err("SE214", "type-mismatch",
+                          f"{rf.name}() expects a number, got {t}", a)
+            if p == "i" and (isinstance(t, TBool) or not isinstance(t, TInt)):
+                self._err("SE214", "type-mismatch",
+                          f"{rf.name}() expects an int, got {t}", a)
+        return {"f": FLOAT, "i": INT, "b": BOOL, "n": NONE,
+                "s": STR, "S": TList(STR), "y": TBytes()}[rf.ret]
 
     def _type_sorted(self, node: ast.Call, ts: list[Type], narrow: dict[str, Type]) -> Type:
         """Type sorted(xs) and sorted(xs, key=lambda v: ...) (Tier 2)."""
@@ -1719,6 +2439,9 @@ class TypeChecker:
         elif isinstance(iter_t, TStr):
             kind = "str"
             elems = (STR,)
+        elif isinstance(iter_t, (TBytes, TByteArray)):
+            kind = "bytes" if isinstance(iter_t, TBytes) else "bytearray"
+            elems = (INT,)
         elif isinstance(iter_t, TIter):
             kind = iter_t.kind
             elems = iter_t.elem
@@ -1800,15 +2523,37 @@ class TypeChecker:
             t = self._type_expr(a, narrow)
             if not isinstance(t, TStr):
                 self._err("SE214", "type-mismatch", f"open() arguments must be str, got {t}", a)
+        binary = False
         if len(node.args) == 2 and isinstance(node.args[1], ast.Constant):
-            if node.args[1].value not in ("r", "w", "a"):
+            mode = node.args[1].value
+            if mode not in ("r", "w", "a", "rb", "wb", "ab"):
                 self._err("SE201", "unsupported-feature",
-                          f"open() mode {node.args[1].value!r} is not Tier 1 — use 'r', 'w' "
-                          f"or 'a'", node.args[1])
-        return TFile()
+                          f"open() mode {mode!r} is not supported — use 'r', 'w', 'a', "
+                          f"'rb', 'wb' or 'ab'", node.args[1])
+            binary = isinstance(mode, str) and mode.endswith("b")
+        elif len(node.args) == 2:
+            self._err("SE201", "unsupported-feature",
+                      "open() mode must be a string literal (the file's text/binary type "
+                      "is static)", node.args[1])
+        return TFile(binary=binary)
 
     def _type_ctor(self, node: ast.Call, cls: ClassInfo, narrow: dict[str, Type]) -> Type:
         """Type a dataclass constructor call, inferring generic arguments."""
+        if node.keywords:
+            params = [Param(f, CONV_COPY, cls.fields[f], cls.field_defaults.get(f))
+                      for f in cls.field_order]
+            self._apply_keywords(node, params, f"{cls.name}()")
+        if len(node.args) < len(cls.field_order):
+            for fname in cls.field_order[len(node.args):]:
+                d = cls.field_defaults.get(fname)
+                if d is None:
+                    break
+                if isinstance(d, ast.Constant):
+                    c: ast.expr = ast.Constant(value=d.value)
+                else:
+                    c = copy.deepcopy(d)
+                ast.copy_location(c, node)
+                node.args.append(c)
         if len(node.args) != len(cls.field_order):
             self._err("SE214", "type-mismatch",
                       f"{cls.name}() takes {len(cls.field_order)} arguments "
@@ -1969,6 +2714,7 @@ class TypeChecker:
                 narrow.pop(k, None)
 
     def _type_user_call(self, node: ast.Call, sig: FuncSig, narrow: dict[str, Type]) -> Type:
+        self._apply_keywords(node, sig.params, f"'{sig.name}'")
         required = len([p for p in sig.params if p.default is None])
         if not (required <= len(node.args) <= len(sig.params)):
             want = str(len(sig.params)) if required == len(sig.params) \
@@ -1977,15 +2723,20 @@ class TypeChecker:
                       f"'{sig.name}' takes {want} arguments, got {len(node.args)}", node)
         if sig.is_template:
             sub: dict = {}
-            arg_ts = []
-            for arg, p in zip(node.args, sig.params):
+            arg_ts: list = [None] * len(node.args)
+            order = sorted(range(len(node.args)),
+                           key=lambda i: isinstance(node.args[i], ast.Lambda))
+            for i in order:
+                arg = node.args[i]
+                p = sig.params[i]
                 if has_tvar(p.typ) and self._is_empty_literal(arg):
                     self._err("SE204", "unknown-element-type",
                               f"empty literal cannot infer type variable for parameter "
                               f"'{p.name}' — bind it to an annotated variable first", arg)
+                pt = subst_type(p.typ, sub)
                 at = self._type_expr(arg, narrow,
-                                     expect=None if has_tvar(p.typ) else p.typ)
-                arg_ts.append(at)
+                                     expect=None if has_tvar(pt) else pt)
+                arg_ts[i] = at
                 if not unify(p.typ, at, sub):
                     self._err("SE214", "type-mismatch",
                               f"argument '{p.name}' expects {subst_type(p.typ, sub)}, got {at}",
@@ -2010,7 +2761,8 @@ class TypeChecker:
         for i, (arg, p) in enumerate(zip(node.args, sig.params)):
             at = pre_typed[i] if pre_typed is not None else \
                 self._type_expr(arg, narrow, expect=p.typ)
-            if not self._assignable(at, p.typ):
+            if not self._assignable(at, p.typ) and \
+                    not (isinstance(p.typ, TFloat) and isinstance(at, TInt)):
                 self._err("SE214", "type-mismatch",
                           f"argument '{p.name}' expects {p.typ}, got {at}", arg)
             if p.conv == CONV_OWNED and not p.typ.is_copy():
@@ -2043,14 +2795,28 @@ class TypeChecker:
                 self._err("SE214", "type-mismatch", f"{name}() takes {n} argument(s)", node)
 
         if name == "print":
-            for t in ts:
-                if isinstance(t, (TIter, TIterObj, TFile)):
+            for a, t in zip(args, ts):
+                if isinstance(t, (TIter, TIterObj, TFile)) or self._contains_func(t):
                     self._err("SE214", "type-mismatch", f"cannot print a {t}", node)
+                t0 = t.inner if isinstance(t, TShared) else t
+                if isinstance(t0, TClass):
+                    info0 = self.classes.get((t0.module, t0.name))
+                    if info0 is not None and "__str__" in info0.methods:
+                        recv_copy = copy.copy(a)
+                        self.expr_types[id(recv_copy)] = t
+                        r = self._op_method_call(a, recv_copy, "__str__", [], narrow,
+                                                 require=STR)
+                        if r is not None:
+                            self.expr_types[id(a)] = STR
             return NONE
         if name == "len":
             arity(1)
             t0 = ts[0].inner if isinstance(ts[0], TShared) else ts[0]
-            if not isinstance(t0, (TList, TDict, TStr)):
+            if isinstance(t0, TClass):
+                r = self._op_method_call(node, args[0], "__len__", [], narrow, require=INT)
+                if r is not None:
+                    return INT
+            if not isinstance(t0, (TList, TDict, TStr, TBytes, TByteArray, TPyVal)):
                 self._err("SE214", "type-mismatch", f"len() is not supported on {ts[0]}", node)
             return INT
         if name == "range":
@@ -2098,20 +2864,25 @@ class TypeChecker:
             return ts[0]
         if name == "str":
             arity(1)
+            t0 = ts[0].inner if isinstance(ts[0], TShared) else ts[0]
+            if isinstance(t0, TClass):
+                r = self._op_method_call(node, args[0], "__str__", [], narrow, require=STR)
+                if r is not None:
+                    return STR
             return STR
         if name == "int":
             arity(1)
-            if not isinstance(ts[0], (TInt, TFloat, TBool, TStr)):
+            if not isinstance(ts[0], (TInt, TFloat, TBool, TStr, TPyVal)):
                 self._err("SE214", "type-mismatch", f"int() cannot convert {ts[0]}", node)
             return INT
         if name == "float":
             arity(1)
-            if not isinstance(ts[0], (TInt, TFloat, TStr)):
+            if not isinstance(ts[0], (TInt, TFloat, TStr, TPyVal)):
                 self._err("SE214", "type-mismatch", f"float() cannot convert {ts[0]}", node)
             return FLOAT
         if name == "bool":
             arity(1)
-            if not isinstance(ts[0], (TInt, TFloat, TBool, TStr)):
+            if not isinstance(ts[0], (TInt, TFloat, TBool, TStr, TPyVal)):
                 self._err("SE214", "type-mismatch", f"bool() cannot convert {ts[0]}", node)
             return BOOL
         if name == "round":
@@ -2149,6 +2920,10 @@ class TypeChecker:
             return TIterObj(ts[0].elem)
         if name == "next":
             arity(1)
+            if isinstance(ts[0], TClass):
+                r = self._op_method_call(node, args[0], "__next__", [], narrow)
+                if r is not None:
+                    return r
             if not (isinstance(args[0], ast.Name)
                     and self.env.get(args[0].id, (None, None))[1] == "iterlocal"):
                 self._err("SE201", "unsupported-feature",
@@ -2157,6 +2932,19 @@ class TypeChecker:
             return ts[0].elem
         if name == "sorted":
             return self._type_sorted(node, ts, narrow)
+        if name in ("bytes", "bytearray"):
+            ret: Type = TBytes() if name == "bytes" else TByteArray()
+            if len(args) == 0:
+                return ret
+            if len(args) == 1:
+                t0 = ts[0]
+                if isinstance(t0, TInt) or isinstance(t0, (TBytes, TByteArray)) \
+                        or (isinstance(t0, TList) and isinstance(t0.elem, TInt)) \
+                        or (name == "bytes" and isinstance(t0, TPyVal)):
+                    return ret
+            self._err("SE214", "type-mismatch",
+                      f"{name}() takes no argument, an int count, a list[int], bytes, "
+                      f"or bytearray", node)
         if name == "input":
             if len(args) > 1:
                 self._err("SE214", "type-mismatch", "input() takes at most one argument", node)
@@ -2168,11 +2956,66 @@ class TypeChecker:
         assert isinstance(node.func, ast.Attribute)
         recv = node.func.value
         method = node.func.attr
+        if isinstance(recv, ast.Name) and recv.id not in self.env:
+            scls = self._resolve_class(self.mod, recv.id)
+            if scls is not None and method in scls.statics:
+                sig = self.sigs[(scls.module, scls.statics[method])]
+                synth = ast.Call(func=ast.Name(id=scls.statics[method], ctx=ast.Load()),
+                                 args=list(node.args), keywords=list(node.keywords))
+                ast.copy_location(synth, node)
+                ast.copy_location(synth.func, node)
+                ast.fix_missing_locations(synth)
+                t = self._type_user_call(synth, sig, narrow)
+                self.expr_types[id(synth)] = t
+                self.op_calls[id(node)] = synth
+                return t
+        if method in ("__enter__", "__iter__"):
+            self._err("SE201", "unsupported-feature",
+                      f"{method} cannot be called directly — use a "
+                      f"{'with' if method == '__enter__' else 'for'} statement", node)
         if isinstance(recv, ast.Name) and recv.id == "sys" and self.mod.imports_sys:
             return self._type_sys_call(node, method, narrow)
+        if isinstance(recv, ast.Name) and recv.id == "bytes" and recv.id not in self.env:
+            if method != "fromhex" or len(node.args) != 1 \
+                    or not isinstance(self._type_expr(node.args[0], narrow), TStr):
+                self._err("SE214", "type-mismatch",
+                          "bytes.fromhex(s) is the only bytes classmethod", node)
+            self.expr_types[id(recv)] = TBytes()
+            return TBytes()
         rt = self._type_expr(recv, narrow)
+        inner0 = rt.inner if isinstance(rt, TShared) else rt
+        if isinstance(inner0, TClass):
+            info = self.classes.get((inner0.module, inner0.name))
+            if info is not None and method in info.fields:
+                ft = self._field_type(inner0, method, node)
+                if isinstance(ft, TFunc):
+                    return self._type_func_value_call(node, ft, narrow)
+        if node.keywords:
+            minfo = self.classes.get((inner0.module, inner0.name)) \
+                if isinstance(inner0, TClass) else None
+            msig = minfo.methods.get(method) if minfo is not None else None
+            if msig is not None:
+                self._apply_keywords(node, msig.params[1:], f".{method}()")
+            if node.keywords:
+                self._err("SE201", "unsupported-feature",
+                          "keyword arguments are only supported on user-defined "
+                          "functions and methods", node)
         args = node.args
-        ts = [self._type_expr(a, narrow) for a in args]
+        expects: list = [None] * len(args)
+        inner_pre = rt.inner if isinstance(rt, TShared) else rt
+        if isinstance(inner_pre, TClass):
+            minfo2 = self.classes.get((inner_pre.module, inner_pre.name))
+            msig2 = minfo2.methods.get(method) if minfo2 is not None else None
+            if msig2 is not None:
+                sub0 = dict(zip(minfo2.typevars, inner_pre.args))
+                pts = [subst_type(p.typ, sub0) for p in msig2.params[1:]]
+                for i in range(min(len(args), len(pts))):
+                    if not has_tvar(pts[i]):
+                        expects[i] = pts[i]
+        if isinstance(inner_pre, TList) and method == "append" and len(args) == 1 \
+                and not has_tvar(inner_pre.elem):
+            expects[0] = inner_pre.elem
+        ts = [self._type_expr(a, narrow, expect=e) for a, e in zip(args, expects)]
         span_node = node
 
         def arity(n: int) -> None:
@@ -2187,14 +3030,88 @@ class TypeChecker:
         if isinstance(inner, TClass):
             return self._type_class_method(node, inner, method, args, ts, narrow)
         if isinstance(inner, TFile):
-            return self._type_file_method(node, method, args, ts)
+            return self._type_file_method(node, inner, method, args, ts)
         if isinstance(inner, TList):
             return self._type_list_method(node, inner, method, args, ts, narrow)
         if isinstance(inner, TDict):
             return self._type_dict_method(node, inner, method, args, ts, narrow)
         if isinstance(inner, TStr):
             return self._type_str_method(node, method, args, ts)
+        if isinstance(inner, TBytes):
+            return self._type_bytes_method(node, method, args, ts)
+        if isinstance(inner, TByteArray):
+            return self._type_bytearray_method(node, method, args, ts)
         self._err("SE214", "type-mismatch", f"{rt} has no method '{method}'", node)
+        raise AssertionError
+
+    def _type_bytes_method(self, node: ast.Call, method: str,
+                           args: list[ast.expr], ts: list[Type]) -> Type:
+        """Type a method call on an immutable bytes value."""
+        def arity(n: int, want: tuple = (TBytes,)) -> None:
+            if len(args) != n or not all(isinstance(t, want) for t in ts):
+                names = "/".join(w().__str__() for w in want) if n else ""
+                self._err("SE214", "type-mismatch",
+                          f"bytes.{method}() takes {n} {names} argument(s)", node)
+        if method in ("find", "count"):
+            arity(1)
+            return INT
+        if method in ("startswith", "endswith"):
+            arity(1)
+            return BOOL
+        if method == "replace":
+            arity(2)
+            return TBytes()
+        if method == "split":
+            if not args:
+                return TList(TBytes())
+            arity(1)
+            return TList(TBytes())
+        if method == "join":
+            if len(args) != 1 or ts[0] != TList(TBytes()):
+                self._err("SE214", "type-mismatch",
+                          "bytes.join() takes one list[bytes] argument", node)
+            return TBytes()
+        if method in ("strip", "lstrip", "rstrip", "upper", "lower"):
+            arity(0)
+            return TBytes()
+        if method == "hex":
+            arity(0)
+            return STR
+        if method == "decode":
+            if args and not (len(args) == 1 and isinstance(args[0], ast.Constant)
+                             and args[0].value in ("utf-8", "utf8")):
+                self._err("SE201", "unsupported-feature",
+                          "bytes.decode() supports only the 'utf-8' encoding", node)
+            return STR
+        self._err("SE214", "type-mismatch", f"bytes has no method '{method}'", node)
+        raise AssertionError
+
+    def _type_bytearray_method(self, node: ast.Call, method: str,
+                               args: list[ast.expr], ts: list[Type]) -> Type:
+        """Type a method call on a mutable bytearray."""
+        if method == "append":
+            if len(args) != 1 or not isinstance(ts[0], TInt):
+                self._err("SE214", "type-mismatch",
+                          "bytearray.append() takes one int argument", node)
+            self._mut_receiver(node)
+            return NONE
+        if method == "extend":
+            if len(args) != 1 or not isinstance(ts[0], (TBytes, TByteArray)):
+                self._err("SE214", "type-mismatch",
+                          "bytearray.extend() takes a bytes or bytearray argument", node)
+            self._mut_receiver(node)
+            return NONE
+        if method == "hex":
+            if args:
+                self._err("SE214", "type-mismatch", "bytearray.hex() takes no arguments", node)
+            return STR
+        if method == "decode":
+            if args and not (len(args) == 1 and isinstance(args[0], ast.Constant)
+                             and args[0].value in ("utf-8", "utf8")):
+                self._err("SE201", "unsupported-feature",
+                          "bytearray.decode() supports only the 'utf-8' encoding", node)
+            return STR
+        self._err("SE214", "type-mismatch", f"bytearray has no method '{method}'", node)
         raise AssertionError
 
     def _type_sys_call(self, node: ast.Call, method: str, narrow: dict[str, Type]) -> Type:
@@ -2230,7 +3147,8 @@ class TypeChecker:
                       f".{method}() takes {want} argument(s), got {len(args)}", node)
         method_tvars = {t.name for p in params for t in self._walk(p.typ) if isinstance(t, TVar)}
         for arg, at, p in zip(args, ts, params[1:]):
-            if not unify(p.typ, at, sub) and not self._assignable(at, subst_type(p.typ, sub)):
+            if not unify(p.typ, at, sub) and not self._assignable(at, subst_type(p.typ, sub)) \
+                    and not (isinstance(subst_type(p.typ, sub), TFloat) and isinstance(at, TInt)):
                 self._err("SE214", "type-mismatch",
                           f"argument '{p.name}' expects {subst_type(p.typ, sub)}, got {at}", arg)
         missing = [tv for tv in sorted(method_tvars) if tv not in sub]
@@ -2281,15 +3199,20 @@ class TypeChecker:
                     self._check_narrow_invalidation_by_mut(arg, narrow)
         return subst_type(sig.ret, sub) if tmpl.is_template else sig.ret
 
-    def _type_file_method(self, node: ast.Call, method: str,
+    def _type_file_method(self, node: ast.Call, ftype: TFile, method: str,
                           args: list[ast.expr], ts: list[Type]) -> Type:
         if method == "read":
             if args:
                 self._err("SE214", "type-mismatch", ".read() takes no arguments in Tier 1", node)
             self._mut_receiver(node)
-            return STR
+            return TBytes() if ftype.binary else STR
         if method == "write":
-            if len(args) != 1 or not isinstance(ts[0], TStr):
+            if ftype.binary:
+                if len(args) != 1 or not isinstance(ts[0], (TBytes, TByteArray)):
+                    self._err("SE214", "type-mismatch",
+                              ".write() on a binary file takes one bytes/bytearray argument",
+                              node)
+            elif len(args) != 1 or not isinstance(ts[0], TStr):
                 self._err("SE214", "type-mismatch", ".write() takes one str argument", node)
             self._mut_receiver(node)
             return INT
@@ -2419,6 +3342,12 @@ class TypeChecker:
                 if not isinstance(t, TStr):
                     self._err("SE214", "type-mismatch", f".{method}() arguments must be str", node)
 
+        if method == "encode":
+            if args and not (len(args) == 1 and isinstance(args[0], ast.Constant)
+                             and args[0].value in ("utf-8", "utf8")):
+                self._err("SE201", "unsupported-feature",
+                          "str.encode() supports only the 'utf-8' encoding", node)
+            return TBytes()
         if method == "split":
             if len(args) == 0:
                 return TList(STR)

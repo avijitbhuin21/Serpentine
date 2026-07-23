@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-http-server"
+version = "0.1.0"
+description = "Serpentine minimal HTTP/1.1 server: blocking accept/respond loop with request parsing (pure Serpentine over serp-socket, dual-runs under CPython)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "http", "server"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["serpentine-shim", "serp-socket"]
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_http_server"]

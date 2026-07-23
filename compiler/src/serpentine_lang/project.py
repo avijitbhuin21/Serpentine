@@ -1,7 +1,7 @@
 """Project manifests: serp.toml discovery, parsing, and import-root resolution.
 
 A Serpentine project is marked by a `serp.toml` next to (or above) the entry
-file (docs/packages.md). The manifest declares the project name/version, its
+file (docs/guides/packages.md). The manifest declares the project name/version, its
 source-distribution dependencies, and optional extra import roots. Import
 resolution order (packages.md section 2): entry-file directory tree, declared
 roots, then dependency-gated venv site-packages; anything else is refused at
@@ -71,6 +71,18 @@ def normalize_dist_name(name: str) -> str:
     return name.lower().replace("-", "_").replace(".", "_")
 
 
+def lock_dist_names(project_dir: Path) -> list[str]:
+    """Read the distribution names pinned in serp.lock (direct + transitive)."""
+    lock_path = project_dir / "serp.lock"
+    if not lock_path.is_file():
+        return []
+    try:
+        data = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return [str(p.get("name", "")) for p in data.get("package", []) if p.get("name")]
+
+
 def venv_site_packages(project_dir: Path) -> Path | None:
     """Locate the project venv's site-packages (.venv next to serp.toml), if any."""
     venv = project_dir / ".venv"
@@ -110,6 +122,8 @@ class ImportContext:
         if self.manifest and self.site_packages:
             top = mod_name.split(".")[0]
             dep_roots = {normalize_dist_name(d) for d in self.manifest.dependencies}
+            dep_roots |= {normalize_dist_name(d)
+                          for d in lock_dist_names(self.manifest.project_dir)}
             if top in dep_roots:
                 cand = self.site_packages / rel
                 if cand.is_file():

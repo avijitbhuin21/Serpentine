@@ -1,4 +1,4 @@
-"""Tier-0 type model and annotation parsing (SPEC.md section 2)."""
+"""Tier-0 type model and annotation parsing (docs/spec.md section 2)."""
 
 import ast
 from dataclasses import dataclass
@@ -48,6 +48,36 @@ class TStr(Type):
 
     def __str__(self) -> str:
         return "str"
+
+
+@dataclass(frozen=True)
+class TBytes(Type):
+    """Immutable byte string (O(1)-copy handle, mirrors str)."""
+
+    def is_copy(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return "bytes"
+
+
+@dataclass(frozen=True)
+class TByteArray(Type):
+    """Mutable byte buffer (non-Copy, mirrors list)."""
+
+    def __str__(self) -> str:
+        return "bytearray"
+
+
+@dataclass(frozen=True)
+class TPyVal(Type):
+    """Boxed dynamic Python value (immutable, refcounted, Copy handle)."""
+
+    def is_copy(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return "PyVal"
 
 
 @dataclass(frozen=True)
@@ -160,8 +190,24 @@ class TExc(Type):
 
 
 @dataclass(frozen=True)
+class TFunc(Type):
+    """A first-class function value (Callable[[...], R]); O(1)-copy handle."""
+
+    params: tuple[Type, ...]
+    ret: Type
+
+    def is_copy(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return f"Callable[[{', '.join(str(p) for p in self.params)}], {self.ret}]"
+
+
+@dataclass(frozen=True)
 class TFile(Type):
     """An open file object; deterministic drop closes it."""
+
+    binary: bool = False
 
     def __str__(self) -> str:
         return "file"
@@ -179,7 +225,8 @@ CONV_MUT = "mut"
 CONV_COPY = "copy"
 
 WRAPPERS = {"Owned": CONV_OWNED, "Ref": CONV_REF, "Mut": CONV_MUT}
-SHIM_NAMES = {"Owned", "Ref", "Mut", "Shared", "Weak", "move", "native"}
+SHIM_NAMES = {"Owned", "Ref", "Mut", "Shared", "Weak", "move", "native",
+              "PyVal", "pyval_kind"}
 
 
 @dataclass
@@ -220,7 +267,8 @@ def _parse_type(node: ast.expr, rep: Reporter, file: str, names: dict[str, Type]
     """Parse a type expression with no ownership wrapper permitted anywhere inside."""
     span = Span(file, node.lineno, node.col_offset)
     if isinstance(node, ast.Name):
-        simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR}
+        simple = {"int": INT, "float": FLOAT, "bool": BOOL, "str": STR,
+                  "bytes": TBytes(), "bytearray": TByteArray(), "PyVal": TPyVal()}
         if node.id in simple:
             return simple[node.id]
         if node.id in names:
@@ -266,12 +314,32 @@ def _parse_type(node: ast.expr, rep: Reporter, file: str, names: dict[str, Type]
                 rep.fatal("SE201", "unsupported-feature", "dict takes exactly two type arguments", span)
             k = _parse_type(node.slice.elts[0], rep, file, names)
             v = _parse_type(node.slice.elts[1], rep, file, names)
-            if not k.is_copy():
+            if not k.is_copy() or isinstance(k, (TFunc, TPyVal)):
                 rep.fatal("SE201", "unsupported-feature", "dict keys must be Copy types", span)
             return TDict(k, v)
         if base == "tuple":
             elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             return TTuple(tuple(_parse_type(e, rep, file, names) for e in elts))
+        if base == "Callable":
+            sl = node.slice
+            if not (isinstance(sl, ast.Tuple) and len(sl.elts) == 2
+                    and isinstance(sl.elts[0], ast.List)):
+                rep.fatal("SE201", "unsupported-feature",
+                          "Callable takes the form Callable[[P1, ...], R]", span)
+            params = tuple(_parse_type(e, rep, file, names) for e in sl.elts[0].elts)
+            ret = _parse_type(sl.elts[1], rep, file, names)
+
+            def _has_tvar(t: Type) -> bool:
+                """Whether a type mentions a generic type variable anywhere."""
+                return any(isinstance(x, TVar) for x in walk_types(t))
+
+            bad = [str(p) for p in (*params, ret)
+                   if not p.is_copy() and not _has_tvar(p)]
+            if bad:
+                rep.fatal("SE201", "unsupported-feature",
+                          f"Callable signatures must use Copy types (function values are "
+                          f"O(1)-copy handles); {', '.join(bad)} is not Copy", span)
+            return TFunc(params, ret)
     rep.fatal("SE201", "unsupported-feature", "annotation is not a Tier-0/1 type", span)
     raise AssertionError("unreachable")
 
@@ -292,6 +360,8 @@ def subst_type(t: Type, sub: dict) -> Type:
         return TShared(subst_type(t.inner, sub))
     if isinstance(t, TWeak):
         return TWeak(subst_type(t.inner, sub))
+    if isinstance(t, TFunc):
+        return TFunc(tuple(subst_type(p, sub) for p in t.params), subst_type(t.ret, sub))
     if isinstance(t, TClass) and t.args:
         return TClass(t.module, t.name, tuple(subst_type(a, sub) for a in t.args))
     return t
@@ -309,6 +379,8 @@ def has_tvar(t: Type) -> bool:
         return any(has_tvar(i) for i in t.items)
     if isinstance(t, (TOptional, TShared, TWeak)):
         return has_tvar(t.inner)
+    if isinstance(t, TFunc):
+        return any(has_tvar(p) for p in t.params) or has_tvar(t.ret)
     if isinstance(t, TClass):
         return any(has_tvar(a) for a in t.args)
     return False
@@ -338,6 +410,10 @@ def unify(param: Type, arg: Type, sub: dict) -> bool:
         return unify(param.inner, arg.inner, sub)
     if isinstance(param, TWeak) and isinstance(arg, TWeak):
         return unify(param.inner, arg.inner, sub)
+    if isinstance(param, TFunc) and isinstance(arg, TFunc):
+        return len(param.params) == len(arg.params) and \
+            all(unify(p, a, sub) for p, a in zip(param.params, arg.params)) and \
+            unify(param.ret, arg.ret, sub)
     if isinstance(param, TClass) and isinstance(arg, TClass):
         return param.module == arg.module and param.name == arg.name and \
             len(param.args) == len(arg.args) and \
@@ -358,6 +434,10 @@ def walk_types(t: Type):
             yield from walk_types(i)
     elif isinstance(t, (TOptional, TShared, TWeak)):
         yield from walk_types(t.inner)
+    elif isinstance(t, TFunc):
+        for p in t.params:
+            yield from walk_types(p)
+        yield from walk_types(t.ret)
     elif isinstance(t, TClass):
         for a in t.args:
             yield from walk_types(a)

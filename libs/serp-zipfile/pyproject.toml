@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-zipfile"
+version = "0.2.0"
+description = "Serpentine ZIP archives: read/write stored + DEFLATE entries with CRC verification (pure Serpentine over serp-zlib, dual-runs under CPython)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "zipfile", "zip", "archive"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["serpentine-shim", "serp-zlib"]
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_zipfile"]

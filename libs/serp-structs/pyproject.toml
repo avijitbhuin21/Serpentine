@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-structs"
+version = "0.1.0"
+description = "Serpentine data-structure helpers: min-heap, bisect, generic deque and counter tallies in the Serpentine subset"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "heapq", "bisect", "deque", "counter"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["serpentine-shim"]
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_structs"]

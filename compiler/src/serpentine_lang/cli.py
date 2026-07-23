@@ -214,6 +214,8 @@ def main() -> int:
     register_manage(sub)
     from .pkg import register as register_pkg
     register_pkg(sub)
+    from .testcmd import register as register_test
+    register_test(sub)
 
     args = parser.parse_args()
     return args.func(args)

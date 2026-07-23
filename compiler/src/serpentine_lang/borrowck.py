@@ -1,7 +1,7 @@
 """Ownership analyses over SIR: initialized-places dataflow + lexical loan checks.
 
 Initialized-places is a forward may/must dataflow with a worklist (fixed point),
-so moves inside loop bodies are caught at the loop head (SPEC.md J8). Places are
+so moves inside loop bodies are caught at the loop head (docs/spec.md J8). Places are
 field-sensitive to one level ("x" and "x.f"): moving x.f leaves x.g usable but
 the whole x unusable until x.f is re-assigned. Loans are lexical for-loop
 regions recorded on each instruction during lowering.

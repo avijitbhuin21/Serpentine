@@ -16,6 +16,7 @@ dist/
 tests/accept/tmp_serp_*.txt
 tests/accept/*.exe
 tests/accept/*.rs
+tmp_serp_*
 
 # native build artifacts
 *.pdb

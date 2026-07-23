@@ -1,0 +1,9 @@
+[project]
+name = "serp-http-server"
+version = "0.1.0"
+
+[build]
+roots = ["src", "../serp-socket/src"]
+
+[dependencies]
+serp-socket = "0.1.0"

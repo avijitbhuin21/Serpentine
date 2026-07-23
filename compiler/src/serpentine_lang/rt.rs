@@ -6,7 +6,7 @@
 //   SStr    = opaque 24-byte blob, align 8  ([3 x i64] on the LLVM side)
 //   RtList  = { data: *mut u8, len: i64, cap: i64 }   (element size supplied per call)
 //   SErrC   = { kind: SStr, msg: SStr }
-//   status  = i8 (0 ok, 1 error pending — pick the error up with rt_err_take)
+//   status  = i8 (0 ok, 1 error pending â€” pick the error up with rt_err_take)
 // Ownership: values cross the boundary as raw blobs; the CALLER owns everything
 // it passes by pointer unless a function is documented as consuming it. All
 // type-directed clone/drop logic lives in generated LLVM code.
@@ -521,4 +521,1145 @@ pub unsafe extern "C" fn rt_f64_floormod(a: f64, b: f64, is_mod: i8, out: *mut f
         Ok(v) => { out.write(v); 0 }
         Err(e) => { set_pending(e); 1 }
     }
+}
+
+// ---------- rtlib: serp_math / serp_random / serp_time ----------
+
+unsafe fn st_f(r: SRes<f64>, out: *mut f64) -> i8 {
+    match r { Ok(v) => { out.write(v); 0 } Err(e) => { set_pending(e); 1 } }
+}
+
+unsafe fn st_i(r: SRes<i64>, out: *mut i64) -> i8 {
+    match r { Ok(v) => { out.write(v); 0 } Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_sqrt(x: f64, out: *mut f64) -> i8 { st_f(serp_math_sqrt(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_sin(x: f64) -> f64 { serp_math_sin(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_cos(x: f64) -> f64 { serp_math_cos(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_tan(x: f64) -> f64 { serp_math_tan(x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_log(x: f64, out: *mut f64) -> i8 { st_f(serp_math_log(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_exp(x: f64, out: *mut f64) -> i8 { st_f(serp_math_exp(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_pow(x: f64, y: f64, out: *mut f64) -> i8 { st_f(serp_math_pow(x, y), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_floor(x: f64, out: *mut i64) -> i8 { st_i(serp_math_floor(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_ceil(x: f64, out: *mut i64) -> i8 { st_i(serp_math_ceil(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_isnan(x: f64) -> i8 { serp_math_isnan(x) as i8 }
+
+#[no_mangle]
+pub extern "C" fn rt_math_isinf(x: f64) -> i8 { serp_math_isinf(x) as i8 }
+
+#[no_mangle]
+pub extern "C" fn rt_math_isfinite(x: f64) -> i8 { serp_math_isfinite(x) as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_acos(x: f64, out: *mut f64) -> i8 { st_f(serp_math_acos(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_asin(x: f64, out: *mut f64) -> i8 { st_f(serp_math_asin(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_atan(x: f64) -> f64 { serp_math_atan(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_atan2(y: f64, x: f64) -> f64 { serp_math_atan2(y, x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_acosh(x: f64, out: *mut f64) -> i8 { st_f(serp_math_acosh(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_asinh(x: f64) -> f64 { serp_math_asinh(x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_atanh(x: f64, out: *mut f64) -> i8 { st_f(serp_math_atanh(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_cosh(x: f64, out: *mut f64) -> i8 { st_f(serp_math_cosh(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_sinh(x: f64, out: *mut f64) -> i8 { st_f(serp_math_sinh(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_tanh(x: f64) -> f64 { serp_math_tanh(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_cbrt(x: f64) -> f64 { serp_math_cbrt(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_degrees(x: f64) -> f64 { serp_math_degrees(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_radians(x: f64) -> f64 { serp_math_radians(x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_exp2(x: f64, out: *mut f64) -> i8 { st_f(serp_math_exp2(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_expm1(x: f64, out: *mut f64) -> i8 { st_f(serp_math_expm1(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_fabs(x: f64) -> f64 { serp_math_fabs(x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_log10(x: f64, out: *mut f64) -> i8 { st_f(serp_math_log10(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_log2(x: f64, out: *mut f64) -> i8 { st_f(serp_math_log2(x), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_log1p(x: f64, out: *mut f64) -> i8 { st_f(serp_math_log1p(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_copysign(x: f64, y: f64) -> f64 { serp_math_copysign(x, y) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_fmod(x: f64, y: f64, out: *mut f64) -> i8 { st_f(serp_math_fmod(x, y), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_ldexp(x: f64, i: i64, out: *mut f64) -> i8 { st_f(serp_math_ldexp(x, i), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_trunc(x: f64, out: *mut i64) -> i8 { st_i(serp_math_trunc(x), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_hypot(x: f64, y: f64) -> f64 { serp_math_hypot(x, y) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_nextafter(x: f64, y: f64) -> f64 { serp_math_nextafter(x, y) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_ulp(x: f64) -> f64 { serp_math_ulp(x) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_factorial(n: i64, out: *mut i64) -> i8 { st_i(serp_math_factorial(n), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_gcd(a: i64, b: i64, out: *mut i64) -> i8 { st_i(serp_math_gcd(a, b), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_lcm(a: i64, b: i64, out: *mut i64) -> i8 { st_i(serp_math_lcm(a, b), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_isqrt(n: i64, out: *mut i64) -> i8 { st_i(serp_math_isqrt(n), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_comb(n: i64, k: i64, out: *mut i64) -> i8 { st_i(serp_math_comb(n, k), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_math_perm(n: i64, k: i64, out: *mut i64) -> i8 { st_i(serp_math_perm(n, k), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_frexp_m(x: f64) -> f64 { serp_math_frexp_m(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_frexp_e(x: f64) -> i64 { serp_math_frexp_e(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_modf_frac(x: f64) -> f64 { serp_math_modf_frac(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_math_modf_int(x: f64) -> f64 { serp_math_modf_int(x) }
+
+#[no_mangle]
+pub extern "C" fn rt_rand_seed(n: i64) { serp_rand_seed(n) }
+
+#[no_mangle]
+pub extern "C" fn rt_rand_seed_sys() { serp_rand_seed_sys() }
+
+#[no_mangle]
+pub extern "C" fn rt_rand_random() -> f64 { serp_rand_random() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_rand_getrandbits(k: i64, out: *mut i64) -> i8 { st_i(serp_rand_getrandbits(k), out) }
+
+#[no_mangle]
+pub extern "C" fn rt_rand_randbelow(n: i64) -> i64 { serp_rand_randbelow(n) }
+
+#[no_mangle]
+pub extern "C" fn rt_time_time() -> f64 { serp_time_time() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_time_ns() -> i64 { serp_time_time_ns() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_monotonic_ns() -> i64 { serp_time_monotonic_ns() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_perf_counter() -> f64 { serp_time_perf_counter() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_perf_counter_ns() -> i64 { serp_time_perf_counter_ns() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_monotonic() -> f64 { serp_time_monotonic() }
+
+#[no_mangle]
+pub extern "C" fn rt_time_sleep(secs: f64) -> i8 {
+    match serp_time_sleep(secs) { Ok(()) => 0, Err(e) => { set_pending(e); 1 } }
+}
+// ---------- rtlib: serp_os / serp_hashlib / serp_uuid / serp_secrets ----------
+
+unsafe fn st_s(r: SRes<SStr>, out: *mut SStr) -> i8 {
+    match r { Ok(v) => { out.write(v); 0 } Err(e) => { set_pending(e); 1 } }
+}
+
+unsafe fn st_n(r: SRes<()>) -> i8 {
+    match r { Ok(()) => 0, Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_getenv(name: *const SStr, out: *mut SStr) {
+    out.write(serp_os_getenv(s(name)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_log_set(key: *const SStr, val: *const SStr) {
+    serp_log_set(s(key), s(val));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_log_get(key: *const SStr, out: *mut SStr) {
+    out.write(serp_log_get(s(key)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_log_write_err(line: *const SStr) {
+    serp_log_write_err(s(line));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_has_env(name: *const SStr) -> i8 {
+    serp_os_has_env(s(name)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_setenv(name: *const SStr, value: *const SStr) -> i8 {
+    st_n(serp_os_setenv(s(name), s(value)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_unsetenv(name: *const SStr) -> i8 {
+    st_n(serp_os_unsetenv(s(name)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_getcwd(out: *mut SStr) -> i8 {
+    st_s(serp_os_getcwd(), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_chdir(p: *const SStr) -> i8 {
+    st_n(serp_os_chdir(s(p)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_exists(p: *const SStr) -> i8 {
+    serp_os_exists(s(p)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_is_file(p: *const SStr) -> i8 {
+    serp_os_is_file(s(p)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_is_dir(p: *const SStr) -> i8 {
+    serp_os_is_dir(s(p)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_mkdir(p: *const SStr) -> i8 {
+    st_n(serp_os_mkdir(s(p)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_rmdir(p: *const SStr) -> i8 {
+    st_n(serp_os_rmdir(s(p)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_remove(p: *const SStr) -> i8 {
+    st_n(serp_os_remove(s(p)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_os_listdir(p: *const SStr, out: *mut RtList) -> i8 {
+    match serp_os_listdir(s(p)) {
+        Ok(v) => { vec_sstr_to_rtlist(v, out); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_sha256(a: *const SStr, out: *mut SStr) {
+    out.write(serp_hash_sha256(s(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_sha256_y(h: *const u8, out: *mut SStr) {
+    out.write(serp_hash_sha256_y(&bview(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_sha1_y(h: *const u8, out: *mut SStr) {
+    out.write(serp_hash_sha1_y(&bview(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_md5_y(h: *const u8, out: *mut SStr) {
+    out.write(serp_hash_md5_y(&bview(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_sha1(a: *const SStr, out: *mut SStr) {
+    out.write(serp_hash_sha1(s(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_hash_md5(a: *const SStr, out: *mut SStr) {
+    out.write(serp_hash_md5(s(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_uuid4(out: *mut SStr) {
+    out.write(serp_uuid4());
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_secrets_token_hex(n: i64, out: *mut SStr) -> i8 {
+    st_s(serp_secrets_token_hex(n), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_secrets_token_urlsafe(n: i64, out: *mut SStr) -> i8 {
+    st_s(serp_secrets_token_urlsafe(n), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_secrets_randbelow(n: i64, out: *mut i64) -> i8 {
+    st_i(serp_secrets_randbelow(n), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_secrets_randbits(k: i64, out: *mut i64) -> i8 {
+    st_i(serp_secrets_randbits(k), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_secrets_token_bytes(n: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_secrets_token_bytes(n), out)
+}
+
+// ---------- bytes / bytearray ABI ----------
+// SBytes crosses the boundary as an opaque handle (*const u8 = Rc<Vec<u8>> raw).
+// bytearray is an RtList of u8 (element size 1).
+
+unsafe fn bview(h: *const u8) -> std::mem::ManuallyDrop<SBytes> {
+    std::mem::ManuallyDrop::new(SBytes { v: Rc::from_raw(h as *const Vec<u8>) })
+}
+
+fn bout(b: SBytes) -> *const u8 {
+    Rc::into_raw(b.v) as *const u8
+}
+
+unsafe fn ba_view(l: *const RtList) -> SByteArray {
+    let v = if (*l).data.is_null() { Vec::new() } else {
+        std::slice::from_raw_parts((*l).data, (*l).len as usize).to_vec()
+    };
+    SByteArray { v }
+}
+
+unsafe fn ba_take(l: *mut RtList) -> Vec<u8> {
+    if (*l).data.is_null() { return Vec::new(); }
+    Vec::from_raw_parts((*l).data, (*l).len as usize, (*l).cap as usize)
+}
+
+unsafe fn ba_put(l: *mut RtList, v: Vec<u8>) {
+    let mut v = std::mem::ManuallyDrop::new(v);
+    (*l).data = v.as_mut_ptr();
+    (*l).len = v.len() as i64;
+    (*l).cap = v.capacity() as i64;
+}
+
+unsafe fn slist_out_bytes(out: *mut RtList, items: Vec<SBytes>) {
+    let mut hs: Vec<*const u8> = items.into_iter().map(bout).collect();
+    let mut hs = std::mem::ManuallyDrop::new(hs);
+    (*out).data = hs.as_mut_ptr() as *mut u8;
+    (*out).len = hs.len() as i64;
+    (*out).cap = hs.capacity() as i64;
+}
+
+unsafe fn slist_out_ints(out: *mut RtList, items: Vec<i64>) {
+    let mut xs = std::mem::ManuallyDrop::new(items);
+    (*out).data = xs.as_mut_ptr() as *mut u8;
+    (*out).len = xs.len() as i64;
+    (*out).cap = xs.capacity() as i64;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_new(p: *const u8, len: i64) -> *const u8 {
+    let v = if len == 0 { Vec::new() } else {
+        std::slice::from_raw_parts(p, len as usize).to_vec()
+    };
+    bout(sbytes(v))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_clone(h: *const u8) {
+    Rc::increment_strong_count(h as *const Vec<u8>);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_drop(h: *const u8) {
+    drop(Rc::from_raw(h as *const Vec<u8>));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_len(h: *const u8) -> i64 {
+    bview(h).len_i()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_index(h: *const u8, i: i64, out: *mut i64) -> i8 {
+    match pyb_index(&bview(h), i) {
+        Ok(v) => { out.write(v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_slice(h: *const u8, lo: i64, has_lo: i8,
+                                        hi: i64, has_hi: i8) -> *const u8 {
+    let lo = if has_lo != 0 { Some(lo) } else { None };
+    let hi = if has_hi != 0 { Some(hi) } else { None };
+    bout(pyb_slice(&bview(h), lo, hi))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_concat(a: *const u8, b: *const u8) -> *const u8 {
+    bout(pyb_concat(&bview(a), &bview(b)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_repeat(a: *const u8, k: i64) -> *const u8 {
+    bout(pyb_repeat(&bview(a), k))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_eq(a: *const u8, b: *const u8) -> i8 {
+    (*bview(a) == *bview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_cmp(a: *const u8, b: *const u8) -> i32 {
+    match bview(a).v.as_slice().cmp(bview(b).v.as_slice()) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_contains(a: *const u8, b: *const u8) -> i8 {
+    pyb_contains(&bview(a), &bview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_find(a: *const u8, b: *const u8) -> i64 {
+    pyb_find(&bview(a), &bview(b))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_count(a: *const u8, b: *const u8) -> i64 {
+    pyb_count(&bview(a), &bview(b))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_startswith(a: *const u8, b: *const u8) -> i8 {
+    pyb_startswith(&bview(a), &bview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_endswith(a: *const u8, b: *const u8) -> i8 {
+    pyb_endswith(&bview(a), &bview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_replace(a: *const u8, f: *const u8, t: *const u8) -> *const u8 {
+    bout(pyb_replace(&bview(a), &bview(f), &bview(t)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_strip(a: *const u8) -> *const u8 { bout(pyb_strip(&bview(a))) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_lstrip(a: *const u8) -> *const u8 { bout(pyb_lstrip(&bview(a))) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_rstrip(a: *const u8) -> *const u8 { bout(pyb_rstrip(&bview(a))) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_upper(a: *const u8) -> *const u8 { bout(pyb_upper(&bview(a))) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_lower(a: *const u8) -> *const u8 { bout(pyb_lower(&bview(a))) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_hex(a: *const u8, out: *mut SStr) {
+    out.write(pyb_hex(&bview(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_decode(a: *const u8, out: *mut SStr) -> i8 {
+    match pyb_decode(&bview(a)) {
+        Ok(s) => { out.write(s); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_fromhex(sp: *const SStr, out: *mut *const u8) -> i8 {
+    match pyb_fromhex(s(sp)) {
+        Ok(b) => { out.write(bout(b)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_str_encode(sp: *const SStr) -> *const u8 {
+    bout(py_str_encode(s(sp)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_from_ints(xs: *const RtList, out: *mut *const u8) -> i8 {
+    let v: Vec<i64> = if (*xs).data.is_null() { Vec::new() } else {
+        std::slice::from_raw_parts((*xs).data as *const i64, (*xs).len as usize).to_vec()
+    };
+    match pyb_from_ints(&v) {
+        Ok(b) => { out.write(bout(b)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_zeros(n: i64, out: *mut *const u8) -> i8 {
+    match pyb_zeros(n) {
+        Ok(b) => { out.write(bout(b)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_split(a: *const u8, sep: *const u8, out: *mut RtList) -> i8 {
+    match pyb_split(&bview(a), &bview(sep)) {
+        Ok(items) => { slist_out_bytes(out, items); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_split_ws(a: *const u8, out: *mut RtList) {
+    slist_out_bytes(out, pyb_split_ws(&bview(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_join(sep: *const u8, items: *const RtList) -> *const u8 {
+    let hs: &[*const u8] = if (*items).data.is_null() { &[] } else {
+        std::slice::from_raw_parts((*items).data as *const *const u8, (*items).len as usize)
+    };
+    let mut v = Vec::new();
+    for (i, &h) in hs.iter().enumerate() {
+        if i > 0 { v.extend_from_slice(&bview(sep).v); }
+        v.extend_from_slice(&bview(h).v);
+    }
+    bout(sbytes(v))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_ints(a: *const u8, out: *mut RtList) {
+    slist_out_ints(out, pyb_ints(&bview(a)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_repr(a: *const u8, out: *mut SStr) {
+    out.write(sstr(&bytes_repr(&bview(a).v)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_push(l: *mut RtList, x: i64) -> i8 {
+    let mut ba = SByteArray { v: ba_take(l) };
+    let r = ba.push_i(x);
+    ba_put(l, ba.v);
+    match r { Ok(()) => 0, Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_extend_b(l: *mut RtList, h: *const u8) {
+    let mut v = ba_take(l);
+    v.extend_from_slice(&bview(h).v);
+    ba_put(l, v);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_extend_a(l: *mut RtList, o: *const RtList) {
+    let mut v = ba_take(l);
+    v.extend_from_slice(&ba_view(o).v);
+    ba_put(l, v);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_get(l: *const RtList, i: i64, out: *mut i64) -> i8 {
+    match ba_view(l).get(i) {
+        Ok(v) => { out.write(v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_set(l: *mut RtList, i: i64, x: i64) -> i8 {
+    let mut ba = SByteArray { v: ba_take(l) };
+    let r = ba.set(i, x);
+    ba_put(l, ba.v);
+    match r { Ok(()) => 0, Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_slice(l: *const RtList, lo: i64, has_lo: i8,
+                                     hi: i64, has_hi: i8, out: *mut RtList) {
+    let lo = if has_lo != 0 { Some(lo) } else { None };
+    let hi = if has_hi != 0 { Some(hi) } else { None };
+    let r = pyba_slice(&ba_view(l), lo, hi);
+    ba_put(out, r.v);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_to_bytes(l: *const RtList) -> *const u8 {
+    bout(ba_view(l).as_bytes())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_from_bytes(h: *const u8, out: *mut RtList) {
+    ba_put(out, bview(h).v.as_ref().clone());
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_from_ints(xs: *const RtList, out: *mut RtList) -> i8 {
+    let v: Vec<i64> = if (*xs).data.is_null() { Vec::new() } else {
+        std::slice::from_raw_parts((*xs).data as *const i64, (*xs).len as usize).to_vec()
+    };
+    match pyba_from_ints(&v) {
+        Ok(b) => { ba_put(out, b.v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_zeros(n: i64, out: *mut RtList) -> i8 {
+    match pyba_zeros(n) {
+        Ok(b) => { ba_put(out, b.v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_eq(a: *const RtList, b: *const RtList) -> i8 {
+    (ba_view(a).v == ba_view(b).v) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_clone(src: *const RtList, dst: *mut RtList) {
+    ba_put(dst, ba_view(src).v);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_hex(l: *const RtList, out: *mut SStr) {
+    out.write(pyb_hex(&ba_view(l).as_bytes()));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_decode(l: *const RtList, out: *mut SStr) -> i8 {
+    match pyb_decode(&ba_view(l).as_bytes()) {
+        Ok(s2) => { out.write(s2); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_repr(l: *const RtList, out: *mut SStr) {
+    out.write(sstr(&ba_view(l).py_repr()));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_ba_ints(l: *const RtList, out: *mut RtList) {
+    slist_out_ints(out, pyba_ints(&ba_view(l)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_file_read_bytes(f: *mut SerpFile, out: *mut *const u8) -> i8 {
+    match (*f).read_all_bytes() {
+        Ok(b) => { out.write(bout(b)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_file_write_bytes(f: *mut SerpFile, b: *const u8, out: *mut i64) -> i8 {
+    match (*f).write_bytes(&bview(b).v) {
+        Ok(n) => { out.write(n); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_file_write_ba(f: *mut SerpFile, l: *const RtList, out: *mut i64) -> i8 {
+    match (*f).write_bytes(&ba_view(l).v) {
+        Ok(n) => { out.write(n); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+// ---------- rtlib: serp_zlib ----------
+
+unsafe fn st_y(r: SRes<SBytes>, out: *mut *const u8) -> i8 {
+    match r {
+        Ok(v) => { out.write(bout(v)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_crc32(h: *const u8) -> i64 {
+    serp_zlib_crc32(&bview(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_crc32_seeded(h: *const u8, value: i64) -> i64 {
+    serp_zlib_crc32_seeded(&bview(h), value)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_adler32_seeded(h: *const u8, value: i64) -> i64 {
+    serp_zlib_adler32_seeded(&bview(h), value)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_adler32(h: *const u8) -> i64 {
+    serp_zlib_adler32(&bview(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_compress(h: *const u8, level: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_compress(&bview(h), level), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_decompress(h: *const u8, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_decompress(&bview(h)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_deflate(h: *const u8, level: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_deflate(&bview(h), level), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_inflate(h: *const u8, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_inflate(&bview(h)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_gzip_compress(h: *const u8, level: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_gzip_compress(&bview(h), level), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_zlib_gzip_decompress(h: *const u8, out: *mut *const u8) -> i8 {
+    st_y(serp_zlib_gzip_decompress(&bview(h)), out)
+}
+
+// ---------- rtlib: serp_sqlite ----------
+
+unsafe fn st_i64(r: SRes<i64>, out: *mut i64) -> i8 {
+    match r {
+        Ok(v) => { out.write(v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+unsafe fn st_f64(r: SRes<f64>, out: *mut f64) -> i8 {
+    match r {
+        Ok(v) => { out.write(v); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_open(path: *const SStr, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_open(s(path)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_close(h: i64) -> i8 {
+    st_n(serp_sqlite_close(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_execute(h: i64, sql: *const SStr) -> i8 {
+    st_n(serp_sqlite_execute(h, s(sql)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_changes(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_changes(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_last_rowid(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_last_rowid(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_prepare(h: i64, sql: *const SStr, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_prepare(h, s(sql)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_bind_int(h: i64, idx: i64, v: i64) -> i8 {
+    st_n(serp_sqlite_bind_int(h, idx, v))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_bind_float(h: i64, idx: i64, v: f64) -> i8 {
+    st_n(serp_sqlite_bind_float(h, idx, v))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_bind_text(h: i64, idx: i64, v: *const SStr) -> i8 {
+    st_n(serp_sqlite_bind_text(h, idx, s(v)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_bind_blob(h: i64, idx: i64, v: *const u8) -> i8 {
+    st_n(serp_sqlite_bind_blob(h, idx, &bview(v)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_bind_null(h: i64, idx: i64) -> i8 {
+    st_n(serp_sqlite_bind_null(h, idx))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_step(h: i64, out: *mut i8) -> i8 {
+    match serp_sqlite_step(h) {
+        Ok(v) => { out.write(v as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_column_count(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_column_count(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_col_type(h: i64, i: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_col_type(h, i), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_col_int(h: i64, i: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sqlite_col_int(h, i), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_col_float(h: i64, i: i64, out: *mut f64) -> i8 {
+    st_f64(serp_sqlite_col_float(h, i), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_col_text(h: i64, i: i64, out: *mut SStr) -> i8 {
+    st_s(serp_sqlite_col_text(h, i), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_col_blob(h: i64, i: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_sqlite_col_blob(h, i), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_reset(h: i64) -> i8 {
+    st_n(serp_sqlite_reset(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_finalize(h: i64) -> i8 {
+    st_n(serp_sqlite_finalize(h))
+}
+
+// ---------- rtlib: serp_socket ----------
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_connect(host: *const SStr, port: i64, timeout_ms: i64,
+                                         out: *mut i64) -> i8 {
+    st_i64(serp_sock_connect(s(host), port, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_tls_connect(host: *const SStr, port: i64, timeout_ms: i64,
+                                             insecure: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_tls_connect(s(host), port, timeout_ms, insecure), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_listen(host: *const SStr, port: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_listen(s(host), port), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_accept(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_accept(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_send(h: i64, data: *const u8, out: *mut i64) -> i8 {
+    st_i64(serp_sock_send(h, &bview(data)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_recv(h: i64, maxlen: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_sock_recv(h, maxlen), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_shutdown_write(h: i64) -> i8 {
+    st_n(serp_sock_shutdown_write(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_set_timeout(h: i64, ms: i64) -> i8 {
+    st_n(serp_sock_set_timeout(h, ms))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_local_port(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_local_port(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_close(h: i64) -> i8 {
+    st_n(serp_sock_close(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_udp_bind(host: *const SStr, port: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_udp_bind(s(host), port), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_udp_send_to(h: i64, data: *const u8, host: *const SStr,
+                                             port: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_udp_send_to(h, &bview(data), s(host), port), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_udp_recv_from(h: i64, maxlen: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_sock_udp_recv_from(h, maxlen), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_udp_peer_host(h: i64, out: *mut SStr) -> i8 {
+    st_s(serp_sock_udp_peer_host(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_udp_peer_port(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_udp_peer_port(h), out)
+}
+
+// ---------- PyVal (boxed dynamic values; handle = Rc<PValRepr> raw pointer) ----------
+
+unsafe fn pview(h: *const u8) -> std::mem::ManuallyDrop<PVal> {
+    std::mem::ManuallyDrop::new(PVal(Rc::from_raw(h as *const PValRepr)))
+}
+
+fn pout(v: PVal) -> *const u8 {
+    Rc::into_raw(v.0) as *const u8
+}
+
+unsafe fn vec_pyval_to_rtlist(v: Vec<PVal>, out: *mut RtList) {
+    let mut handles = std::mem::ManuallyDrop::new(
+        v.into_iter().map(pout).collect::<Vec<*const u8>>());
+    out.write(RtList {
+        data: handles.as_mut_ptr() as *mut u8,
+        len: handles.len() as i64,
+        cap: handles.capacity() as i64,
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_none() -> *const u8 { pout(pyval_none()) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_bool(b: i8) -> *const u8 { pout(pyval_bool(b != 0)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_int(i: i64) -> *const u8 { pout(pyval_int(i)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_float(f: f64) -> *const u8 { pout(pyval_float(f)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_str(sp: *const SStr) -> *const u8 {
+    pout(pyval_str((*sp).clone()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_bytes(h: *const u8) -> *const u8 {
+    pout(pyval_bytes((*bview(h)).clone()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_list_new() -> *const u8 { pout(pyval_list(Vec::new())) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_list_push(h: *const u8, item: *const u8) {
+    let mut rc = std::mem::ManuallyDrop::new(Rc::from_raw(h as *const PValRepr));
+    if let Some(PValRepr::List(v)) = Rc::get_mut(&mut *rc) {
+        v.push((*pview(item)).clone());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_dict_new() -> *const u8 {
+    pout(pyval_dict(SerpDict::new()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_dict_set(h: *const u8, k: *const SStr, val: *const u8) {
+    let mut rc = std::mem::ManuallyDrop::new(Rc::from_raw(h as *const PValRepr));
+    if let Some(PValRepr::Dict(d)) = Rc::get_mut(&mut *rc) {
+        d.set((*k).clone(), (*pview(val)).clone());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_clone(h: *const u8) {
+    Rc::increment_strong_count(h as *const PValRepr);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_drop(h: *const u8) {
+    drop(Rc::from_raw(h as *const PValRepr));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_kind(h: *const u8, out: *mut SStr) {
+    out.write(pyval_kind(&*pview(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_truthy(h: *const u8) -> i8 {
+    pyval_truthy(&*pview(h)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_eq(a: *const u8, b: *const u8) -> i8 {
+    pyval_eq(&*pview(a), &*pview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_len(h: *const u8, out: *mut i64) -> i8 {
+    match pyval_len(&*pview(h)) {
+        Ok(n) => { out.write(n); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_getitem_i(h: *const u8, i: i64, out: *mut *const u8) -> i8 {
+    match pyval_getitem_i(&*pview(h), i) {
+        Ok(v) => { out.write(pout(v)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_getitem_s(h: *const u8, k: *const SStr,
+                                            out: *mut *const u8) -> i8 {
+    match pyval_getitem_s(&*pview(h), &*k) {
+        Ok(v) => { out.write(pout(v)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_getitem_v(h: *const u8, k: *const u8,
+                                            out: *mut *const u8) -> i8 {
+    match pyval_getitem_v(&*pview(h), &*pview(k)) {
+        Ok(v) => { out.write(pout(v)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_contains(h: *const u8, n: *const u8, out: *mut i8) -> i8 {
+    match pyval_contains(&*pview(h), &*pview(n)) {
+        Ok(b) => { out.write(b as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_iter(h: *const u8, out: *mut RtList) -> i8 {
+    match pyval_iter(&*pview(h)) {
+        Ok(v) => { vec_pyval_to_rtlist(v, out); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_to_int(h: *const u8, out: *mut i64) -> i8 {
+    match pyval_to_int(&*pview(h)) {
+        Ok(i) => { out.write(i); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_to_float(h: *const u8, out: *mut f64) -> i8 {
+    match pyval_to_float(&*pview(h)) {
+        Ok(f) => { out.write(f); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_to_bytes(h: *const u8, out: *mut *const u8) -> i8 {
+    match pyval_to_bytes(&*pview(h)) {
+        Ok(b) => { out.write(bout(b)); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_str_of(h: *const u8, out: *mut SStr) {
+    out.write(sstring(pview(h).py_str()));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_repr(h: *const u8, out: *mut SStr) {
+    out.write(sstring(pview(h).py_repr()));
 }

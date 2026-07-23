@@ -1,4 +1,4 @@
-"""Frontend: parsing, module discovery, three-bin import resolution (SPEC.md section 9)."""
+"""Frontend: parsing, module discovery, three-bin import resolution (docs/spec.md section 9)."""
 
 import ast
 from dataclasses import dataclass, field
@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .diagnostics import Reporter, Span
 from .project import ManifestError, import_context
+from .rtlib import RTLIB_CONSTS, RTLIB_FUNCS, RTLIB_MODULES, RtFn
 
 
 @dataclass
@@ -20,11 +21,60 @@ class Module:
     functions: dict[str, ast.FunctionDef] = field(default_factory=dict)
     constants: dict[str, ast.AnnAssign] = field(default_factory=dict)
     classes: dict[str, ast.ClassDef] = field(default_factory=dict)
+    class_statics: dict[str, dict[str, str]] = field(default_factory=dict)
     protocols: dict[str, ast.ClassDef] = field(default_factory=dict)
     typevars: set[str] = field(default_factory=set)
     typevar_bounds: dict[str, str] = field(default_factory=dict)
     imports_sys: bool = False
+    rtlib_imports: dict[str, RtFn] = field(default_factory=dict)
+    rtlib_consts: dict[str, float] = field(default_factory=dict)
     entry_call: str | None = None
+    exceptions: dict[str, str] = field(default_factory=dict)
+
+
+# Built-in exception classes recognized by raise/except (docs/spec.md section 11).
+BUILTIN_EXC = {"Exception", "ValueError", "RuntimeError", "TypeError", "IndexError", "KeyError",
+               "ZeroDivisionError", "OverflowError", "EOFError", "FileNotFoundError",
+               "PermissionError", "OSError", "ArithmeticError", "LookupError", "StopIteration",
+               "UnicodeDecodeError", "NotImplementedError"}
+
+# Direct parent of each non-root builtin (mirrors prelude.rs SerpErr::matches).
+BUILTIN_EXC_PARENT = {"FileNotFoundError": "OSError",
+                      "ZeroDivisionError": "ArithmeticError",
+                      "OverflowError": "ArithmeticError",
+                      "IndexError": "LookupError",
+                      "KeyError": "LookupError",
+                      "UnicodeDecodeError": "ValueError",
+                      "NotImplementedError": "RuntimeError"}
+
+
+def collect_user_exceptions(program: "Program") -> dict[str, str]:
+    """Merge every module's user exception classes into one {name: base} map."""
+    out: dict[str, str] = {}
+    for mod in program.modules.values():
+        out.update(mod.exceptions)
+    return out
+
+
+def exc_ancestors(name: str, user_exc: dict[str, str]) -> set[str]:
+    """All classes (excluding itself) that a raise of `name` should match."""
+    out: set[str] = {"Exception"}
+    cur = name
+    seen = {name}
+    while True:
+        parent = user_exc.get(cur) or BUILTIN_EXC_PARENT.get(cur)
+        if parent is None or parent in seen:
+            return out
+        out.add(parent)
+        seen.add(parent)
+        cur = parent
+
+
+def exc_handler_names(cls: str, user_exc: dict[str, str]) -> list[str]:
+    """Expand a handler class to itself plus every user subclass (whole-program)."""
+    names = [cls]
+    names += sorted(u for u in user_exc if cls in exc_ancestors(u, user_exc))
+    return names
 
 
 @dataclass
@@ -63,7 +113,7 @@ def load_program(entry_path: Path, rep: Reporter,
                 rep.fatal("SE213", "foreign-import",
                           f"import of '{mod_name}' does not resolve to a Serpentine module "
                           f"(searched: {roots}) — the CPython interop boundary refuses foreign "
-                          f"imports in native builds (docs/interop.md); run under CPython to "
+                          f"imports in native builds (docs/guides/interop.md); run under CPython to "
                           f"use them", span)
             sub = _load_module(candidate, mod_name, rep, overlay)
             _check_name_collision(program, sub, rep)
@@ -108,6 +158,7 @@ def _load_module(path: Path, name: str, rep: Reporter,
     except SyntaxError as exc:
         rep.fatal("SE201", "unsupported-feature", f"syntax error: {exc.msg}",
                   Span(str(path), exc.lineno or 1, (exc.offset or 1) - 1))
+    _rewrite_with_statements(tree)
     mod = Module(name=name, path=path, tree=tree)
     file = str(path)
 
@@ -129,6 +180,20 @@ def _load_module(path: Path, name: str, rep: Reporter,
                     if alias.asname:
                         rep.fatal("SE201", "unsupported-feature", "aliased shim imports are not supported", span)
                     mod.shim_imports.add(alias.name)
+            elif node.module in RTLIB_MODULES:
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    fn = RTLIB_FUNCS.get((node.module, alias.name))
+                    if fn is not None:
+                        mod.rtlib_imports[local] = fn
+                        continue
+                    cv = RTLIB_CONSTS.get((node.module, alias.name))
+                    if cv is not None:
+                        mod.rtlib_consts[local] = cv
+                        continue
+                    rep.fatal("SE201", "unsupported-feature",
+                              f"runtime library '{node.module}' has no member "
+                              f"'{alias.name}'", span)
             elif node.module is not None and node.level == 0:
                 for alias in node.names:
                     local = alias.asname or alias.name
@@ -145,7 +210,7 @@ def _load_module(path: Path, name: str, rep: Reporter,
                       f"import of '{node.names[0].name}' is not supported — use "
                       f"'from {node.names[0].name} import ...' for Serpentine modules "
                       f"(only 'import sys' is special-cased); the interop boundary refuses "
-                      f"foreign imports in native builds (docs/interop.md)",
+                      f"foreign imports in native builds (docs/guides/interop.md)",
                       span)
         elif isinstance(node, ast.FunctionDef):
             if node.decorator_list:
@@ -168,6 +233,9 @@ def _load_module(path: Path, name: str, rep: Reporter,
                               "protocol classes need 'from serpentine import Protocol'", span)
                 mod.protocols[node.name] = node
                 continue
+            if _is_exception_class(node):
+                mod.exceptions[node.name] = node.bases[0].id
+                continue
             deco = node.decorator_list
             if not (len(deco) == 1 and isinstance(deco[0], ast.Name) and deco[0].id == "dataclass"):
                 rep.fatal("SE201", "unsupported-feature",
@@ -177,6 +245,7 @@ def _load_module(path: Path, name: str, rep: Reporter,
                 rep.fatal("SE201", "unsupported-feature",
                           "class inheritance is not supported in Tier 1 (only a "
                           "Generic[...] base for generic classes)", span)
+            _lift_static_methods(mod, node)
             mod.classes[node.name] = node
         elif _is_typevar_decl(node):
             assert isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
@@ -193,7 +262,111 @@ def _load_module(path: Path, name: str, rep: Reporter,
             rep.fatal("SE205", "module-level-statement",
                       "only imports, function definitions, classes, Copy constants, and the "
                       "entry guard are allowed at module level", span)
+    _fold_negative_literals(mod)
+    if mod.rtlib_consts:
+        _fold_rtlib_consts(mod, rep)
     return mod
+
+
+def _lift_static_methods(mod: Module, node: ast.ClassDef) -> None:
+    """Move @staticmethod defs out of a class body into module functions."""
+    statics: dict[str, str] = {}
+    kept = []
+    for st in node.body:
+        if isinstance(st, ast.FunctionDef) and len(st.decorator_list) == 1 \
+                and isinstance(st.decorator_list[0], ast.Name) \
+                and st.decorator_list[0].id == "staticmethod":
+            mangled = f"_static_{node.name}_{st.name}"
+            statics[st.name] = mangled
+            st.decorator_list = []
+            st.name = mangled
+            mod.functions[mangled] = st
+        else:
+            kept.append(st)
+    node.body = kept
+    if statics:
+        mod.class_statics[node.name] = statics
+
+
+def _rewrite_with_statements(tree: ast.Module) -> None:
+    """Rewrite `with <expr> as n:` (non-open) into `n = <expr>; try: ... finally: n.__exit__(...)`.
+
+    File `with open(...)` keeps its dedicated RAII lowering. Under CPython the
+    original source runs the real context-manager protocol; the rewrite is
+    equivalent because __enter__ is required to be exactly `return self`.
+    """
+
+    counter = [0]
+
+    class WithRewriter(ast.NodeTransformer):
+        def visit_With(self, node: ast.With):
+            """Rewrite one user-object with-block into assign + try/finally."""
+            self.generic_visit(node)
+            if len(node.items) != 1:
+                return node
+            item = node.items[0]
+            ctx = item.context_expr
+            if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name) \
+                    and ctx.func.id == "open":
+                return node
+            if item.optional_vars is None:
+                counter[0] += 1
+                tname = f"_serp_with_{counter[0]}"
+            elif isinstance(item.optional_vars, ast.Name):
+                tname = item.optional_vars.id
+            else:
+                return node
+            assign = ast.Assign(
+                targets=[ast.Name(id=tname, ctx=ast.Store())], value=ctx)
+            exit_call = ast.Expr(value=ast.Call(
+                func=ast.Attribute(value=ast.Name(id=tname, ctx=ast.Load()),
+                                   attr="__exit__", ctx=ast.Load()),
+                args=[ast.Constant(value=None), ast.Constant(value=None),
+                      ast.Constant(value=None)],
+                keywords=[]))
+            tryst = ast.Try(body=node.body, handlers=[], orelse=[],
+                            finalbody=[exit_call])
+            for n in (assign, exit_call, tryst):
+                ast.copy_location(n, node)
+            return [assign, tryst]
+
+    WithRewriter().visit(tree)
+    ast.fix_missing_locations(tree)
+
+
+def _fold_negative_literals(mod: Module) -> None:
+    """Fold unary-minus number literals into plain constants (-1 -> Constant(-1))."""
+
+    class NegFolder(ast.NodeTransformer):
+        def visit_UnaryOp(self, node: ast.UnaryOp):
+            """Rewrite USub over an int/float literal into a negative Constant."""
+            self.generic_visit(node)
+            if isinstance(node.op, ast.USub) and isinstance(node.operand, ast.Constant) \
+                    and isinstance(node.operand.value, (int, float)) \
+                    and not isinstance(node.operand.value, bool):
+                return ast.copy_location(ast.Constant(value=-node.operand.value), node)
+            return node
+
+    mod.tree = ast.fix_missing_locations(NegFolder().visit(mod.tree))
+
+
+def _fold_rtlib_consts(mod: Module, rep: Reporter) -> None:
+    """Replace loads of imported rtlib constants (pi, e, ...) with float literals."""
+
+    consts = mod.rtlib_consts
+    file = str(mod.path)
+
+    class Folder(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name):
+            if node.id in consts:
+                if not isinstance(node.ctx, ast.Load):
+                    rep.fatal("SE206", "mutable-global",
+                              f"cannot assign to runtime-library constant '{node.id}'",
+                              Span(file, node.lineno, node.col_offset))
+                return ast.copy_location(ast.Constant(value=consts[node.id]), node)
+            return node
+
+    mod.tree = ast.fix_missing_locations(Folder().visit(mod.tree))
 
 
 def _is_generic_base(node: ast.expr) -> bool:
@@ -206,6 +379,18 @@ def _is_protocol_class(node: ast.ClassDef) -> bool:
     """Recognize `class P(Protocol):` as a Tier-2 structural protocol."""
     return (len(node.bases) == 1 and isinstance(node.bases[0], ast.Name)
             and node.bases[0].id == "Protocol")
+
+
+def _is_exception_class(node: ast.ClassDef) -> bool:
+    """Recognize `class E(Base): pass` (single Name base, empty body) as an exception class."""
+    if node.decorator_list or node.keywords:
+        return False
+    if len(node.bases) != 1 or not isinstance(node.bases[0], ast.Name):
+        return False
+    return all(isinstance(s, ast.Pass)
+               or (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                   and isinstance(s.value.value, str))
+               for s in node.body)
 
 
 def _is_typevar_decl(node: ast.stmt) -> bool:

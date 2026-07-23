@@ -1,0 +1,14 @@
+[project]
+name = "serp-fang"
+version = "0.2.0"
+
+[build]
+roots = ["src", "../serp-url/src", "../serp-base64/src", "../serp-json/src", "../serp-io/src", "../serp-zlib/src"]
+
+[dependencies]
+serp-socket = "0.1.0"
+serp-url = "0.1.0"
+serp-base64 = "0.1.0"
+serp-json = "0.1.0"
+serp-io = "0.1.0"
+serp-zlib = "0.1.0"

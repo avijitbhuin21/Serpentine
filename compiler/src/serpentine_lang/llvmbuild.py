@@ -1,6 +1,6 @@
 """Backend B build pipeline: cached runtime library + object emission + native link.
 
-Runtime strategy (CHECKLIST Phase 5.0, DECISIONS.md): prelude.rs + rt.rs are
+Runtime strategy (archived checklist Phase 5.0, docs/decisions.md): prelude.rs + rt.rs are
 compiled ONCE per (source hash, rustc version, target) into a cached Rust
 library; Backend-B objects link against it. Two platform link paths:
 

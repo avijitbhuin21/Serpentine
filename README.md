@@ -25,7 +25,7 @@ serp add somelib                   # add a Serpentine library from PyPI (pinned 
 
 Any program accepted by `serp check` produces the same observable behavior when
 (a) executed by CPython, and (b) compiled by `serp build` and run natively — modulo a small,
-explicitly documented list of divergences ([SPEC.md §10](SPEC.md)).
+explicitly documented list of divergences ([docs/spec.md §10](docs/spec.md)).
 
 ```python
 from serpentine import Owned, Ref, Mut, move
@@ -51,12 +51,14 @@ are no-ops.
 
 | Path | What |
 |---|---|
-| `SPEC.md` | The Tier-0 language specification — the wall against scope creep |
-| `DECISIONS.md` | Resolved design questions (RESEARCH.md §8) |
-| `RESEARCH.md` | The research & design document that seeded the project |
-| `CHECKLIST.md` | Ordered execution tracker for all phases |
-| `docs/exceptions-ownership.md` | Paper prototype: exceptions × ownership (Tier 1) |
+| `docs/` | All documentation — see [docs/README.md](docs/README.md) for the index |
+| `docs/spec.md` | The language specification — the wall against scope creep |
+| `docs/features.md` | Current feature state (language, compiler, tooling, libraries) |
+| `docs/decisions.md` | Resolved design questions |
+| `docs/libraries.md` | Library roadmap & tracker |
 | `shim/` | `serpentine-shim` — the runtime no-op package (`pip install serpentine-shim`) |
+| `compiler/` | `serpentine-lang` — the `serp` compiler & CLI |
+| `libs/` | The `serp-*` library monorepo |
 | `tests/accept/` | Programs the checker must accept; each runs under CPython today |
 | `tests/reject/` | Programs the checker must reject; each annotated with its expected error |
 

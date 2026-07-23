@@ -21,10 +21,11 @@ import ast
 
 from llvmlite import ir
 
-from .frontend import Module
-from .ptypes import (Type, TBool, TClass, TDict, TExc, TFile, TFloat, TInt, TList, TNone,
-                     TOptional, TShared, TStr, TTuple, TWeak, mangle_type, subst_type)
-from .typecheck import FuncSig, TIterObj, TypeChecker
+from .frontend import Module, exc_handler_names
+from .ptypes import (Type, TBool, TByteArray, TBytes, TClass, TDict, TExc, TFile, TFloat,
+                     TFunc, TInt, TList, TNone, TOptional, TPyVal, TShared, TStr, TTuple,
+                     TWeak, mangle_type, subst_type)
+from .typecheck import FuncSig, Param, TIterObj, TypeChecker
 
 I64 = ir.IntType(64)
 I32 = ir.IntType(32)
@@ -40,6 +41,8 @@ SLIST = ir.LiteralStructType([I8P, I64, I64])     # {data, len, cap}
 SLISTP = SLIST.as_pointer()
 SERR = ir.LiteralStructType([SSTR, SSTR])         # {kind, msg}
 SERRP = SERR.as_pointer()
+SFUNC = ir.LiteralStructType([I8P, I8P])          # closure {fn, env}
+DTORTY = ir.FunctionType(VOID, [I8P])             # closure-env destructor
 
 OVERFLOW_MSG = "Serpentine int operation overflowed 64 bits"
 
@@ -53,7 +56,7 @@ class LLVMUnsupported(Exception):
 
 def needs_clone(t: Type) -> bool:
     """Copy-semantics types whose copies are not bitwise (mirror rustgen)."""
-    if isinstance(t, (TStr, TShared, TWeak, TExc)):
+    if isinstance(t, (TStr, TShared, TWeak, TExc, TFunc, TBytes, TPyVal)):
         return True
     if isinstance(t, TTuple):
         return any(needs_clone(i) for i in t.items)
@@ -143,6 +146,216 @@ RT_SIGS = {
     "rt_round_n": (F64, [F64, I64]),
     "rt_int_from_f64": (I8, [F64, I64.as_pointer()]),
     "rt_f64_floormod": (I8, [F64, F64, I8, F64.as_pointer()]),
+    "rt_math_sqrt": (I8, [F64, F64.as_pointer()]),
+    "rt_math_sin": (F64, [F64]),
+    "rt_math_cos": (F64, [F64]),
+    "rt_math_tan": (F64, [F64]),
+    "rt_math_log": (I8, [F64, F64.as_pointer()]),
+    "rt_math_exp": (I8, [F64, F64.as_pointer()]),
+    "rt_math_pow": (I8, [F64, F64, F64.as_pointer()]),
+    "rt_math_floor": (I8, [F64, I64.as_pointer()]),
+    "rt_math_ceil": (I8, [F64, I64.as_pointer()]),
+    "rt_math_isnan": (I8, [F64]),
+    "rt_math_isinf": (I8, [F64]),
+    "rt_math_isfinite": (I8, [F64]),
+    "rt_math_acos": (I8, [F64, F64.as_pointer()]),
+    "rt_math_asin": (I8, [F64, F64.as_pointer()]),
+    "rt_math_atan": (F64, [F64]),
+    "rt_math_atan2": (F64, [F64, F64]),
+    "rt_math_acosh": (I8, [F64, F64.as_pointer()]),
+    "rt_math_asinh": (F64, [F64]),
+    "rt_math_atanh": (I8, [F64, F64.as_pointer()]),
+    "rt_math_cosh": (I8, [F64, F64.as_pointer()]),
+    "rt_math_sinh": (I8, [F64, F64.as_pointer()]),
+    "rt_math_tanh": (F64, [F64]),
+    "rt_math_cbrt": (F64, [F64]),
+    "rt_math_degrees": (F64, [F64]),
+    "rt_math_radians": (F64, [F64]),
+    "rt_math_exp2": (I8, [F64, F64.as_pointer()]),
+    "rt_math_expm1": (I8, [F64, F64.as_pointer()]),
+    "rt_math_fabs": (F64, [F64]),
+    "rt_math_log10": (I8, [F64, F64.as_pointer()]),
+    "rt_math_log2": (I8, [F64, F64.as_pointer()]),
+    "rt_math_log1p": (I8, [F64, F64.as_pointer()]),
+    "rt_math_copysign": (F64, [F64, F64]),
+    "rt_math_fmod": (I8, [F64, F64, F64.as_pointer()]),
+    "rt_math_ldexp": (I8, [F64, I64, F64.as_pointer()]),
+    "rt_math_trunc": (I8, [F64, I64.as_pointer()]),
+    "rt_math_hypot": (F64, [F64, F64]),
+    "rt_math_nextafter": (F64, [F64, F64]),
+    "rt_math_ulp": (F64, [F64]),
+    "rt_math_factorial": (I8, [I64, I64.as_pointer()]),
+    "rt_math_gcd": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_math_lcm": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_math_isqrt": (I8, [I64, I64.as_pointer()]),
+    "rt_math_comb": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_math_perm": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_math_frexp_m": (F64, [F64]),
+    "rt_math_frexp_e": (I64, [F64]),
+    "rt_math_modf_frac": (F64, [F64]),
+    "rt_math_modf_int": (F64, [F64]),
+    "rt_rand_seed": (VOID, [I64]),
+    "rt_rand_seed_sys": (VOID, []),
+    "rt_rand_random": (F64, []),
+    "rt_rand_getrandbits": (I8, [I64, I64.as_pointer()]),
+    "rt_rand_randbelow": (I64, [I64]),
+    "rt_time_time": (F64, []),
+    "rt_time_monotonic": (F64, []),
+    "rt_time_sleep": (I8, [F64]),
+    "rt_time_time_ns": (I64, []),
+    "rt_time_monotonic_ns": (I64, []),
+    "rt_time_perf_counter": (F64, []),
+    "rt_time_perf_counter_ns": (I64, []),
+    "rt_os_getenv": (VOID, [SSTRP, SSTRP]),
+    "rt_log_set": (VOID, [SSTRP, SSTRP]),
+    "rt_log_get": (VOID, [SSTRP, SSTRP]),
+    "rt_log_write_err": (VOID, [SSTRP]),
+    "rt_os_has_env": (I8, [SSTRP]),
+    "rt_os_setenv": (I8, [SSTRP, SSTRP]),
+    "rt_os_unsetenv": (I8, [SSTRP]),
+    "rt_os_getcwd": (I8, [SSTRP]),
+    "rt_os_chdir": (I8, [SSTRP]),
+    "rt_os_exists": (I8, [SSTRP]),
+    "rt_os_is_file": (I8, [SSTRP]),
+    "rt_os_is_dir": (I8, [SSTRP]),
+    "rt_os_mkdir": (I8, [SSTRP]),
+    "rt_os_rmdir": (I8, [SSTRP]),
+    "rt_os_remove": (I8, [SSTRP]),
+    "rt_os_listdir": (I8, [SSTRP, SLISTP]),
+    "rt_hash_sha256": (VOID, [SSTRP, SSTRP]),
+    "rt_hash_sha1": (VOID, [SSTRP, SSTRP]),
+    "rt_hash_md5": (VOID, [SSTRP, SSTRP]),
+    "rt_hash_sha256_y": (VOID, [I8P, SSTRP]),
+    "rt_hash_sha1_y": (VOID, [I8P, SSTRP]),
+    "rt_hash_md5_y": (VOID, [I8P, SSTRP]),
+    "rt_uuid4": (VOID, [SSTRP]),
+    "rt_secrets_token_hex": (I8, [I64, SSTRP]),
+    "rt_secrets_randbits": (I8, [I64, I64.as_pointer()]),
+    "rt_secrets_token_bytes": (I8, [I64, I8P.as_pointer()]),
+    "rt_secrets_token_urlsafe": (I8, [I64, SSTRP]),
+    "rt_secrets_randbelow": (I8, [I64, I64.as_pointer()]),
+    "rt_zlib_crc32": (I64, [I8P]),
+    "rt_zlib_crc32_seeded": (I64, [I8P, I64]),
+    "rt_zlib_adler32_seeded": (I64, [I8P, I64]),
+    "rt_zlib_adler32": (I64, [I8P]),
+    "rt_zlib_compress": (I8, [I8P, I64, I8P.as_pointer()]),
+    "rt_zlib_decompress": (I8, [I8P, I8P.as_pointer()]),
+    "rt_zlib_deflate": (I8, [I8P, I64, I8P.as_pointer()]),
+    "rt_zlib_inflate": (I8, [I8P, I8P.as_pointer()]),
+    "rt_zlib_gzip_compress": (I8, [I8P, I64, I8P.as_pointer()]),
+    "rt_zlib_gzip_decompress": (I8, [I8P, I8P.as_pointer()]),
+    "rt_sqlite_open": (I8, [SSTRP, I64.as_pointer()]),
+    "rt_sqlite_close": (I8, [I64]),
+    "rt_sqlite_execute": (I8, [I64, SSTRP]),
+    "rt_sqlite_changes": (I8, [I64, I64.as_pointer()]),
+    "rt_sqlite_last_rowid": (I8, [I64, I64.as_pointer()]),
+    "rt_sqlite_prepare": (I8, [I64, SSTRP, I64.as_pointer()]),
+    "rt_sqlite_bind_int": (I8, [I64, I64, I64]),
+    "rt_sqlite_bind_float": (I8, [I64, I64, F64]),
+    "rt_sqlite_bind_text": (I8, [I64, I64, SSTRP]),
+    "rt_sqlite_bind_blob": (I8, [I64, I64, I8P]),
+    "rt_sqlite_bind_null": (I8, [I64, I64]),
+    "rt_sqlite_step": (I8, [I64, I8.as_pointer()]),
+    "rt_sqlite_column_count": (I8, [I64, I64.as_pointer()]),
+    "rt_sqlite_col_type": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_sqlite_col_int": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_sqlite_col_float": (I8, [I64, I64, F64.as_pointer()]),
+    "rt_sqlite_col_text": (I8, [I64, I64, SSTRP]),
+    "rt_sqlite_col_blob": (I8, [I64, I64, I8P.as_pointer()]),
+    "rt_sqlite_reset": (I8, [I64]),
+    "rt_sqlite_finalize": (I8, [I64]),
+    "rt_sock_connect": (I8, [SSTRP, I64, I64, I64.as_pointer()]),
+    "rt_sock_tls_connect": (I8, [SSTRP, I64, I64, I64, I64.as_pointer()]),
+    "rt_sock_listen": (I8, [SSTRP, I64, I64.as_pointer()]),
+    "rt_sock_accept": (I8, [I64, I64.as_pointer()]),
+    "rt_sock_send": (I8, [I64, I8P, I64.as_pointer()]),
+    "rt_sock_recv": (I8, [I64, I64, I8P.as_pointer()]),
+    "rt_sock_shutdown_write": (I8, [I64]),
+    "rt_sock_set_timeout": (I8, [I64, I64]),
+    "rt_sock_local_port": (I8, [I64, I64.as_pointer()]),
+    "rt_sock_close": (I8, [I64]),
+    "rt_sock_udp_bind": (I8, [SSTRP, I64, I64.as_pointer()]),
+    "rt_sock_udp_send_to": (I8, [I64, I8P, SSTRP, I64, I64.as_pointer()]),
+    "rt_sock_udp_recv_from": (I8, [I64, I64, I8P.as_pointer()]),
+    "rt_sock_udp_peer_host": (I8, [I64, SSTRP]),
+    "rt_sock_udp_peer_port": (I8, [I64, I64.as_pointer()]),
+    "rt_bytes_new": (I8P, [I8P, I64]),
+    "rt_pyval_none": (I8P, []),
+    "rt_pyval_bool": (I8P, [I8]),
+    "rt_pyval_int": (I8P, [I64]),
+    "rt_pyval_float": (I8P, [F64]),
+    "rt_pyval_str": (I8P, [SSTRP]),
+    "rt_pyval_bytes": (I8P, [I8P]),
+    "rt_pyval_list_new": (I8P, []),
+    "rt_pyval_list_push": (VOID, [I8P, I8P]),
+    "rt_pyval_dict_new": (I8P, []),
+    "rt_pyval_dict_set": (VOID, [I8P, SSTRP, I8P]),
+    "rt_pyval_clone": (VOID, [I8P]),
+    "rt_pyval_drop": (VOID, [I8P]),
+    "rt_pyval_kind": (VOID, [I8P, SSTRP]),
+    "rt_pyval_truthy": (I8, [I8P]),
+    "rt_pyval_eq": (I8, [I8P, I8P]),
+    "rt_pyval_len": (I8, [I8P, I64.as_pointer()]),
+    "rt_pyval_getitem_i": (I8, [I8P, I64, I8P.as_pointer()]),
+    "rt_pyval_getitem_s": (I8, [I8P, SSTRP, I8P.as_pointer()]),
+    "rt_pyval_getitem_v": (I8, [I8P, I8P, I8P.as_pointer()]),
+    "rt_pyval_contains": (I8, [I8P, I8P, I8.as_pointer()]),
+    "rt_pyval_iter": (I8, [I8P, SLISTP]),
+    "rt_pyval_to_int": (I8, [I8P, I64.as_pointer()]),
+    "rt_pyval_to_float": (I8, [I8P, F64.as_pointer()]),
+    "rt_pyval_to_bytes": (I8, [I8P, I8P.as_pointer()]),
+    "rt_pyval_str_of": (VOID, [I8P, SSTRP]),
+    "rt_pyval_repr": (VOID, [I8P, SSTRP]),
+    "rt_bytes_clone": (VOID, [I8P]),
+    "rt_bytes_drop": (VOID, [I8P]),
+    "rt_bytes_len": (I64, [I8P]),
+    "rt_bytes_index": (I8, [I8P, I64, I64.as_pointer()]),
+    "rt_bytes_slice": (I8P, [I8P, I64, I8, I64, I8]),
+    "rt_bytes_concat": (I8P, [I8P, I8P]),
+    "rt_bytes_repeat": (I8P, [I8P, I64]),
+    "rt_bytes_eq": (I8, [I8P, I8P]),
+    "rt_bytes_cmp": (I32, [I8P, I8P]),
+    "rt_bytes_contains": (I8, [I8P, I8P]),
+    "rt_bytes_find": (I64, [I8P, I8P]),
+    "rt_bytes_count": (I64, [I8P, I8P]),
+    "rt_bytes_startswith": (I8, [I8P, I8P]),
+    "rt_bytes_endswith": (I8, [I8P, I8P]),
+    "rt_bytes_replace": (I8P, [I8P, I8P, I8P]),
+    "rt_bytes_strip": (I8P, [I8P]),
+    "rt_bytes_lstrip": (I8P, [I8P]),
+    "rt_bytes_rstrip": (I8P, [I8P]),
+    "rt_bytes_upper": (I8P, [I8P]),
+    "rt_bytes_lower": (I8P, [I8P]),
+    "rt_bytes_hex": (VOID, [I8P, SSTRP]),
+    "rt_bytes_decode": (I8, [I8P, SSTRP]),
+    "rt_bytes_fromhex": (I8, [SSTRP, I8P.as_pointer()]),
+    "rt_str_encode": (I8P, [SSTRP]),
+    "rt_bytes_from_ints": (I8, [SLISTP, I8P.as_pointer()]),
+    "rt_bytes_zeros": (I8, [I64, I8P.as_pointer()]),
+    "rt_bytes_split": (I8, [I8P, I8P, SLISTP]),
+    "rt_bytes_split_ws": (VOID, [I8P, SLISTP]),
+    "rt_bytes_join": (I8P, [I8P, SLISTP]),
+    "rt_bytes_ints": (VOID, [I8P, SLISTP]),
+    "rt_bytes_repr": (VOID, [I8P, SSTRP]),
+    "rt_ba_push": (I8, [SLISTP, I64]),
+    "rt_ba_extend_b": (VOID, [SLISTP, I8P]),
+    "rt_ba_extend_a": (VOID, [SLISTP, SLISTP]),
+    "rt_ba_get": (I8, [SLISTP, I64, I64.as_pointer()]),
+    "rt_ba_set": (I8, [SLISTP, I64, I64]),
+    "rt_ba_slice": (VOID, [SLISTP, I64, I8, I64, I8, SLISTP]),
+    "rt_ba_to_bytes": (I8P, [SLISTP]),
+    "rt_ba_from_bytes": (VOID, [I8P, SLISTP]),
+    "rt_ba_from_ints": (I8, [SLISTP, SLISTP]),
+    "rt_ba_zeros": (I8, [I64, SLISTP]),
+    "rt_ba_eq": (I8, [SLISTP, SLISTP]),
+    "rt_ba_clone": (VOID, [SLISTP, SLISTP]),
+    "rt_ba_hex": (VOID, [SLISTP, SSTRP]),
+    "rt_ba_decode": (I8, [SLISTP, SSTRP]),
+    "rt_ba_repr": (VOID, [SLISTP, SSTRP]),
+    "rt_ba_ints": (VOID, [SLISTP, SLISTP]),
+    "rt_file_read_bytes": (I8, [I8P, I8P.as_pointer()]),
+    "rt_file_write_bytes": (I8, [I8P, I8P, I64.as_pointer()]),
+    "rt_file_write_ba": (I8, [I8P, SLISTP, I64.as_pointer()]),
 }
 
 CMPFN = ir.FunctionType(I32, [I8P, I8P])
@@ -171,6 +384,9 @@ class LLVMGen:
         self._size_cache: dict[str, int] = {}
         self.di_files: dict[str, object] = {}
         self.di_cu = None
+        self.pending_lambdas: list[dict] = []
+        self.lambda_counter = 0
+        self.thunks: dict[tuple, ir.Function] = {}
         self._setup_debug_info()
 
     # ---------- infrastructure ----------
@@ -264,6 +480,20 @@ class LLVMGen:
         p = gv.gep([ir.Constant(I32, 0), ir.Constant(I32, 0)])
         return p, len(data)
 
+    def _cbytes(self, data: bytes):
+        """(i8* pointer constant, byte length) of an interned raw-bytes constant."""
+        key = "\x00bytes:" + data.hex()
+        if key not in self.strings:
+            ty = ir.ArrayType(I8, max(len(data), 1))
+            gv = ir.GlobalVariable(self.module, ty, name=f".bytes{len(self.strings)}")
+            gv.linkage = "internal"
+            gv.global_constant = True
+            gv.initializer = ir.Constant(ty, bytearray(data) if data else bytearray(b"\x00"))
+            self.strings[key] = gv
+        gv = self.strings[key]
+        p = gv.gep([ir.Constant(I32, 0), ir.Constant(I32, 0)])
+        return p, len(data)
+
     def _lty(self, t: Type) -> ir.Type:
         """LLVM storage type for a Serpentine type."""
         if isinstance(t, TInt):
@@ -290,16 +520,21 @@ class LLVMGen:
                 self.class_types[key] = ir.LiteralStructType(
                     [self._lty(subst_type(info.fields[f], sub)) for f in info.field_order])
             return self.class_types[key]
-        if isinstance(t, (TShared, TWeak, TFile)):
+        if isinstance(t, (TShared, TWeak, TFile, TBytes, TPyVal)):
             return I8P
+        if isinstance(t, TByteArray):
+            return SLIST
         if isinstance(t, TExc):
             return SERR
+        if isinstance(t, TFunc):
+            return SFUNC
         if isinstance(t, TIterObj):
             return ir.LiteralStructType([SLISTP, I64])
         raise LLVMUnsupported(f"no LLVM type for {t}")
 
     def _is_agg(self, t: Type) -> bool:
-        return isinstance(t, (TStr, TList, TDict, TTuple, TOptional, TClass, TExc, TIterObj))
+        return isinstance(t, (TStr, TList, TDict, TTuple, TOptional, TClass, TExc,
+                              TIterObj, TFunc, TByteArray))
 
     def _sizeof(self, t: Type) -> int:
         key = mangle_type(t)
@@ -308,7 +543,8 @@ class LLVMGen:
         return self._size_cache[key]
 
     def _droppable(self, t: Type) -> bool:
-        if isinstance(t, (TStr, TList, TDict, TShared, TWeak, TExc, TFile)):
+        if isinstance(t, (TStr, TList, TDict, TShared, TWeak, TExc, TFile, TFunc,
+                          TBytes, TByteArray, TPyVal)):
             return True
         if isinstance(t, TTuple):
             return any(self._droppable(i) for i in t.items)
@@ -396,6 +632,15 @@ class LLVMGen:
         if isinstance(t, TShared):
             b.call(self._shared_drop_fn(t.inner), [v.ssa])
             return
+        if isinstance(t, TBytes):
+            b.call(self._rt("rt_bytes_drop"), [v.ssa])
+            return
+        if isinstance(t, TPyVal):
+            b.call(self._rt("rt_pyval_drop"), [v.ssa])
+            return
+        if isinstance(t, TByteArray):
+            b.call(self._rt("rt_list_free"), [v.ptr, ir.Constant(I64, 1)])
+            return
         if isinstance(t, TWeak):
             b.call(self._weak_drop_fn(t.inner), [v.ssa])
             return
@@ -404,6 +649,19 @@ class LLVMGen:
             m = b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
             b.call(self._rt("rt_str_drop"), [k])
             b.call(self._rt("rt_str_drop"), [m])
+            return
+        if isinstance(t, TFunc):
+            env = b.load(b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+            nonnull = b.icmp_unsigned("!=", env, ir.Constant(I8P, None))
+            with b.if_then(nonnull):
+                rcp = b.bitcast(env, I64.as_pointer())
+                rc = b.sub(b.load(rcp), ir.Constant(I64, 1))
+                b.store(rc, rcp)
+                dead = b.icmp_signed("==", rc, ir.Constant(I64, 0))
+                with b.if_then(dead):
+                    dpp = b.bitcast(b.gep(env, [ir.Constant(I64, 8)]),
+                                    DTORTY.as_pointer().as_pointer())
+                    b.call(b.load(dpp), [env])
             return
         if isinstance(t, (TList, TDict)):
             b.call(self._drop_fn(t), [v.ptr])
@@ -505,7 +763,7 @@ class LLVMGen:
     # ----- clone -----
 
     def _clone_scalar(self, b: ir.IRBuilder, t: Type, ssa):
-        """Clone a handle scalar (Shared/Weak): bump the refcount."""
+        """Clone a handle scalar (Shared/Weak/bytes): bump the refcount."""
         if isinstance(t, TShared):
             p = b.bitcast(ssa, I64.as_pointer())
             b.store(b.add(b.load(p), ir.Constant(I64, 1)), p)
@@ -513,6 +771,12 @@ class LLVMGen:
         if isinstance(t, TWeak):
             p = b.gep(b.bitcast(ssa, I64.as_pointer()), [ir.Constant(I64, 1)])
             b.store(b.add(b.load(p), ir.Constant(I64, 1)), p)
+            return ssa
+        if isinstance(t, TBytes):
+            b.call(self._rt("rt_bytes_clone"), [ssa])
+            return ssa
+        if isinstance(t, TPyVal):
+            b.call(self._rt("rt_pyval_clone"), [ssa])
             return ssa
         return ssa
 
@@ -526,6 +790,20 @@ class LLVMGen:
                 s = b.gep(src_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)])
                 d = b.gep(dst_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)])
                 b.call(self._rt("rt_str_clone"), [s, d])
+            return
+        if isinstance(t, TFunc):
+            for i in (0, 1):
+                s = b.gep(src_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)])
+                d = b.gep(dst_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)])
+                b.store(b.load(s), d)
+            env = b.load(b.gep(dst_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+            nonnull = b.icmp_unsigned("!=", env, ir.Constant(I8P, None))
+            with b.if_then(nonnull):
+                rcp = b.bitcast(env, I64.as_pointer())
+                b.store(b.add(b.load(rcp), ir.Constant(I64, 1)), rcp)
+            return
+        if isinstance(t, TByteArray):
+            b.call(self._rt("rt_ba_clone"), [src_ptr, dst_ptr])
             return
         if isinstance(t, (TList, TDict)):
             b.call(self._clone_fn(t), [src_ptr, dst_ptr])
@@ -562,7 +840,7 @@ class LLVMGen:
             self._clone_into(b, t, src_ptr, dst_ptr)
             return
         val = b.load(src_ptr)
-        if isinstance(t, (TShared, TWeak)):
+        if isinstance(t, (TShared, TWeak, TPyVal)):
             val = self._clone_scalar(b, t, val)
         b.store(val, dst_ptr)
 
@@ -611,6 +889,15 @@ class LLVMGen:
             return b.fcmp_ordered("==", a.ssa, c.ssa)
         if isinstance(t, TStr):
             r = b.call(self._rt("rt_str_eq"), [a.ptr, c.ptr])
+            return b.trunc(r, I1)
+        if isinstance(t, TBytes):
+            r = b.call(self._rt("rt_bytes_eq"), [a.ssa, c.ssa])
+            return b.trunc(r, I1)
+        if isinstance(t, TPyVal):
+            r = b.call(self._rt("rt_pyval_eq"), [a.ssa, c.ssa])
+            return b.trunc(r, I1)
+        if isinstance(t, TByteArray):
+            r = b.call(self._rt("rt_ba_eq"), [a.ptr, c.ptr])
             return b.trunc(r, I1)
         if isinstance(t, TNone):
             return ir.Constant(I1, 1)
@@ -743,6 +1030,8 @@ class LLVMGen:
     def _cmp_ptrs(self, b: ir.IRBuilder, t: Type, ap, cp):
         if isinstance(t, TStr):
             return b.call(self._rt("rt_str_cmp"), [ap, cp])
+        if isinstance(t, TBytes):
+            return b.call(self._rt("rt_bytes_cmp"), [b.load(ap), b.load(cp)])
         if isinstance(t, (TInt, TBool)):
             a = b.load(ap)
             c = b.load(cp)
@@ -839,6 +1128,25 @@ class LLVMGen:
         if isinstance(t, TWeak):
             self._push_bytes(b, sb, "<weak>")
             return
+        if isinstance(t, TBytes):
+            tmp = b.alloca(SSTR)
+            b.call(self._rt("rt_bytes_repr"), [v.ssa, tmp])
+            b.call(self._rt("rt_sb_push_str"), [sb, tmp])
+            b.call(self._rt("rt_str_drop"), [tmp])
+            return
+        if isinstance(t, TPyVal):
+            tmp = b.alloca(SSTR)
+            fn2 = "rt_pyval_repr" if as_repr else "rt_pyval_str_of"
+            b.call(self._rt(fn2), [v.ssa, tmp])
+            b.call(self._rt("rt_sb_push_str"), [sb, tmp])
+            b.call(self._rt("rt_str_drop"), [tmp])
+            return
+        if isinstance(t, TByteArray):
+            tmp = b.alloca(SSTR)
+            b.call(self._rt("rt_ba_repr"), [v.ptr, tmp])
+            b.call(self._rt("rt_sb_push_str"), [sb, tmp])
+            b.call(self._rt("rt_str_drop"), [tmp])
+            return
         if isinstance(t, (TList, TDict, TTuple, TClass)):
             b.call(self._repr_fn(t), [sb, v.ptr])
             return
@@ -897,6 +1205,19 @@ class LLVMGen:
                 return
             assert isinstance(t, TClass)
             info = self.tc.classes[(t.module, t.name)]
+            msig = self.tc.sigs.get((t.module, f"{t.name}.__repr__"))
+            if msig is not None and not msig.is_template and not info.typevars:
+                res = b.call(self.funcs[(t.module, msig.name)], [vp])
+                err = b.extract_value(res, 0)
+                with b.if_then(err):
+                    b.call(self._rt("rt_abort_pending"), [])
+                    b.unreachable()
+                tmp = b.alloca(SSTR)
+                b.store(b.extract_value(res, 1), tmp)
+                b.call(self._rt("rt_sb_push_str"), [sb, tmp])
+                b.call(self._rt("rt_str_drop"), [tmp])
+                b.ret_void()
+                return
             sub = dict(zip(info.typevars, t.args))
             self._push_bytes(b, sb, f"{info.name}(")
             for i, f in enumerate(info.field_order):
@@ -925,6 +1246,8 @@ class LLVMGen:
             self._declare_function(sig)
         for sig in sigs:
             self._emit_function(sig)
+        while self.pending_lambdas:
+            self._emit_lambda_fn(self.pending_lambdas.pop(0))
         entry = self.tc.program.entry
         if entry.entry_call is None:
             raise LLVMUnsupported("no entry point")
@@ -943,6 +1266,153 @@ class LLVMGen:
             mb.call(se, [])
             mb.ret(ir.Constant(I32, 0))
         return self.module
+
+    def _closure_fnty(self, ft: TFunc) -> ir.FunctionType:
+        """The LLVM function type behind a Callable value (env first, then params)."""
+        retty = I1 if isinstance(ft.ret, TNone) else \
+            ir.LiteralStructType([I1, self._lty(ft.ret)])
+        return ir.FunctionType(retty, [I8P] + [self._lty(p) for p in ft.params])
+
+    def _func_thunk(self, key: tuple[str, str], ft: TFunc) -> ir.Function:
+        """An env-discarding forwarder so a module function fits the closure ABI."""
+        tkey = (key, mangle_type(ft))
+        if tkey in self.thunks:
+            return self.thunks[tkey]
+        name = self._sanitize(f"thunk_{key[0]}_{key[1]}_{mangle_type(ft)}")
+        fn = ir.Function(self.module, self._closure_fnty(ft), name=name)
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        res = b.call(self.funcs[key], list(fn.args)[1:])
+        b.ret(res)
+        self.thunks[tkey] = fn
+        return fn
+
+    def _lambda_value(self, node: ast.Lambda) -> V:
+        """Materialize a capturing lambda: heap env {rc, dtor, caps...} + fn ptr."""
+        ft = self._t(node)
+        assert isinstance(ft, TFunc)
+        caps = self.tc.lambda_caps.get(id(node), [])
+        n = self.lambda_counter
+        self.lambda_counter += 1
+        envty = ir.LiteralStructType([I64, I8P] + [self._lty(t) for _, t in caps])
+        fn = ir.Function(self.module, self._closure_fnty(ft), name=f"lam_{n}")
+        fn.linkage = "internal"
+        dtor = ir.Function(self.module, DTORTY, name=f"lam_dtor_{n}")
+        dtor.linkage = "internal"
+        self.pending_lambdas.append({"node": node, "ft": ft, "caps": caps, "fn": fn,
+                                     "dtor": dtor, "envty": envty, "mod": self.mod})
+        b = self.b
+        size = envty.get_abi_size(self.td)
+        envp = b.call(self._rt("rt_shared_alloc"), [ir.Constant(I64, size)])
+        tenv = b.bitcast(envp, envty.as_pointer())
+        b.store(ir.Constant(I64, 1),
+                b.gep(tenv, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+        b.store(b.bitcast(dtor, I8P),
+                b.gep(tenv, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+        for i, (cname, ct) in enumerate(caps):
+            bind = self.bindings[cname]
+            src = bind["ptr"]
+            if bind["ref"]:
+                src = b.load(src)
+            dst = b.gep(tenv, [ir.Constant(I32, 0), ir.Constant(I32, 2 + i)])
+            self._clone_any(b, ct, src, dst)
+        tmp = self._temp(ft)
+        b.store(b.bitcast(fn, I8P),
+                b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+        b.store(envp, b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+        return tmp
+
+    def _func_value_call(self, node: ast.Call, ft: TFunc) -> V:
+        """Call through a Callable value: unpack {fn, env} and dispatch."""
+        fv = self._expr(node.func, "ref")
+        fnp = self.b.load(self.b.gep(fv.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+        envp = self.b.load(self.b.gep(fv.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+        fnc = self.b.bitcast(fnp, self._closure_fnty(ft).as_pointer())
+        args = [envp]
+        for a, pt in zip(node.args, ft.params):
+            args.append(self._arg_value(a, Param(name="", conv="copy", typ=pt)))
+        return self._finish_call(fnc, args, ft.ret)
+
+    def _emit_lambda_fn(self, rec: dict) -> None:
+        """Emit a deferred lambda body as its own internal function."""
+        fn, ft, caps, lnode, envty = rec["fn"], rec["ft"], rec["caps"], rec["node"], rec["envty"]
+        self.fn = fn
+        self.mod = rec["mod"]
+        self.sig = FuncSig(module=self.mod.name, name=fn.name,
+                           params=[Param(name=a.arg, conv="copy", typ=pt)
+                                   for a, pt in zip(lnode.args.args, ft.params)],
+                           ret=ft.ret, node=lnode)
+        self.entry_block = fn.append_basic_block("entry")
+        self.body_block = fn.append_basic_block("body")
+        self.b = ir.IRBuilder(self.body_block)
+        self.bindings = {}
+        self.func_drops = []
+        self.try_ctx = []
+        self.cur_exc = []
+        self.loop_stack = []
+        self.stmt_temps = []
+        self.active_borrows = []
+        self.try_counter = 0
+        self.raise_blocks = {}
+        self.di_sub = None
+        self.errflag_slot = self._entry_alloca(I1, name="errflag")
+        self.b.store(ir.Constant(I1, 0), self.errflag_slot)
+        if not isinstance(ft.ret, TNone):
+            self.ret_slot = self._entry_alloca(self._lty(ft.ret), name="retval")
+            self.b.store(ir.Constant(self._lty(ft.ret), None), self.ret_slot)
+        else:
+            self.ret_slot = None
+        self.exit_block = fn.append_basic_block("func.exit")
+        self.err_return_block = fn.append_basic_block("func.err")
+
+        tenv = self.b.bitcast(fn.args[0], envty.as_pointer())
+        for i, (cname, ct) in enumerate(caps):
+            p = self.b.gep(tenv, [ir.Constant(I32, 0), ir.Constant(I32, 2 + i)])
+            self.bindings[cname] = {"ptr": p, "ty": ct, "ref": False, "flag": None}
+        for a, pt, arg in zip(lnode.args.args, ft.params, list(fn.args)[1:]):
+            arg.name = f"a_{a.arg}"
+            bind = self._make_binding(a.arg, pt)
+            self.b.store(arg, bind["ptr"])
+            if bind["flag"] is not None:
+                self.b.store(ir.Constant(I1, 1), bind["flag"])
+
+        ret = ast.Return(value=lnode.body)
+        ast.copy_location(ret, lnode.body)
+        ast.fix_missing_locations(ret)
+        self._emit_stmt(ret)
+        if not self.b.block.is_terminated:
+            self.b.branch(self.exit_block)
+
+        b = ir.IRBuilder(self.err_return_block)
+        b.store(ir.Constant(I1, 1), self.errflag_slot)
+        b.branch(self.exit_block)
+        eb = ir.IRBuilder(self.entry_block)
+        eb.position_at_end(self.entry_block)
+        eb.branch(self.body_block)
+
+        b = ir.IRBuilder(self.exit_block)
+        for bind in reversed(self.func_drops):
+            flagged = b.load(bind["flag"])
+            with b.if_then(flagged):
+                self._drop(b, bind["ty"], self._as_v(b, bind["ty"], bind["ptr"]))
+        flag = b.load(self.errflag_slot)
+        if isinstance(ft.ret, TNone):
+            b.ret(flag)
+        else:
+            res = ir.Constant(ir.LiteralStructType([I1, self._lty(ft.ret)]), None)
+            res = b.insert_value(res, flag, 0)
+            res = b.insert_value(res, b.load(self.ret_slot), 1)
+            b.ret(res)
+
+        db = ir.IRBuilder(rec["dtor"].append_basic_block("entry"))
+        denv = db.bitcast(rec["dtor"].args[0], envty.as_pointer())
+        for i, (cname, ct) in enumerate(caps):
+            if self._droppable(ct):
+                p = db.gep(denv, [ir.Constant(I32, 0), ir.Constant(I32, 2 + i)])
+                self._drop(db, ct, self._as_v(db, ct, p))
+        db.call(self._rt("rt_shared_free"),
+                [rec["dtor"].args[0], ir.Constant(I64, envty.get_abi_size(self.td))])
+        db.ret_void()
 
     def _fnty(self, sig: FuncSig) -> ir.FunctionType:
         argtys = []
@@ -966,7 +1436,7 @@ class LLVMGen:
     def _loop_bound_names(self, fn: ast.FunctionDef) -> set[str]:
         names = set()
         for node in ast.walk(fn):
-            if isinstance(node, ast.For):
+            if isinstance(node, ast.For) and id(node) not in self.tc.for_lowered:
                 targets = [node.target] if isinstance(node.target, ast.Name) \
                     else list(node.target.elts)
                 for t in targets:
@@ -1263,6 +1733,10 @@ class LLVMGen:
         self.b.call(self._rt("rt_str_drop"), [out])
 
     def _emit_assign(self, stmt) -> None:
+        oc = self.tc.op_calls.get(id(stmt))
+        if oc is not None:
+            self._call(oc, "val")
+            return
         target = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
         assert stmt.value is not None
         bind = self.tc.elem_borrow_binds.get(id(stmt))
@@ -1308,6 +1782,13 @@ class LLVMGen:
                 if self._droppable(elem):
                     self._drop(self.b, elem, self._as_v(self.b, elem, p))
                 self._store_into(p, v)
+                return
+            if isinstance(inner, TByteArray):
+                recv = self._recv(target.value, True)
+                idx = self._expr(target.slice, "val").ssa
+                v = self._expr(stmt.value, "val").ssa
+                st = self.b.call(self._rt("rt_ba_set"), [recv.ptr, idx, v])
+                self._check_err_i8(st)
                 return
             assert isinstance(inner, TDict)
             v = self._coerce(self._expr(stmt.value, "val", expect=inner.value), inner.value)
@@ -1364,10 +1845,18 @@ class LLVMGen:
             self._drop(self.b, t, self._as_v(self.b, t, p))
         self._store_into(p, self._coerce(res, t))
 
+    def _cond_i1(self, test: ast.expr):
+        """Evaluate a condition to i1, applying PyVal truthiness."""
+        v = self._expr(test, "val")
+        if isinstance(v.ty, TPyVal):
+            r = self.b.call(self._rt("rt_pyval_truthy"), [v.ssa])
+            return self.b.trunc(r, I1)
+        return v.ssa
+
     def _emit_if(self, s: ast.If) -> None:
         mark_t = len(self.stmt_temps)
         mark_b = len(self.active_borrows)
-        cond = self._expr(s.test, "val").ssa
+        cond = self._cond_i1(s.test)
         self._drain(mark_t, mark_b)
         then_b = self.fn.append_basic_block("then")
         else_b = self.fn.append_basic_block("else") if s.orelse else None
@@ -1392,7 +1881,7 @@ class LLVMGen:
         self.b.position_at_end(head)
         mark_t = len(self.stmt_temps)
         mark_b = len(self.active_borrows)
-        cond = self._expr(s.test, "val").ssa
+        cond = self._cond_i1(s.test)
         self._drain(mark_t, mark_b)
         self.b.cbranch(cond, body, exit_b)
         self.b.position_at_end(body)
@@ -1499,9 +1988,13 @@ class LLVMGen:
             self.b.cbranch(was_set, dispatch, hjoin)
             self.b.position_at_end(dispatch)
             for h in s.handlers:
-                classes = ["Exception"] if h.type is None else (
+                named = ["Exception"] if h.type is None else (
                     [h.type.id] if isinstance(h.type, ast.Name)
                     else [el.id for el in h.type.elts if isinstance(el, ast.Name)])
+                classes: list[str] = []
+                for c in named:
+                    classes += [n for n in exc_handler_names(c, self.tc.user_exc)
+                                if n not in classes]
                 cond = ir.Constant(I1, 0)
                 for c in classes:
                     cp, cl = self._cstr(c)
@@ -1552,6 +2045,14 @@ class LLVMGen:
     # ---------- loops (for + comprehensions) ----------
 
     def _emit_for(self, s: ast.For) -> None:
+        lowered = self.tc.for_lowered.get(id(s))
+        if lowered is not None:
+            for name in self.tc.for_lowered_names.get(id(s), []):
+                if name not in self.bindings:
+                    self._make_binding(name, self.facts.locals[name])
+            for st in lowered:
+                self._emit_stmt(st)
+            return
         kind = self.tc.loop_iter_kind.get(id(s), "list")
         targets = [s.target] if isinstance(s.target, ast.Name) else list(s.target.elts)
         names = [t.id for t in targets if isinstance(t, ast.Name)]
@@ -1636,6 +2137,24 @@ class LLVMGen:
                 src = self._expr(iter_node, "ref")
                 seq = self._chars_temp(src)
                 elem_t = TStr()
+            elif kind in ("bytes", "bytearray"):
+                src = self._expr(iter_node, "ref")
+                tmp = self._temp(TList(TInt()))
+                self.b.store(ir.Constant(SLIST, None), tmp.ptr)
+                if kind == "bytes":
+                    self.b.call(self._rt("rt_bytes_ints"), [src.ssa, tmp.ptr])
+                else:
+                    self.b.call(self._rt("rt_ba_ints"), [src.ptr, tmp.ptr])
+                seq = tmp
+                elem_t = TInt()
+            elif kind == "pyval":
+                src = self._expr(iter_node, "ref")
+                tmp = self._temp(TList(TPyVal()))
+                self.b.store(ir.Constant(SLIST, None), tmp.ptr)
+                st = self.b.call(self._rt("rt_pyval_iter"), [src.ssa, tmp.ptr])
+                self._check_err_i8(st)
+                seq = tmp
+                elem_t = TPyVal()
             else:
                 seq = self._expr(iter_node, "ref")
                 it_t = self._t(iter_node)
@@ -1763,9 +2282,99 @@ class LLVMGen:
             return tmp
         if isinstance(dst, TFloat) and isinstance(src, TInt):
             return V(dst, ssa=self.b.sitofp(v.ssa, F64))
+        if isinstance(dst, TPyVal) and not isinstance(src, TPyVal):
+            if isinstance(src, TNone):
+                h = self.b.call(self._rt("rt_pyval_none"), [])
+                return self._register_temp_ssa(dst, h)
+            if v.ptr is not None:
+                p = v.ptr
+            else:
+                p = self._entry_alloca(self._lty(src))
+                self.b.store(v.ssa, p)
+            h = self.b.call(self._pyval_from_fn(src), [p])
+            return self._register_temp_ssa(TPyVal(), h)
         return v
 
+    def _pyval_from_fn(self, t: Type) -> ir.Function:
+        """i8* topyval_T(T*): convert a typed storage slot into a fresh PyVal."""
+
+        def body(b, fn):
+            src = fn.args[0]
+            if isinstance(t, TBool):
+                b.ret(b.call(self._rt("rt_pyval_bool"), [b.zext(b.load(src), I8)]))
+                return
+            if isinstance(t, TInt):
+                b.ret(b.call(self._rt("rt_pyval_int"), [b.load(src)]))
+                return
+            if isinstance(t, TFloat):
+                b.ret(b.call(self._rt("rt_pyval_float"), [b.load(src)]))
+                return
+            if isinstance(t, TStr):
+                b.ret(b.call(self._rt("rt_pyval_str"), [src]))
+                return
+            if isinstance(t, TBytes):
+                b.ret(b.call(self._rt("rt_pyval_bytes"), [b.load(src)]))
+                return
+            if isinstance(t, TList):
+                h = b.call(self._rt("rt_pyval_list_new"), [])
+                n = self._list_len(b, src)
+                idx = b.alloca(I64)
+                b.store(ir.Constant(I64, 0), idx)
+                head = fn.append_basic_block("head")
+                loop = fn.append_basic_block("loop")
+                done = fn.append_basic_block("done")
+                b.branch(head)
+                b.position_at_end(head)
+                i = b.load(idx)
+                b.cbranch(b.icmp_signed("<", i, n), loop, done)
+                b.position_at_end(loop)
+                p = self._elem_ptr(b, src, t.elem, i)
+                eh = b.call(self._pyval_from_fn(t.elem), [p])
+                b.call(self._rt("rt_pyval_list_push"), [h, eh])
+                b.call(self._rt("rt_pyval_drop"), [eh])
+                b.store(b.add(i, ir.Constant(I64, 1)), idx)
+                b.branch(head)
+                b.position_at_end(done)
+                b.ret(h)
+                return
+            if isinstance(t, TDict):
+                elem = self._elem_of(t)
+                h = b.call(self._rt("rt_pyval_dict_new"), [])
+                n = self._list_len(b, src)
+                idx = b.alloca(I64)
+                b.store(ir.Constant(I64, 0), idx)
+                head = fn.append_basic_block("head")
+                loop = fn.append_basic_block("loop")
+                done = fn.append_basic_block("done")
+                b.branch(head)
+                b.position_at_end(head)
+                i = b.load(idx)
+                b.cbranch(b.icmp_signed("<", i, n), loop, done)
+                b.position_at_end(loop)
+                p = self._elem_ptr(b, src, elem, i)
+                kp = b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 0)])
+                vp = b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
+                eh = b.call(self._pyval_from_fn(t.value), [vp])
+                b.call(self._rt("rt_pyval_dict_set"), [h, kp, eh])
+                b.call(self._rt("rt_pyval_drop"), [eh])
+                b.store(b.add(i, ir.Constant(I64, 1)), idx)
+                b.branch(head)
+                b.position_at_end(done)
+                b.ret(h)
+                return
+            if isinstance(t, TPyVal):
+                v0 = b.load(src)
+                b.call(self._rt("rt_pyval_clone"), [v0])
+                b.ret(v0)
+                return
+            raise LLVMUnsupported(f"cannot convert {t} to PyVal")
+
+        return self._helper("topyval", t, [self._lty(t).as_pointer()], I8P, body)
+
     def _expr(self, node: ast.expr, mode: str, expect: Type | None = None) -> V:
+        oc = self.tc.op_calls.get(id(node))
+        if oc is not None:
+            return self._call(oc, mode)
         if isinstance(node, (ast.ListComp, ast.DictComp)):
             return self._comp_expr(node)
         if isinstance(node, ast.Constant):
@@ -1822,7 +2431,7 @@ class LLVMGen:
         if isinstance(node, ast.Attribute):
             return self._attribute(node, mode)
         if isinstance(node, ast.Lambda):
-            raise LLVMUnsupported("bare lambda")
+            return self._lambda_value(node)
         raise LLVMUnsupported(f"expression {type(node).__name__}")
 
     def _const(self, node: ast.Constant) -> V:
@@ -1838,17 +2447,35 @@ class LLVMGen:
             p, n = self._cstr(v)
             self.b.call(self._rt("rt_str_new"), [p, ir.Constant(I64, n), tmp.ptr])
             return tmp
+        if isinstance(v, bytes):
+            p, n = self._cbytes(v)
+            h = self.b.call(self._rt("rt_bytes_new"), [p, ir.Constant(I64, n)])
+            return self._register_temp_ssa(TBytes(), h)
         if v is None:
             return V(TNone(), ssa=ir.Constant(I1, 0))
         raise LLVMUnsupported(f"literal {v!r}")
 
     def _name(self, node: ast.Name, mode: str) -> V:
         name = node.id
+        fref = self.tc.func_value_refs.get(id(node))
+        if fref is not None:
+            ft = self._t(node)
+            assert isinstance(ft, TFunc)
+            thunk = self._func_thunk(fref, ft)
+            tmp = self._temp(ft)
+            self.b.store(self.b.bitcast(thunk, I8P),
+                         self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            self.b.store(ir.Constant(I8P, None),
+                         self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+            return tmp
         bind = self.bindings.get(name)
         if bind is None:
-            const = self.tc.constants.get((self.mod.name, name))
+            cmod, cname = self.mod.name, name
+            if (cmod, cname) not in self.tc.constants and name in self.mod.imports:
+                cmod, cname = self.mod.imports[name]
+            const = self.tc.constants.get((cmod, cname))
             if const is not None:
-                cnode = self.mod.constants[name].value
+                cnode = self.tc.program.modules[cmod].constants[cname].value
                 assert isinstance(cnode, ast.Constant)
                 self.tc.expr_types[id(cnode)] = const
                 return self._const(cnode)
@@ -1878,6 +2505,9 @@ class LLVMGen:
             return V(t, ssa=self.b.load(ptr))
         if isinstance(t, (TShared, TWeak)):
             return V(t, ssa=self._clone_scalar(self.b, t, self.b.load(ptr)))
+        if isinstance(t, (TBytes, TPyVal)):
+            return self._register_temp_ssa(
+                t, self._clone_scalar(self.b, t, self.b.load(ptr)))
         if isinstance(t, TFile):
             if moveable is not None:
                 self.b.store(ir.Constant(I1, 0), moveable)
@@ -2025,6 +2655,54 @@ class LLVMGen:
             st = self.b.call(self._rt("rt_str_index"), [recv.ptr, idx, tmp.ptr])
             self._check_err_i8(st)
             return tmp
+        if isinstance(inner0, TBytes):
+            recv = self._expr(node.value, "ref")
+            if isinstance(node.slice, ast.Slice):
+                lo = node.slice.lower
+                hi = node.slice.upper
+                lov = self._expr(lo, "val").ssa if lo is not None else ir.Constant(I64, 0)
+                hiv = self._expr(hi, "val").ssa if hi is not None else ir.Constant(I64, 0)
+                h = self.b.call(self._rt("rt_bytes_slice"),
+                                [recv.ssa, lov, ir.Constant(I8, 1 if lo is not None else 0),
+                                 hiv, ir.Constant(I8, 1 if hi is not None else 0)])
+                return self._register_temp_ssa(TBytes(), h)
+            idx = self._expr(node.slice, "val").ssa
+            out = self._entry_alloca(I64)
+            st = self.b.call(self._rt("rt_bytes_index"), [recv.ssa, idx, out])
+            self._check_err_i8(st)
+            return V(TInt(), ssa=self.b.load(out))
+        if isinstance(inner0, TByteArray):
+            recv = self._recv(node.value, False)
+            if isinstance(node.slice, ast.Slice):
+                lo = node.slice.lower
+                hi = node.slice.upper
+                lov = self._expr(lo, "val").ssa if lo is not None else ir.Constant(I64, 0)
+                hiv = self._expr(hi, "val").ssa if hi is not None else ir.Constant(I64, 0)
+                tmp = self._temp(TByteArray())
+                self.b.call(self._rt("rt_ba_slice"),
+                            [recv.ptr, lov, ir.Constant(I8, 1 if lo is not None else 0),
+                             hiv, ir.Constant(I8, 1 if hi is not None else 0), tmp.ptr])
+                return tmp
+            idx = self._expr(node.slice, "val").ssa
+            out = self._entry_alloca(I64)
+            st = self.b.call(self._rt("rt_ba_get"), [recv.ptr, idx, out])
+            self._check_err_i8(st)
+            return V(TInt(), ssa=self.b.load(out))
+        if isinstance(inner0, TPyVal):
+            recv = self._expr(node.value, "ref")
+            idx_t = self._t(node.slice)
+            out = self._entry_alloca(I8P)
+            if isinstance(idx_t, TStr):
+                idx = self._expr(node.slice, "ref")
+                st = self.b.call(self._rt("rt_pyval_getitem_s"), [recv.ssa, idx.ptr, out])
+            elif isinstance(idx_t, TPyVal):
+                idx = self._expr(node.slice, "ref")
+                st = self.b.call(self._rt("rt_pyval_getitem_v"), [recv.ssa, idx.ssa, out])
+            else:
+                idx = self._expr(node.slice, "val")
+                st = self.b.call(self._rt("rt_pyval_getitem_i"), [recv.ssa, idx.ssa, out])
+            self._check_err_i8(st)
+            return self._register_temp_ssa(TPyVal(), self.b.load(out))
         if isinstance(inner0, TTuple):
             assert isinstance(node.slice, ast.Constant)
             i = node.slice.value
@@ -2188,6 +2866,15 @@ class LLVMGen:
             tmp = self._temp(TStr())
             self.b.call(self._rt("rt_str_concat"), [l.ptr, r.ptr, tmp.ptr])
             return tmp
+        if isinstance(lt, TBytes) and isinstance(rt, TBytes) and isinstance(op, ast.Add):
+            h = self.b.call(self._rt("rt_bytes_concat"), [l.ssa, r.ssa])
+            return self._register_temp_ssa(TBytes(), h)
+        if isinstance(op, ast.Mult) and isinstance(lt, TBytes) and isinstance(rt, TInt):
+            h = self.b.call(self._rt("rt_bytes_repeat"), [l.ssa, r.ssa])
+            return self._register_temp_ssa(TBytes(), h)
+        if isinstance(op, ast.Mult) and isinstance(lt, TInt) and isinstance(rt, TBytes):
+            h = self.b.call(self._rt("rt_bytes_repeat"), [r.ssa, l.ssa])
+            return self._register_temp_ssa(TBytes(), h)
         both_int = isinstance(lt, TInt) and isinstance(rt, TInt)
         zero = ir.Constant(I64, 0)
         if both_int and not isinstance(op, ast.Div):
@@ -2299,6 +2986,9 @@ class LLVMGen:
                 return V(TFloat(), ssa=ir.Constant(F64, -v))
         v = self._expr(node.operand, "val")
         if isinstance(node.op, ast.Not):
+            if isinstance(t, TPyVal):
+                r = self.b.call(self._rt("rt_pyval_truthy"), [v.ssa])
+                return V(TBool(), ssa=self.b.not_(self.b.trunc(r, I1)))
             return V(TBool(), ssa=self.b.not_(v.ssa))
         if isinstance(node.op, ast.USub):
             if isinstance(t, TInt):
@@ -2338,6 +3028,9 @@ class LLVMGen:
             return self.b.not_(e) if isinstance(op, ast.NotEq) else e
         table = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">="}
         sym = table[type(op)]
+        if isinstance(lt, TBytes):
+            c = self.b.call(self._rt("rt_bytes_cmp"), [l.ssa, r.ssa])
+            return self.b.icmp_signed(sym, c, ir.Constant(I32, 0))
         if isinstance(lt, TStr):
             c = self.b.call(self._rt("rt_str_cmp"), [l.ptr, r.ptr])
             return self.b.icmp_signed(sym, c, ir.Constant(I32, 0))
@@ -2360,6 +3053,18 @@ class LLVMGen:
             return V(TBool(), ssa=r)
         if isinstance(op0, (ast.In, ast.NotIn)):
             ct = self._t(e.comparators[0])
+            if isinstance(ct, TPyVal):
+                recv = self._expr(e.comparators[0], "ref")
+                needle = self._coerce(self._expr(e.left, "val", expect=TPyVal()),
+                                      TPyVal())
+                out = self._entry_alloca(I8)
+                st = self.b.call(self._rt("rt_pyval_contains"),
+                                 [recv.ssa, needle.ssa, out])
+                self._check_err_i8(st)
+                res = self.b.trunc(self.b.load(out), I1)
+                if isinstance(op0, ast.NotIn):
+                    res = self.b.not_(res)
+                return V(TBool(), ssa=res)
             if isinstance(ct, TShared):
                 recv = self._recv(e.comparators[0], False)
                 ct = ct.inner
@@ -2369,6 +3074,9 @@ class LLVMGen:
             needle = self._expr(e.left, "ref" if self._is_agg(needle_t) else "val")
             if isinstance(ct, TStr):
                 r = self.b.call(self._rt("rt_str_contains"), [recv.ptr, needle.ptr])
+                res = self.b.trunc(r, I1)
+            elif isinstance(ct, TBytes):
+                r = self.b.call(self._rt("rt_bytes_contains"), [recv.ssa, needle.ssa])
                 res = self.b.trunc(r, I1)
             elif isinstance(ct, TDict):
                 found, _ = self._dict_scan(recv.ptr, ct, needle)
@@ -2391,6 +3099,18 @@ class LLVMGen:
                 res = self.b.not_(res)
             return V(TBool(), ssa=res)
         operands = [e.left] + list(e.comparators)
+        if any(isinstance(self._t(o), TPyVal) for o in operands):
+            pvals = [self._coerce(self._expr(o, "val", expect=TPyVal()), TPyVal())
+                     for o in operands]
+            acc = None
+            for i, op in enumerate(e.ops):
+                r = self.b.call(self._rt("rt_pyval_eq"),
+                                [pvals[i].ssa, pvals[i + 1].ssa])
+                c = self.b.trunc(r, I1)
+                if isinstance(op, ast.NotEq):
+                    c = self.b.not_(c)
+                acc = c if acc is None else self.b.and_(acc, c)
+            return V(TBool(), ssa=acc)
         vals = []
         for o in operands:
             t = self._t(o)
@@ -2519,6 +3239,9 @@ class LLVMGen:
     # ---------- calls ----------
 
     def _call(self, node: ast.Call, mode: str) -> V:
+        ftv = self.tc.expr_types.get(id(node.func))
+        if isinstance(ftv, TFunc):
+            return self._func_value_call(node, ftv)
         if isinstance(node.func, ast.Attribute):
             return self._method_call(node)
         assert isinstance(node.func, ast.Name)
@@ -2557,6 +3280,11 @@ class LLVMGen:
                 self.b.store(w, self.b.gep(out.ptr,
                                            [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
             return out
+        if name == "pyval_kind":
+            v = self._expr(node.args[0], "ref")
+            tmp = self._temp(TStr())
+            self.b.call(self._rt("rt_pyval_kind"), [v.ssa, tmp.ptr])
+            return tmp
         if name == "open":
             path = self._expr(node.args[0], "ref")
             if len(node.args) > 1:
@@ -2568,6 +3296,8 @@ class LLVMGen:
             st = self.b.call(self._rt("rt_file_open"), [path.ptr, fmode.ptr, hslot])
             self._check_err_i8(st)
             return self._register_temp_ssa(TFile(), self.b.load(hslot))
+        if name in self.mod.rtlib_imports:
+            return self._rtlib_call(node, self.mod.rtlib_imports[name])
         target = self.tc.call_targets.get(id(node))
         if target is not None:
             return self._user_call(node, self.tc.sigs[target])
@@ -2575,6 +3305,59 @@ class LLVMGen:
         if sig is not None:
             return self._user_call(node, sig)
         return self._builtin(node, name)
+
+    def _rtlib_call(self, node: ast.Call, rf) -> V:
+        """Lower a runtime-backed library call (rtlib.py) to its rt.rs extern."""
+        b = self.b
+        args = []
+        for a, p in zip(node.args, rf.params):
+            if p == "s":
+                v = self._expr(a, "ref")
+                args.append(v.ptr)
+                continue
+            if p == "y":
+                v = self._expr(a, "ref")
+                args.append(v.ssa)
+                continue
+            pt = TFloat() if p == "f" else TInt()
+            v = self._coerce(self._expr(a, "val", expect=pt), pt)
+            args.append(v.ssa)
+        if rf.ret == "y":
+            out = self._entry_alloca(I8P)
+            if rf.can_raise:
+                st = b.call(self._rt(rf.rt), args + [out])
+                self._check_err_i8(st)
+            else:
+                b.call(self._rt(rf.rt), args + [out])
+            return self._register_temp_ssa(TBytes(), b.load(out))
+        if rf.ret in ("s", "S"):
+            tmp = self._temp(TStr() if rf.ret == "s" else TList(TStr()))
+            if rf.can_raise:
+                st = b.call(self._rt(rf.rt), args + [tmp.ptr])
+                self._check_err_i8(st)
+            else:
+                b.call(self._rt(rf.rt), args + [tmp.ptr])
+            return tmp
+        if rf.can_raise:
+            if rf.ret == "n":
+                st = b.call(self._rt(rf.rt), args)
+                self._check_err_i8(st)
+                return V(TNone(), ssa=ir.Constant(I1, 0))
+            if rf.ret == "b":
+                slot = self._entry_alloca(I8)
+                st = b.call(self._rt(rf.rt), args + [slot])
+                self._check_err_i8(st)
+                return V(TBool(), ssa=b.trunc(b.load(slot), I1))
+            slot = self._entry_alloca(F64 if rf.ret == "f" else I64)
+            st = b.call(self._rt(rf.rt), args + [slot])
+            self._check_err_i8(st)
+            return V(TFloat() if rf.ret == "f" else TInt(), ssa=b.load(slot))
+        r = b.call(self._rt(rf.rt), args)
+        if rf.ret == "n":
+            return V(TNone(), ssa=ir.Constant(I1, 0))
+        if rf.ret == "b":
+            return V(TBool(), ssa=b.trunc(r, I1))
+        return V(TFloat() if rf.ret == "f" else TInt(), ssa=r)
 
     def _ctor_call(self, node: ast.Call) -> V:
         cmod, cname, args = self.tc.ctor_calls[id(node)]
@@ -2587,6 +3370,10 @@ class LLVMGen:
             v = self._coerce(self._expr(arg, "val", expect=ft), ft)
             p = self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, i)])
             self._store_into(p, v)
+        if not info.typevars:
+            psig = self.tc.sigs.get((cmod, f"{cname}.__post_init__"))
+            if psig is not None:
+                self._finish_call(self.funcs[(cmod, psig.name)], [tmp.ptr], TNone())
         return tmp
 
     def _arg_value(self, a: ast.expr, p) -> ir.Value:
@@ -2633,7 +3420,7 @@ class LLVMGen:
             tmp = self._temp(ret)
             self.b.store(val, tmp.ptr)
             return tmp
-        if isinstance(ret, (TShared, TWeak, TFile)):
+        if isinstance(ret, (TShared, TWeak, TFile, TBytes, TPyVal)):
             return self._register_temp_ssa(ret, val)
         return V(ret, ssa=val)
 
@@ -2666,21 +3453,39 @@ class LLVMGen:
             return self._user_call(node, sig, self_arg=self_arg)
         if isinstance(inner, TFile):
             h = self._expr(recv, "ref").ssa
+            binary = isinstance(inner, TFile) and inner.binary
             if method == "read":
+                if binary:
+                    out = self._entry_alloca(I8P)
+                    st = self.b.call(self._rt("rt_file_read_bytes"), [h, out])
+                    self._check_err_i8(st)
+                    return self._register_temp_ssa(TBytes(), self.b.load(out))
                 tmp = self._temp(TStr())
                 st = self.b.call(self._rt("rt_file_read"), [h, tmp.ptr])
                 self._check_err_i8(st)
                 return tmp
             if method == "write":
-                s = self._expr(args[0], "ref")
                 out = self._entry_alloca(I64)
-                st = self.b.call(self._rt("rt_file_write"), [h, s.ptr, out])
+                if binary:
+                    at = self._t(args[0])
+                    v = self._expr(args[0], "ref")
+                    if isinstance(at, TBytes):
+                        st = self.b.call(self._rt("rt_file_write_bytes"), [h, v.ssa, out])
+                    else:
+                        st = self.b.call(self._rt("rt_file_write_ba"), [h, v.ptr, out])
+                else:
+                    s = self._expr(args[0], "ref")
+                    st = self.b.call(self._rt("rt_file_write"), [h, s.ptr, out])
                 self._check_err_i8(st)
                 return V(TInt(), ssa=self.b.load(out))
             if method == "close":
                 self.b.call(self._rt("rt_file_close"), [h])
                 return V(TNone(), ssa=ir.Constant(I1, 0))
             raise LLVMUnsupported(f"file method {method}")
+        if isinstance(inner, TBytes):
+            return self._bytes_method(node, method, args)
+        if isinstance(inner, TByteArray):
+            return self._bytearray_method(node, method, args)
         if isinstance(inner, TList):
             return self._list_method(node, rt, inner, method, args)
         if isinstance(inner, TDict):
@@ -2688,6 +3493,91 @@ class LLVMGen:
         if isinstance(inner, TStr):
             return self._str_method(node, rt, method, args)
         raise LLVMUnsupported(f"method '{method}' on {rt}")
+
+    BYTES_H = {"strip": "rt_bytes_strip", "lstrip": "rt_bytes_lstrip",
+               "rstrip": "rt_bytes_rstrip", "upper": "rt_bytes_upper",
+               "lower": "rt_bytes_lower"}
+    BYTES_I = {"find": "rt_bytes_find", "count": "rt_bytes_count"}
+    BYTES_B = {"startswith": "rt_bytes_startswith", "endswith": "rt_bytes_endswith"}
+
+    def _bytes_method(self, node: ast.Call, method: str, args) -> V:
+        """Lower a method call on an immutable bytes value."""
+        if method == "fromhex":
+            s = self._expr(args[0], "ref")
+            out = self._entry_alloca(I8P)
+            st = self.b.call(self._rt("rt_bytes_fromhex"), [s.ptr, out])
+            self._check_err_i8(st)
+            return self._register_temp_ssa(TBytes(), self.b.load(out))
+        h = self._expr(node.func.value, "ref").ssa
+        if method in self.BYTES_H:
+            r = self.b.call(self._rt(self.BYTES_H[method]), [h])
+            return self._register_temp_ssa(TBytes(), r)
+        if method in self.BYTES_I:
+            a = self._expr(args[0], "ref").ssa
+            return V(TInt(), ssa=self.b.call(self._rt(self.BYTES_I[method]), [h, a]))
+        if method in self.BYTES_B:
+            a = self._expr(args[0], "ref").ssa
+            r = self.b.call(self._rt(self.BYTES_B[method]), [h, a])
+            return V(TBool(), ssa=self.b.trunc(r, I1))
+        if method == "replace":
+            a = self._expr(args[0], "ref").ssa
+            c = self._expr(args[1], "ref").ssa
+            r = self.b.call(self._rt("rt_bytes_replace"), [h, a, c])
+            return self._register_temp_ssa(TBytes(), r)
+        if method == "split":
+            tmp = self._temp(TList(TBytes()))
+            self.b.store(ir.Constant(SLIST, None), tmp.ptr)
+            if args:
+                sep = self._expr(args[0], "ref").ssa
+                st = self.b.call(self._rt("rt_bytes_split"), [h, sep, tmp.ptr])
+                self._check_err_i8(st)
+            else:
+                self.b.call(self._rt("rt_bytes_split_ws"), [h, tmp.ptr])
+            return tmp
+        if method == "join":
+            items = self._expr(args[0], "ref")
+            r = self.b.call(self._rt("rt_bytes_join"), [h, items.ptr])
+            return self._register_temp_ssa(TBytes(), r)
+        if method == "hex":
+            tmp = self._temp(TStr())
+            self.b.call(self._rt("rt_bytes_hex"), [h, tmp.ptr])
+            return tmp
+        if method == "decode":
+            tmp = self._temp(TStr())
+            st = self.b.call(self._rt("rt_bytes_decode"), [h, tmp.ptr])
+            self._check_err_i8(st)
+            return tmp
+        raise LLVMUnsupported(f"bytes method {method}")
+
+    def _bytearray_method(self, node: ast.Call, method: str, args) -> V:
+        """Lower a method call on a mutable bytearray."""
+        none = V(TNone(), ssa=ir.Constant(I1, 0))
+        if method == "append":
+            recv = self._recv(node.func.value, True)
+            v = self._expr(args[0], "val").ssa
+            st = self.b.call(self._rt("rt_ba_push"), [recv.ptr, v])
+            self._check_err_i8(st)
+            return none
+        if method == "extend":
+            recv = self._recv(node.func.value, True)
+            at = self._t(args[0])
+            v = self._expr(args[0], "ref")
+            if isinstance(at, TBytes):
+                self.b.call(self._rt("rt_ba_extend_b"), [recv.ptr, v.ssa])
+            else:
+                self.b.call(self._rt("rt_ba_extend_a"), [recv.ptr, v.ptr])
+            return none
+        recv = self._recv(node.func.value, False)
+        if method == "hex":
+            tmp = self._temp(TStr())
+            self.b.call(self._rt("rt_ba_hex"), [recv.ptr, tmp.ptr])
+            return tmp
+        if method == "decode":
+            tmp = self._temp(TStr())
+            st = self.b.call(self._rt("rt_ba_decode"), [recv.ptr, tmp.ptr])
+            self._check_err_i8(st)
+            return tmp
+        raise LLVMUnsupported(f"bytearray method {method}")
 
     def _list_method(self, node, rt, t: TList, method: str, args) -> V:
         elem = t.elem
@@ -2869,6 +3759,9 @@ class LLVMGen:
             tmp = self._temp(TStr())
             self.b.call(self._rt("rt_str_join"), [recv.ptr, lst.ptr, tmp.ptr])
             return tmp
+        if method == "encode":
+            r = self.b.call(self._rt("rt_str_encode"), [recv.ptr])
+            return self._register_temp_ssa(TBytes(), r)
         raise LLVMUnsupported(f"str method {method}")
 
     # ---------- builtins ----------
@@ -2883,9 +3776,73 @@ class LLVMGen:
                 t = t.inner
             else:
                 recv = self._expr(args[0], "ref")
-            if isinstance(t, (TList, TDict)):
+            if isinstance(t, (TList, TDict, TByteArray)):
                 return V(TInt(), ssa=self._list_len(b, recv.ptr))
+            if isinstance(t, TBytes):
+                return V(TInt(), ssa=b.call(self._rt("rt_bytes_len"), [recv.ssa]))
+            if isinstance(t, TPyVal):
+                out = self._entry_alloca(I64)
+                st = b.call(self._rt("rt_pyval_len"), [recv.ssa, out])
+                self._check_err_i8(st)
+                return V(TInt(), ssa=b.load(out))
             return V(TInt(), ssa=b.call(self._rt("rt_str_len"), [recv.ptr]))
+        if name in ("bytes", "bytearray"):
+            is_b = name == "bytes"
+            if not args:
+                if is_b:
+                    p, n = self._cbytes(b"")
+                    h = b.call(self._rt("rt_bytes_new"), [p, ir.Constant(I64, 0)])
+                    return self._register_temp_ssa(TBytes(), h)
+                tmp = self._temp(TByteArray())
+                b.store(ir.Constant(SLIST, None), tmp.ptr)
+                return tmp
+            t0 = self._t(args[0])
+            if is_b and isinstance(t0, TPyVal):
+                v = self._expr(args[0], "ref")
+                out = self._entry_alloca(I8P)
+                st = b.call(self._rt("rt_pyval_to_bytes"), [v.ssa, out])
+                self._check_err_i8(st)
+                return self._register_temp_ssa(TBytes(), b.load(out))
+            if isinstance(t0, TInt):
+                nval = self._expr(args[0], "val").ssa
+                if is_b:
+                    out = self._entry_alloca(I8P)
+                    st = b.call(self._rt("rt_bytes_zeros"), [nval, out])
+                    self._check_err_i8(st)
+                    return self._register_temp_ssa(TBytes(), b.load(out))
+                tmp = self._temp(TByteArray())
+                b.store(ir.Constant(SLIST, None), tmp.ptr)
+                st = b.call(self._rt("rt_ba_zeros"), [nval, tmp.ptr])
+                self._check_err_i8(st)
+                return tmp
+            if isinstance(t0, TList):
+                xs = self._expr(args[0], "ref")
+                if is_b:
+                    out = self._entry_alloca(I8P)
+                    st = b.call(self._rt("rt_bytes_from_ints"), [xs.ptr, out])
+                    self._check_err_i8(st)
+                    return self._register_temp_ssa(TBytes(), b.load(out))
+                tmp = self._temp(TByteArray())
+                b.store(ir.Constant(SLIST, None), tmp.ptr)
+                st = b.call(self._rt("rt_ba_from_ints"), [xs.ptr, tmp.ptr])
+                self._check_err_i8(st)
+                return tmp
+            if isinstance(t0, TBytes):
+                if is_b:
+                    return self._expr(args[0], "val")
+                src = self._expr(args[0], "ref")
+                tmp = self._temp(TByteArray())
+                b.store(ir.Constant(SLIST, None), tmp.ptr)
+                b.call(self._rt("rt_ba_from_bytes"), [src.ssa, tmp.ptr])
+                return tmp
+            src = self._expr(args[0], "ref")
+            if is_b:
+                h = b.call(self._rt("rt_ba_to_bytes"), [src.ptr])
+                return self._register_temp_ssa(TBytes(), h)
+            tmp = self._temp(TByteArray())
+            b.store(ir.Constant(SLIST, None), tmp.ptr)
+            b.call(self._rt("rt_ba_clone"), [src.ptr, tmp.ptr])
+            return tmp
         if name == "sum":
             t = self._t(args[0])
             assert isinstance(t, TList)
@@ -2928,6 +3885,12 @@ class LLVMGen:
             return out
         if name == "int":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                v = self._expr(args[0], "ref")
+                out = self._entry_alloca(I64)
+                st = b.call(self._rt("rt_pyval_to_int"), [v.ssa, out])
+                self._check_err_i8(st)
+                return V(TInt(), ssa=b.load(out))
             if isinstance(t, TStr):
                 v = self._expr(args[0], "ref")
                 out = self._entry_alloca(I64)
@@ -2945,6 +3908,12 @@ class LLVMGen:
             return v
         if name == "float":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                v = self._expr(args[0], "ref")
+                out = self._entry_alloca(F64)
+                st = b.call(self._rt("rt_pyval_to_float"), [v.ssa, out])
+                self._check_err_i8(st)
+                return V(TFloat(), ssa=b.load(out))
             if isinstance(t, TStr):
                 v = self._expr(args[0], "ref")
                 out = self._entry_alloca(F64)
@@ -2957,6 +3926,10 @@ class LLVMGen:
             return v
         if name == "bool":
             t = self._t(args[0])
+            if isinstance(t, TPyVal):
+                v = self._expr(args[0], "ref")
+                r = b.call(self._rt("rt_pyval_truthy"), [v.ssa])
+                return V(TBool(), ssa=b.trunc(r, I1))
             if isinstance(t, TStr):
                 v = self._expr(args[0], "ref")
                 r = b.call(self._rt("rt_str_is_empty"), [v.ptr])

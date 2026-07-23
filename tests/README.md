@@ -1,6 +1,6 @@
 # Test Corpus — the executable half of the spec
 
-These programs ARE the spec (SPEC.md §1.3). Every design change must keep this corpus green.
+These programs ARE the spec (docs/spec.md §1.3). Every design change must keep this corpus green.
 
 ## `tests/accept/`
 
@@ -25,4 +25,4 @@ Programs `serp check` MUST reject. Annotation convention (machine-checked):
 
 Check locally: `python tools/check_reject_tests.py`
 
-Error codes are defined in SPEC.md §12 and are frozen once released.
+Error codes are defined in docs/spec.md §12 and are frozen once released.

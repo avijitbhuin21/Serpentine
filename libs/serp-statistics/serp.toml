@@ -1,0 +1,9 @@
+[project]
+name = "serp-statistics"
+version = "0.1.0"
+
+[build]
+roots = ["src", "../serp-math/src"]
+
+[dependencies]
+serp-math = "0.1.0"

@@ -1,5 +1,5 @@
 # serp-reject: SE201 unsupported-feature
-"""Reject: lambda expressions are Tier 2 (closures)."""
+"""Reject: a lambda needs an expected Callable type (annotate the target)."""
 
 
 def main() -> None:
