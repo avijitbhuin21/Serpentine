@@ -28,6 +28,7 @@ jobs:
       name: pypi-libs-${{ needs.meta.outputs.short }}
     permissions:
       id-token: write
+      contents: read
     env:
       LIB: ${{ needs.meta.outputs.lib }}
     steps:
