@@ -9,8 +9,9 @@
 |---|---|
 | [spec.md](spec.md) | **Spec-of-record** for the compilable subset (Tier 0–2). Changes are spec changes. |
 | [features.md](features.md) | Current feature state — language, compiler, tooling, libraries. |
-| [decisions.md](decisions.md) | Resolved design decisions (D1–D9+). Reopening one is a spec change. |
-| [libraries.md](libraries.md) | Library roadmap & tracker — every `serp-*` dist, wave by wave. |
+| [DECISIONS.md](DECISIONS.md) | Resolved design decisions (D1–D12+). Reopening one is a spec change. |
+| [libraries.md](libraries.md) | Library tracker — every `serp-*` dist, wave by wave, one line each, blockers at the bottom. |
+| [readiness.md](readiness.md) | Production-readiness checklist — P0/P1/P2 items across CI, releases, security, ops, ecosystem. |
 
 ## Language
 
@@ -18,9 +19,17 @@
 |---|---|
 | [language/tour.md](language/tour.md) | Guided tour of the language. |
 | [language/ownership.md](language/ownership.md) | The ownership & borrowing model. |
-| [language/exceptions-ownership.md](language/exceptions-ownership.md) | Paper prototype: exceptions × ownership. |
 | [language/divergences.md](language/divergences.md) | Documented CPython-vs-native divergences. |
-| [language/python-equivalence.md](language/python-equivalence.md) | Per-library stdlib drop-in status & blockers. |
+
+## Libraries
+
+| Doc | What |
+|---|---|
+| [libraries.md](libraries.md) | Tracker — one line per `serp-*` dist. |
+| [libraries/venom.md](libraries/venom.md) | **Venom** roadmap — path to axum-class perf and drop-in `fastapi`. |
+
+`libraries/<name>.md` holds the working checklist for a library that has one; the tracker
+stays one line per library.
 
 ## Guides
 
@@ -32,10 +41,3 @@
 | [guides/publishing.md](guides/publishing.md) | Publishing libraries & releases. |
 | [guides/benchmarks.md](guides/benchmarks.md) | Benchmark methodology & results. |
 
-## Archive (historical)
-
-| Doc | What |
-|---|---|
-| [archive/research.md](archive/research.md) | The research & design document that seeded the project. |
-| [archive/checklist.md](archive/checklist.md) | The phase-by-phase execution tracker (Phases 0–7). |
-| [archive/corpus-study.md](archive/corpus-study.md) | Tier-2 feature-demand corpus study. |

@@ -1,7 +1,7 @@
 # Migrating Python Code to Serpentine
 
 What actually changes when you port an ordinary Python script, in the order you will hit
-it. The corpus study (`../archive/corpus-study.md`) found that numeric code, str/dict
+it. The corpus study (archived) found that numeric code, str/dict
 processing, and dataclass-based code pass nearly unchanged; the friction is concentrated
 below.
 

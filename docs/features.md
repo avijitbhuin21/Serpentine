@@ -4,28 +4,40 @@
 > The normative definition is [spec.md](spec.md); resolved design questions are in
 > [decisions.md](decisions.md); the library ecosystem is tracked in [libraries.md](libraries.md).
 
-**As of:** v0.5+ (2026-07-22). Suites: 66/66 accept differential (both backends,
-debug + release), 58/58 reject, 29/29 library dual-run, rustc-agreement 0 disagreements.
+**As of:** v0.5+ (2026-07-23). Suites: 75/75 accept differential (both backends),
+70/70 reject, 31/31 library dual-run, rustc-agreement 0 disagreements.
 
 ## Language
 
 ### Types & ownership
 - Full-annotation static typing over the Tier-0/1/2 surface: `int` (int64 + overflow trap),
-  `float`, `bool`, `str`, `bytes`, `bytearray`, `list[T]`, `dict[K, V]`, `tuple`, `Optional[T]`,
-  `None`, file handles.
+  `float`, `bool`, `str`, `bytes`, `bytearray`, `list[T]`, `dict[K, V]`, `set[T]`, `tuple`,
+  `Optional[T]`, `None`, file handles.
+- General unions (D24): `int | str` / `Union[A, B]` as closed runtime-tagged sums, narrowed
+  with `isinstance()`; members must differ in runtime kind, and a member widens into the
+  union implicitly at annotated boundaries.
+- C-like enums (D21): `class C(Enum | IntEnum | StrEnum)` with constant `int`/`str` members,
+  `C.MEMBER`, `.value`, `.name`, `C(value)` lookup and `==`/`!=`; a Copy scalar usable as a
+  dict key, set element or field type.
 - `PyVal` boxed dynamic values (decisions.md D10): immutable refcounted Copy handle over
   None/bool/int/float/str/bytes/list/dict with indexing, truthiness, Python-semantics
-  `==`/`!=`, `len`, iteration, `in`, explicit `int()/float()/str()/bool()/bytes()` extraction
-  and `pyval_kind()`; scalars/lists/str-keyed dicts coerce into `PyVal` at annotated
+  `==`/`!=`, `len`, iteration, `in`, explicit `int()/float()/str()/bool()/bytes()` extraction,
+  `pyval_kind()` and `pyval_json(v, ensure_ascii, compact)` (native JSON serialization —
+  16.7x faster than the pure-Serpentine walk; backs `serp_json.dumps`);
+  scalars/lists/str-keyed dicts coerce into `PyVal` at annotated
   boundaries. Powers the json/tomllib/sqlite3/csv.DictReader drop-ins.
 - Ownership discipline via shim annotations: `Owned[T]`, `Ref[T]` / `Mut[T]` (parameter-only
   borrows), explicit `move()` at call sites and rebinds, drop at end of lexical scope.
 - One-level field-sensitive borrow checking (partial moves), place rules (no move-out-by-index),
   iterator-invalidation and loan-conflict detection (any number of `Ref` XOR one `Mut`).
-- Returned borrows forbidden (SE209); flow-sensitive `Optional` narrowing via `is None`.
+- Returned borrows forbidden (SE209); flow-sensitive `Optional` narrowing via `is None` and
+  union narrowing via `isinstance()`.
 - `Shared[T]` / `Weak[T]` escape hatch (`Rc<RefCell>`; cycles leak per D3).
 - Generics: `TypeVar` + `Generic[T]` classes, monomorphized by AST copy; structural
-  protocols (`Protocol`) as TypeVar bounds.
+  protocols (`Protocol`) as TypeVar bounds. A generic class may also inherit one
+  non-generic base (`class Page(Envelope, Generic[T])`, D23); inheriting *from* a generic
+  class is rejected. Its `@classmethod`s are called on an explicit instantiation —
+  `Page[int].model_validate(d)` — where `cls`/`Self` mean `Page[int]` (D25).
 
 ### Statements & expressions
 - Functions, `if`/`while`/`for`, `break`/`continue`, ternary chains, f-strings.
@@ -36,8 +48,22 @@ debug + release), 58/58 reject, 29/29 library dual-run, rustc-agreement 0 disagr
 - List/dict comprehensions (one `for` + one `if`, Copy/fresh elements).
 - `try`/`except`/`finally` with the maybe-moved join (D1); user exception classes
   (`class E(Base): pass`); fatal runtime errors are catchable error values.
-- First-class functions: `Callable[[...], R]`, lambdas capturing by value (Copy only,
-  frozen after capture; loop-assigned captures refused for CPython late-binding parity).
+- First-class functions: `Callable[[...], R]` with **any param/return types** (non-Copy
+  arguments require an explicit `move()` at the call site); lambdas capturing by value
+  (Copy only, frozen after capture; loop-assigned captures refused for CPython
+  late-binding parity).
+- Registration-style decorators on module functions (`@deco`, `@deco(args)`; D13 —
+  decorated name stays bound to the original, decorator result typechecked against the
+  exact signature, applications run at startup in import order).
+- `async def` / `await` on a baton-scheduled task runtime (D14 → D45): `await f(...)` runs the
+  coroutine inline; `asyncio.create_task`/`gather`/`Task[T]`/`await task`/`done()` and
+  `asyncio.sleep` suspend the current task with CPython's event-loop ordering; `async with`;
+  every direct async call must be awaited or wrapped; `serp-asyncio` adds
+  `Event`/`Lock`/`Semaphore`/`BoundedSemaphore`/`Queue`; sockets have an async mode that
+  parks the task on the reactor instead of blocking (Fang `AsyncClient`, Venom `serve_conn`).
+- Threads (D9 v1): `from serpentine import spawn`; `spawn(f, args...) -> JoinHandle[R]`,
+  `.join()` returns the result or re-raises; arguments/returns are Send-by-copy
+  (int/float/bool/str/bytes, SE216 otherwise); `Shared` cannot cross threads.
 - `sorted(key=lambda ...)`, `sort`/`reverse`, `min`/`max`/`sum`/`abs`, `round`/`ord`/`chr`,
   conversions, str index/slice (char-based).
 
@@ -45,16 +71,39 @@ debug + release), 58/58 reject, 29/29 library dual-run, rustc-agreement 0 disagr
 - `@dataclass` and regular classes; `Ref`/`Mut` self (no `Owned` self); dataclass field
   defaults (literals plus empty `[]`/`{}` containers, fresh per construction); classes in
   containers; class forward refs via `from __future__ import annotations`.
-- Operator overloading: arithmetic + matmul, ordering, `__neg__`, `__getitem__`/`__setitem__`/
-  `__len__`; plus `__str__` (drives `str()`, `print`, f-strings), `__repr__` (backend
+- **Single inheritance** (D15): `class Sub(Base)` flattens the base's fields and
+  non-overridden methods into the subclass at check time (mixin semantics — no subtyping,
+  no `super()`, no virtual dispatch; overriding replaces; field-less base classes allowed;
+  `@classmethod`s and `@staticmethod`s are inherited too).
+  Powers the serp-test `TestCase` model with build-time discovery in `serp test`.
+- Operator overloading: arithmetic + matmul, ordering (a class's `__lt__`/`__gt__`/… may
+  return **any type**, e.g. a boolean-mask object — D38), user `__eq__`/`__ne__` overloads and
+  reflected `__radd__`/`__rsub__`/`__rmul__`/`__rtruediv__`/… (`2 * obj`, D39), bitwise `&`/`|`/`^` via
+  `__and__`/`__or__`/`__xor__` and `~` via `__invert__` (class operands only), `__neg__`,
+  `__getitem__`/`__setitem__`/`__len__`; **`@overload`-typed `__getitem__`** (D40 — the call
+  site takes the matching stub's return type, so one indexer can yield a `Series` for a
+  string key and a `DataFrame` for a mask); operator and `__getitem__` results are fresh owned
+  values (assignable, attribute-addressable); plus `__str__` (drives `str()`, `print`, f-strings), `__repr__` (backend
   override — containers, `!r`, KeyError messages), `__post_init__` (validation/normalization
-  run after every construction; can raise), `@property`, `@staticmethod`.
+  run after every construction; can raise), `__init__` (a user constructor whose parameter
+  list is independent of the field list; every field assigned exactly once — D22),
+  `@property`, `@staticmethod`,
+  `@classmethod` (D16 — `cls` is a build-time binding: `cls(...)`, `cls.other()`, `Self`
+  returns).
+- **Build-time field-table intrinsics** (D16): `fields_of(obj)`, `fields_json(cls)`,
+  `fields_build(cls, d)` from `serpentine`, lowered to generated per-class functions —
+  reflection-free model dumping/validation (powers serp-molt). `Annotated[T, ...]` extras
+  and a `Field(...)` call in field-default position are kept as build-time field metadata,
+  including `default_factory`.
 - Call-site conveniences: keyword arguments, literal default params, int→float coercion at
   call args, negative-literal constants.
 
 ### Explicitly out of scope (any tier)
-`eval`/`exec`, monkeypatching, metaclasses, dynamic attributes, runtime reflection, multiple
-inheritance, `globals()` mutation. Threading is parked (D4/D9: scoped threads planned, Wave 6).
+`eval`/`exec`, monkeypatching, metaclasses, dynamic attributes, runtime reflection,
+subtype polymorphism (inheritance is compile-time flattening, D15), multiple inheritance,
+`globals()` mutation.
+Concurrency shipped as D9-v1 `spawn`/`join`; scoped borrows across threads and `Sync[T]`
+remain future work.
 
 ## Compiler & runtime
 - **Backend B (default):** direct LLVM IR via llvmlite (`llvmgen.py` + `llvmbuild.py`) against
@@ -76,9 +125,9 @@ inheritance, `globals()` mutation. Threading is parked (D4/D9: scoped threads pl
   publishing ([guides/publishing.md](guides/publishing.md)).
 
 ## Libraries
-30 `serp-*` libraries in `libs/` (Waves 1–4 shipped) — json, math, random, os, datetime,
+30+ `serp-*` libraries in `libs/` (Waves 1–4 shipped; Wave 5 has Molt and **Scales**, the
+pandas-style `DataFrame`/`Series` flagship) — json, math, random, os, datetime,
 pathlib, io, zipfile, sqlite, socket, url, http-server, fang (httpx façade with native TLS),
 and more. Many are true CPython stdlib **drop-ins** (facade + `_core` rtlib pattern) —
 including, since the PyVal push, `json`, `tomllib`, `sqlite3`, and `csv.DictReader`;
-per-library drop-in status lives in [language/python-equivalence.md](language/python-equivalence.md)
-and the tracker in [libraries.md](libraries.md).
+per-library drop-in status and blockers live in the tracker, [libraries.md](libraries.md).

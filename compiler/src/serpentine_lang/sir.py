@@ -406,7 +406,7 @@ class Lowerer:
                 return
             if isinstance(e.func, ast.Attribute):
                 recv = e.func.value
-                from .ptypes import TClass, TDict, TFile, TList, TShared
+                from .ptypes import TClass, TDict, TFile, TJoin, TList, TShared, TThread
                 if isinstance(recv, ast.Name) and recv.id == "sys":
                     for a in e.args:
                         self._lower_expr(a)
@@ -423,6 +423,8 @@ class Lowerer:
                 elif isinstance(rt, TDict) and e.func.attr == "pop":
                     is_mut = True
                 elif isinstance(rt, TFile):
+                    is_mut = True
+                elif isinstance(rt, (TJoin, TThread)):
                     is_mut = True
                 elif isinstance(rt, TClass):
                     tgt = self.tc.call_targets.get(id(e))

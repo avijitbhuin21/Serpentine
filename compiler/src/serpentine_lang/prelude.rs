@@ -37,6 +37,29 @@ impl SerpErr {
 
 type SRes<T> = Result<T, SerpErr>;
 
+// ---------- threads (DECISIONS.md D9: Send-checked spawn/join) ----------
+
+pub struct SJoin<T>(pub RefCell<Option<std::thread::JoinHandle<SRes<T>>>>);
+
+fn serp_spawn<T, F>(f: F) -> SJoin<T>
+where T: Send + 'static, F: FnOnce() -> SRes<T> + Send + 'static {
+    SJoin(RefCell::new(Some(std::thread::spawn(f))))
+}
+
+fn serp_join<T>(h: &SJoin<T>) -> SRes<T> {
+    let taken = h.0.borrow_mut().take();
+    match taken {
+        None => Err(SerpErr::new("ValueError", "thread already joined".to_string())),
+        Some(j) => match j.join() {
+            Ok(r) => r,
+            Err(_) => Err(SerpErr::new("RuntimeError", "thread panicked".to_string())),
+        },
+    }
+}
+
+fn send_str(s: &SStr) -> String { s.as_str().to_string() }
+fn recv_str(s: String) -> SStr { sstring(s) }
+
 // ---------- strings (SPEC section 3.7: O(1) copies + SSO) ----------
 // Small-string optimization: strings up to 22 bytes live inline (no allocation —
 // covers split() parts, chars, keys); longer strings are Rc<str> (O(1) clones).
@@ -211,6 +234,9 @@ impl PyShow for str {
                 '\r' => out.push_str("\\r"),
                 '\t' => out.push_str("\\t"),
                 c if c == quote => { out.push('\\'); out.push(c); }
+                c if (c as u32) < 0x20 || (c as u32) == 0x7f
+                    || ((c as u32) >= 0x80 && (c as u32) <= 0xa0) || (c as u32) == 0xad =>
+                    out.push_str(&format!("\\x{:02x}", c as u32)),
                 c => out.push(c),
             }
         }
@@ -440,6 +466,90 @@ impl<K: PyShow, V: PyShow> PyShow for SerpDict<K, V> {
         let parts: Vec<String> = self.entries.iter()
             .map(|(k, v)| format!("{}: {}", k.py_repr(), v.py_repr()))
             .collect();
+        format!("{{{}}}", parts.join(", "))
+    }
+}
+
+// ---------- insertion-ordered set (docs/spec.md D20) ----------
+
+#[derive(Clone)]
+struct SerpSet<E> {
+    items: Vec<E>,
+}
+
+impl<E: PartialEq + Clone + PyShow> SerpSet<E> {
+    fn new() -> Self { SerpSet { items: Vec::new() } }
+    fn add(&mut self, e: E) {
+        if !self.items.iter().any(|x| x == &e) { self.items.push(e); }
+    }
+    fn discard(&mut self, e: &E) {
+        if let Some(i) = self.items.iter().position(|x| x == e) { self.items.remove(i); }
+    }
+    fn remove(&mut self, e: &E) -> SRes<()> {
+        match self.items.iter().position(|x| x == e) {
+            Some(i) => { self.items.remove(i); Ok(()) }
+            None => serp_err("KeyError", e.py_repr()),
+        }
+    }
+    fn take(&mut self) -> SRes<E> {
+        if self.items.is_empty() { return serp_err("KeyError", "pop from an empty set".to_string()); }
+        Ok(self.items.remove(0))
+    }
+    fn clear(&mut self) { self.items.clear(); }
+    fn contains(&self, e: &E) -> bool { self.items.iter().any(|x| x == e) }
+    fn len_i(&self) -> i64 { self.items.len() as i64 }
+    fn iter_it(&self) -> impl Iterator<Item = &E> { self.items.iter() }
+    fn union(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for e in other.items.iter() { out.add(e.clone()); }
+        out
+    }
+    fn intersection(&self, other: &Self) -> Self {
+        let mut out = SerpSet::new();
+        for e in self.items.iter() { if other.contains(e) { out.items.push(e.clone()); } }
+        out
+    }
+    fn difference(&self, other: &Self) -> Self {
+        let mut out = SerpSet::new();
+        for e in self.items.iter() { if !other.contains(e) { out.items.push(e.clone()); } }
+        out
+    }
+    fn symmetric_difference(&self, other: &Self) -> Self {
+        let mut out = self.difference(other);
+        for e in other.items.iter() { if !self.contains(e) { out.items.push(e.clone()); } }
+        out
+    }
+    fn update(&mut self, other: &Self) {
+        for e in other.items.iter() { self.add(e.clone()); }
+    }
+    fn difference_update(&mut self, other: &Self) {
+        self.items.retain(|x| !other.contains(x));
+    }
+    fn intersection_update(&mut self, other: &Self) {
+        self.items.retain(|x| other.contains(x));
+    }
+    fn issubset(&self, other: &Self) -> bool { self.items.iter().all(|e| other.contains(e)) }
+    fn issuperset(&self, other: &Self) -> bool { other.items.iter().all(|e| self.contains(e)) }
+    fn isdisjoint(&self, other: &Self) -> bool { !self.items.iter().any(|e| other.contains(e)) }
+    fn from_vec(v: &[E]) -> Self {
+        let mut out = SerpSet::new();
+        for e in v.iter() { out.add(e.clone()); }
+        out
+    }
+}
+
+impl<E: PartialEq> PartialEq for SerpSet<E> {
+    fn eq(&self, other: &Self) -> bool {
+        self.items.len() == other.items.len()
+            && self.items.iter().all(|e| other.items.iter().any(|o| o == e))
+    }
+}
+
+impl<E: PyShow> PyShow for SerpSet<E> {
+    fn py_str(&self) -> String { self.py_repr() }
+    fn py_repr(&self) -> String {
+        if self.items.is_empty() { return "set()".to_string(); }
+        let parts: Vec<String> = self.items.iter().map(|e| e.py_repr()).collect();
         format!("{{{}}}", parts.join(", "))
     }
 }
@@ -2731,9 +2841,82 @@ enum SockKind {
 struct SockRec {
     kind: SockKind,
     peer: Option<(String, i64)>,
+    // Async mode (D45): the socket is non-blocking and every would-block parks the
+    // calling task on the reactor instead of blocking the thread; timeout_ms is the
+    // set_timeout() value replayed as the reactor deadline (0 = none).
+    aio: bool,
+    timeout_ms: i64,
 }
 
-static mut SOCKS: Vec<Option<SockRec>> = Vec::new();
+fn sock_new(kind: SockKind) -> SockRec {
+    SockRec { kind, peer: None, aio: false, timeout_ms: 0 }
+}
+
+// Threads (D9): the handle table is an RwLock'd Vec of per-socket Arc<Mutex<..>>,
+// so blocking I/O on one socket never holds the table lock or another socket's.
+// Lookups take the table in SHARED mode: the poll loop resolves one handle per
+// connection per iteration, and an exclusive lock there serialized all workers.
+type SockRef = std::sync::Arc<std::sync::Mutex<SockRec>>;
+
+static SOCKS: std::sync::RwLock<Vec<Option<SockRef>>> = std::sync::RwLock::new(Vec::new());
+static SOCK_FREE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+// Per-request the event loop resolves the same few handles over and over. Taking the
+// table RwLock in read mode is still an atomic read-modify-write on ONE cache line
+// shared by every worker, so per-request CPU grew with the worker count. Each thread
+// therefore memoizes the handles it has resolved; a relaxed load of SOCK_EPOCH (a plain
+// shared read, no RMW) tells it whether any handle has been retired since.
+static SOCK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static SOCK_CACHE: std::cell::RefCell<(u64, Vec<Option<SockRef>>)> =
+        std::cell::RefCell::new((0, Vec::new()));
+}
+
+fn sock_cache_sync() -> u64 {
+    let ep = SOCK_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    SOCK_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != ep {
+            c.0 = ep;
+            c.1.clear();
+        }
+    });
+    ep
+}
+
+fn sock_cache_get(h: i64) -> Option<SockRef> {
+    if h < 1 {
+        return None;
+    }
+    SOCK_CACHE.with(|c| {
+        let c = c.borrow();
+        c.1.get(h as usize - 1).cloned().flatten()
+    })
+}
+
+fn sock_cache_put(h: i64, rec: &SockRef) {
+    if h < 1 {
+        return;
+    }
+    SOCK_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let i = h as usize - 1;
+        if c.1.len() <= i {
+            c.1.resize(i + 1, None);
+        }
+        c.1[i] = Some(rec.clone());
+    });
+}
+
+fn sock_cache_flush() {
+    SOCK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    SOCK_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0 = SOCK_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        c.1.clear();
+    });
+}
 
 fn sock_io_err(e: &std::io::Error) -> SerpErr {
     use std::io::ErrorKind as K;
@@ -2748,24 +2931,112 @@ fn sock_io_err(e: &std::io::Error) -> SerpErr {
     SerpErr::new("OSError", msg.to_string())
 }
 
-fn sock_push(rec: SockRec) -> i64 {
-    unsafe {
-        let socks = &mut *std::ptr::addr_of_mut!(SOCKS);
-        socks.push(Some(rec));
-        socks.len() as i64
+// Internal marker for "the non-blocking op would block"; aio_io turns it into a
+// reactor wait on async-mode sockets and into CPython's "timed out" otherwise.
+const SOCK_WB_KIND: &str = "_WouldBlock";
+
+fn sock_wb_err() -> SerpErr { SerpErr::new(SOCK_WB_KIND, "would block".to_string()) }
+
+fn sock_io_err_wb(e: &std::io::Error) -> SerpErr {
+    if e.kind() == std::io::ErrorKind::WouldBlock { sock_wb_err() } else { sock_io_err(e) }
+}
+
+// Run one socket operation, parking the current task until the fd is ready when the
+// socket is in async mode and the op would block (D45).
+fn aio_io<T>(h: i64, write: bool, mut f: impl FnMut(&mut SockRec) -> SRes<T>) -> SRes<T> {
+    loop {
+        let arc = sock_get(h)?;
+        let (r, aio, tmo) = {
+            let mut rec = sock_lock(&arc);
+            let r = f(&mut rec);
+            (r, rec.aio, rec.timeout_ms)
+        };
+        match r {
+            Err(e) if e.kind == SOCK_WB_KIND => {
+                if !aio {
+                    return serp_err("OSError", "timed out".into());
+                }
+                let ok = serp_aio_wait_fd(h, if write { 1 } else { 0 },
+                                          if tmo > 0 { tmo } else { -1 })?;
+                if !ok {
+                    return serp_err("OSError", "timed out".into());
+                }
+            }
+            other => return other,
+        }
     }
 }
 
-fn sock_get(h: i64) -> SRes<&'static mut SockRec> {
-    unsafe {
-        let socks = &mut *std::ptr::addr_of_mut!(SOCKS);
+fn sock_push(rec: SockRec) -> i64 {
+    let arc = std::sync::Arc::new(std::sync::Mutex::new(rec));
+    let slot = {
+        let mut free = SOCK_FREE.lock().unwrap_or_else(|p| p.into_inner());
+        free.pop()
+    };
+    let mut socks = SOCKS.write().unwrap_or_else(|p| p.into_inner());
+    match slot {
+        Some(i) if i < socks.len() && socks[i].is_none() => {
+            socks[i] = Some(arc);
+            (i + 1) as i64
+        }
+        _ => {
+            socks.push(Some(arc));
+            socks.len() as i64
+        }
+    }
+}
+
+fn sock_get(h: i64) -> SRes<SockRef> {
+    sock_cache_sync();
+    if let Some(rec) = sock_cache_get(h) {
+        return Ok(rec);
+    }
+    let socks = SOCKS.read().unwrap_or_else(|p| p.into_inner());
+    if h >= 1 && (h as usize) <= socks.len() {
+        if let Some(rec) = &socks[h as usize - 1] {
+            let out = rec.clone();
+            drop(socks);
+            sock_cache_put(h, &out);
+            return Ok(out);
+        }
+    }
+    serp_err("ValueError", "invalid socket handle".into())
+}
+
+fn sock_get_many(hs: &[i64]) -> Vec<Option<SockRef>> {
+    sock_cache_sync();
+    let mut out: Vec<Option<SockRef>> = Vec::with_capacity(hs.len());
+    let mut missing = false;
+    for &h in hs {
+        let hit = sock_cache_get(h);
+        missing |= hit.is_none();
+        out.push(hit);
+    }
+    if !missing {
+        return out;
+    }
+    let socks = SOCKS.read().unwrap_or_else(|p| p.into_inner());
+    let mut fresh: Vec<(i64, SockRef)> = Vec::new();
+    for (k, &h) in hs.iter().enumerate() {
+        if out[k].is_some() {
+            continue;
+        }
         if h >= 1 && (h as usize) <= socks.len() {
-            if let Some(rec) = &mut socks[h as usize - 1] {
-                return Ok(rec);
+            if let Some(rec) = &socks[h as usize - 1] {
+                fresh.push((h, rec.clone()));
+                out[k] = Some(rec.clone());
             }
         }
-        serp_err("ValueError", "invalid socket handle".into())
     }
+    drop(socks);
+    for (h, rec) in &fresh {
+        sock_cache_put(*h, rec);
+    }
+    out
+}
+
+fn sock_lock(arc: &SockRef) -> std::sync::MutexGuard<'_, SockRec> {
+    arc.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 fn sock_port_ok(port: i64) -> SRes<u16> {
@@ -2796,7 +3067,7 @@ fn serp_sock_connect(host: &str, port: i64, timeout_ms: i64) -> SRes<i64> {
         std::net::TcpStream::connect(addr)
     };
     match stream {
-        Ok(s) => Ok(sock_push(SockRec { kind: SockKind::Tcp(s), peer: None })),
+        Ok(s) => Ok(sock_push(sock_new(SockKind::Tcp(s)))),
         Err(e) => Err(sock_io_err(&e)),
     }
 }
@@ -2804,36 +3075,106 @@ fn serp_sock_connect(host: &str, port: i64, timeout_ms: i64) -> SRes<i64> {
 fn serp_sock_listen(host: &str, port: i64) -> SRes<i64> {
     let addr = sock_resolve(host, port)?;
     match std::net::TcpListener::bind(addr) {
-        Ok(l) => Ok(sock_push(SockRec { kind: SockKind::Listener(l), peer: None })),
+        Ok(l) => Ok(sock_push(sock_new(SockKind::Listener(l)))),
         Err(e) => Err(sock_io_err(&e)),
     }
 }
 
 fn serp_sock_accept(h: i64) -> SRes<i64> {
-    let rec = sock_get(h)?;
-    match &rec.kind {
+    let s = aio_io(h, false, |rec| match &rec.kind {
         SockKind::Listener(l) => match l.accept() {
-            Ok((s, _)) => Ok(sock_push(SockRec { kind: SockKind::Tcp(s), peer: None })),
-            Err(e) => Err(sock_io_err(&e)),
+            Ok((s, _)) => Ok(s),
+            Err(e) => Err(sock_io_err_wb(&e)),
         },
         _ => serp_err("ValueError", "accept() needs a listener".into()),
-    }
+    })?;
+    let _ = s.set_nodelay(true);
+    Ok(sock_push(sock_new(SockKind::Tcp(s))))
 }
 
 fn serp_sock_send(h: i64, data: &SBytes) -> SRes<i64> {
     use std::io::Write;
-    let rec = sock_get(h)?;
-    match &mut rec.kind {
-        SockKind::Tcp(s) => match s.write_all(&data.v) {
-            Ok(()) => Ok(data.v.len() as i64),
-            Err(e) => Err(sock_io_err(&e)),
-        },
-        SockKind::Tls(c) => {
-            tls_write_conn(c, &data.v)?;
-            Ok(data.v.len() as i64)
+    aio_io(h, true, |rec| {
+        let aio = rec.aio;
+        match &mut rec.kind {
+            // write_all cannot be used here: on a non-blocking socket a full send
+            // buffer surfaces as WouldBlock *after* a partial write, and write_all
+            // discards the count. Return what actually landed and let the caller
+            // resume, matching CPython's send() contract.
+            SockKind::Tcp(s) => {
+                let mut sent: usize = 0;
+                while sent < data.v.len() {
+                    match s.write(&data.v[sent..]) {
+                        Ok(0) => break,
+                        Ok(n) => sent += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if aio && sent == 0 {
+                                return Err(sock_wb_err());
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            if sent > 0 {
+                                break;
+                            }
+                            return Err(sock_io_err(&e));
+                        }
+                    }
+                }
+                Ok(sent as i64)
+            }
+            SockKind::Tls(c) => {
+                tls_write_conn(c, &data.v)?;
+                Ok(data.v.len() as i64)
+            }
+            _ => serp_err("ValueError", "send() needs a TCP stream".into()),
         }
-        _ => serp_err("ValueError", "send() needs a TCP stream".into()),
-    }
+    })
+}
+
+fn serp_sock_send_all(h: i64, data: &SBytes, timeout_ms: i64) -> SRes<i64> {
+    use std::io::Write;
+    let mut sent: usize = 0;
+    aio_io(h, true, |rec| {
+        let raw = sock_raw(rec);
+        let aio = rec.aio;
+        match &mut rec.kind {
+            SockKind::Tcp(s) => {
+                while sent < data.v.len() {
+                    match s.write(&data.v[sent..]) {
+                        Ok(0) => return serp_err("OSError", "connection reset by peer".into()),
+                        Ok(n) => sent += n,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if aio {
+                                return Err(sock_wb_err());
+                            }
+                            // Non-blocking socket with a full send buffer: park on
+                            // POLLOUT instead of spinning. timeout_ms <= 0 waits
+                            // indefinitely, matching a blocking sendall().
+                            let fd = match raw {
+                                Some(f) => f,
+                                None => return serp_err("OSError", "timed out".into()),
+                            };
+                            let mut fds = [SockPollFd { fd, events: SOCK_POLL_OUT, revents: 0 }];
+                            let w = if timeout_ms > 0 { timeout_ms } else { 1000 };
+                            if sys_poll(&mut fds, w) <= 0 && timeout_ms > 0 {
+                                return serp_err("OSError", "timed out".into());
+                            }
+                        }
+                        Err(e) => return Err(sock_io_err(&e)),
+                    }
+                }
+                Ok(sent as i64)
+            }
+            SockKind::Tls(c) => {
+                tls_write_conn(c, &data.v)?;
+                Ok(data.v.len() as i64)
+            }
+            _ => serp_err("ValueError", "sendall() needs a TCP stream".into()),
+        }
+    })
 }
 
 fn serp_sock_recv(h: i64, maxlen: i64) -> SRes<SBytes> {
@@ -2841,22 +3182,22 @@ fn serp_sock_recv(h: i64, maxlen: i64) -> SRes<SBytes> {
     if maxlen <= 0 {
         return serp_err("ValueError", "maxlen must be positive".into());
     }
-    let rec = sock_get(h)?;
-    match &mut rec.kind {
+    aio_io(h, false, |rec| match &mut rec.kind {
         SockKind::Tcp(s) => {
             let mut buf = vec![0u8; maxlen as usize];
             match s.read(&mut buf) {
                 Ok(n) => { buf.truncate(n); Ok(sbytes(buf)) }
-                Err(e) => Err(sock_io_err(&e)),
+                Err(e) => Err(sock_io_err_wb(&e)),
             }
         }
         SockKind::Tls(c) => Ok(sbytes(tls_read_conn(c, maxlen as usize)?)),
         _ => serp_err("ValueError", "recv() needs a TCP stream".into()),
-    }
+    })
 }
 
 fn serp_sock_shutdown_write(h: i64) -> SRes<()> {
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     match &rec.kind {
         SockKind::Tcp(s) => match s.shutdown(std::net::Shutdown::Write) {
             Ok(()) => Ok(()),
@@ -2871,7 +3212,8 @@ fn serp_sock_shutdown_write(h: i64) -> SRes<()> {
 }
 
 fn serp_sock_set_timeout(h: i64, ms: i64) -> SRes<()> {
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     let dur = if ms > 0 {
         Some(std::time::Duration::from_millis(ms as u64))
     } else {
@@ -2885,13 +3227,24 @@ fn serp_sock_set_timeout(h: i64, ms: i64) -> SRes<()> {
             return serp_err("ValueError", "cannot set timeout on a listener".into()),
     };
     match r {
-        Ok(()) => Ok(()),
+        Ok(()) => { rec.timeout_ms = if ms > 0 { ms } else { 0 }; Ok(()) }
         Err(e) => Err(sock_io_err(&e)),
     }
 }
 
+// Async mode (D45): non-blocking fd whose would-blocks park the current task on
+// the reactor (see aio_io); the plain recv/send/accept API is unchanged.
+fn serp_sock_set_async(h: i64) -> SRes<()> {
+    serp_sock_set_nonblocking(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
+    rec.aio = true;
+    Ok(())
+}
+
 fn serp_sock_local_port(h: i64) -> SRes<i64> {
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     let addr = match &rec.kind {
         SockKind::Tcp(s) => s.local_addr(),
         SockKind::Tls(c) => c.tcp.local_addr(),
@@ -2905,25 +3258,205 @@ fn serp_sock_local_port(h: i64) -> SRes<i64> {
 }
 
 fn serp_sock_close(h: i64) -> SRes<()> {
-    sock_get(h)?;
-    unsafe {
-        let socks = &mut *std::ptr::addr_of_mut!(SOCKS);
-        socks[h as usize - 1] = None;
+    let rec = sock_get(h)?;
+    {
+        // A cached SockRef on another thread would otherwise keep the fd alive after
+        // the table drops it, so tear the connection down explicitly.
+        let r = sock_lock(&rec);
+        match &r.kind {
+            SockKind::Tcp(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+            SockKind::Tls(c) => {
+                let _ = c.tcp.shutdown(std::net::Shutdown::Both);
+            }
+            _ => {}
+        }
     }
+    drop(rec);
+    let mut socks = SOCKS.write().unwrap_or_else(|p| p.into_inner());
+    socks[h as usize - 1] = None;
+    drop(socks);
+    let mut free = SOCK_FREE.lock().unwrap_or_else(|p| p.into_inner());
+    free.push(h as usize - 1);
+    drop(free);
+    sock_cache_flush();
     Ok(())
+}
+
+// ---------- non-blocking primitives (Venom event loop) ----------
+
+fn serp_sock_set_nonblocking(h: i64) -> SRes<()> {
+    let arc = sock_get(h)?;
+    let rec = sock_lock(&arc);
+    let r = match &rec.kind {
+        SockKind::Tcp(s) => s.set_nonblocking(true),
+        SockKind::Listener(l) => l.set_nonblocking(true),
+        SockKind::Udp(u) => u.set_nonblocking(true),
+        SockKind::Tls(c) => c.tcp.set_nonblocking(true),
+    };
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) => Err(sock_io_err(&e)),
+    }
+}
+
+fn serp_sock_accept_nb(h: i64) -> SRes<i64> {
+    let arc = sock_get(h)?;
+    let accepted = {
+        let rec = sock_lock(&arc);
+        match &rec.kind {
+            SockKind::Listener(l) => match l.accept() {
+                Ok((s, _)) => Some(s),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(e) => return Err(sock_io_err(&e)),
+            },
+            _ => return serp_err("ValueError", "accept_nb() needs a listener".into()),
+        }
+    };
+    match accepted {
+        Some(s) => {
+            let _ = s.set_nodelay(true);
+            Ok(sock_push(sock_new(SockKind::Tcp(s))))
+        }
+        None => Ok(0),
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct SockPollFd {
+    fd: usize,
+    events: i16,
+    revents: i16,
+}
+#[cfg(windows)]
+#[link(name = "ws2_32")]
+extern "system" {
+    fn WSAPoll(fds: *mut SockPollFd, n: u32, timeout: i32) -> i32;
+}
+#[cfg(windows)]
+const SOCK_POLL_IN: i16 = 0x0100 | 0x0200; // POLLRDNORM | POLLRDBAND
+#[cfg(windows)]
+const SOCK_POLL_OUT: i16 = 0x0010; // POLLWRNORM
+#[cfg(windows)]
+fn sys_poll(fds: &mut [SockPollFd], timeout_ms: i64) -> i32 {
+    unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, timeout_ms.max(0) as i32) }
+}
+#[cfg(windows)]
+fn sock_raw(rec: &SockRec) -> Option<usize> {
+    use std::os::windows::io::AsRawSocket;
+    match &rec.kind {
+        SockKind::Tcp(s) => Some(s.as_raw_socket() as usize),
+        SockKind::Listener(l) => Some(l.as_raw_socket() as usize),
+        SockKind::Udp(u) => Some(u.as_raw_socket() as usize),
+        SockKind::Tls(c) => Some(c.tcp.as_raw_socket() as usize),
+    }
+}
+
+#[cfg(unix)]
+#[repr(C)]
+struct SockPollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+#[cfg(unix)]
+extern "C" {
+    fn poll(fds: *mut SockPollFd, n: u64, timeout: i32) -> i32;
+}
+#[cfg(unix)]
+const SOCK_POLL_IN: i16 = 0x0001; // POLLIN
+#[cfg(unix)]
+const SOCK_POLL_OUT: i16 = 0x0004; // POLLOUT
+#[cfg(unix)]
+fn sys_poll(fds: &mut [SockPollFd], timeout_ms: i64) -> i32 {
+    unsafe { poll(fds.as_mut_ptr(), fds.len() as u64, timeout_ms.max(0) as i32) }
+}
+#[cfg(unix)]
+fn sock_raw(rec: &SockRec) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    match &rec.kind {
+        SockKind::Tcp(s) => Some(s.as_raw_fd()),
+        SockKind::Listener(l) => Some(l.as_raw_fd()),
+        SockKind::Udp(u) => Some(u.as_raw_fd()),
+        SockKind::Tls(c) => Some(c.tcp.as_raw_fd()),
+    }
+}
+
+fn serp_sock_poll_ready(packed: &SBytes, timeout_ms: i64) -> SRes<SBytes> {
+    let b = &packed.v;
+    let mut hs: Vec<i64> = Vec::new();
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let mut v: i64 = 0;
+        for j in (0..8).rev() {
+            v = (v << 8) | (b[i + j] as i64);
+        }
+        hs.push(v);
+        i += 8;
+    }
+    if hs.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(timeout_ms.max(0) as u64));
+        return Ok(sbytes(Vec::new()));
+    }
+    let mut flags: Vec<bool> = vec![false; hs.len()];
+    let mut fds: Vec<SockPollFd> = Vec::new();
+    let mut fd_idx: Vec<usize> = Vec::new();
+    let refs = sock_get_many(&hs);
+    for (k, slot) in refs.iter().enumerate() {
+        match slot {
+            None => flags[k] = true,
+            Some(arc) => {
+                let rec = sock_lock(arc);
+                let buffered = matches!(&rec.kind, SockKind::Tls(c) if !c.dec.is_empty());
+                if buffered {
+                    flags[k] = true;
+                } else if let Some(fd) = sock_raw(&rec) {
+                    fds.push(SockPollFd { fd, events: SOCK_POLL_IN, revents: 0 });
+                    fd_idx.push(k);
+                } else {
+                    flags[k] = true;
+                }
+            }
+        }
+    }
+    let any_instant = flags.iter().any(|&f| f);
+    if !any_instant && !fds.is_empty() {
+        let n = sys_poll(&mut fds, timeout_ms);
+        if n > 0 {
+            for (pos, &k) in fd_idx.iter().enumerate() {
+                if fds[pos].revents != 0 {
+                    flags[k] = true;
+                }
+            }
+        }
+    }
+    let mut ready: Vec<u8> = Vec::new();
+    for (k, &h) in hs.iter().enumerate() {
+        if flags[k] {
+            let mut v = h;
+            for _ in 0..8 {
+                ready.push((v & 0xff) as u8);
+                v >>= 8;
+            }
+        }
+    }
+    Ok(sbytes(ready))
 }
 
 fn serp_sock_udp_bind(host: &str, port: i64) -> SRes<i64> {
     let addr = sock_resolve(host, port)?;
     match std::net::UdpSocket::bind(addr) {
-        Ok(u) => Ok(sock_push(SockRec { kind: SockKind::Udp(u), peer: None })),
+        Ok(u) => Ok(sock_push(sock_new(SockKind::Udp(u)))),
         Err(e) => Err(sock_io_err(&e)),
     }
 }
 
 fn serp_sock_udp_send_to(h: i64, data: &SBytes, host: &str, port: i64) -> SRes<i64> {
     let addr = sock_resolve(host, port)?;
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     match &rec.kind {
         SockKind::Udp(u) => match u.send_to(&data.v, addr) {
             Ok(n) => Ok(n as i64),
@@ -2937,7 +3470,8 @@ fn serp_sock_udp_recv_from(h: i64, maxlen: i64) -> SRes<SBytes> {
     if maxlen <= 0 {
         return serp_err("ValueError", "maxlen must be positive".into());
     }
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     match &rec.kind {
         SockKind::Udp(u) => {
             let mut buf = vec![0u8; maxlen as usize];
@@ -2955,7 +3489,8 @@ fn serp_sock_udp_recv_from(h: i64, maxlen: i64) -> SRes<SBytes> {
 }
 
 fn serp_sock_udp_peer_host(h: i64) -> SRes<SStr> {
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     match &rec.peer {
         Some((host, _)) => Ok(sstring(host.clone())),
         None => serp_err("ValueError", "no datagram received yet".into()),
@@ -2963,7 +3498,8 @@ fn serp_sock_udp_peer_host(h: i64) -> SRes<SStr> {
 }
 
 fn serp_sock_udp_peer_port(h: i64) -> SRes<i64> {
-    let rec = sock_get(h)?;
+    let arc = sock_get(h)?;
+    let mut rec = sock_lock(&arc);
     match &rec.peer {
         Some((_, port)) => Ok(*port),
         None => serp_err("ValueError", "no datagram received yet".into()),
@@ -3258,7 +3794,7 @@ fn tls_read_conn(c: &mut TlsConn, maxlen: usize) -> SRes<Vec<u8>> {
             match c.tcp.read(&mut tmp) {
                 Ok(0) => c.eof = true,
                 Ok(n) => c.enc.extend_from_slice(&tmp[..n]),
-                Err(e) => return Err(sock_io_err(&e)),
+                Err(e) => return Err(sock_io_err_wb(&e)),
             }
         }
     }
@@ -3390,6 +3926,10 @@ struct TlsConn {
     eof: bool,
 }
 
+// Exclusive access is guaranteed by the per-socket Mutex (SockRef).
+#[cfg(unix)]
+unsafe impl Send for TlsConn {}
+
 #[cfg(unix)]
 impl Drop for TlsConn {
     fn drop(&mut self) {
@@ -3474,13 +4014,13 @@ fn tls_read_conn(c: &mut TlsConn, maxlen: usize) -> SRes<Vec<u8>> {
         if err == 5 {
             let ose = std::io::Error::last_os_error();
             if matches!(ose.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
-                return Err(sock_io_err(&ose));
+                return Err(sock_io_err_wb(&ose));
             }
             c.eof = true;
             return Ok(Vec::new());
         }
         if err == 2 || err == 3 {
-            return serp_err("OSError", "timed out".into());
+            return Err(sock_wb_err());
         }
         serp_err("OSError", "socket error".into())
     }
@@ -3536,22 +4076,16 @@ fn serp_sock_tls_connect(host: &str, port: i64, timeout_ms: i64, insecure: i64) 
         let (cred, ctx, sizes, extra) = tls_client_handshake(&mut tcp, host, insecure != 0)?;
         let _ = tcp.set_read_timeout(None);
         let _ = tcp.set_write_timeout(None);
-        Ok(sock_push(SockRec {
-            kind: SockKind::Tls(TlsConn {
-                tcp, cred, ctx, sizes, enc: extra, dec: Vec::new(), eof: false,
-            }),
-            peer: None,
-        }))
+        Ok(sock_push(sock_new(SockKind::Tls(TlsConn {
+            tcp, cred, ctx, sizes, enc: extra, dec: Vec::new(), eof: false,
+        }))))
     }
     #[cfg(unix)]
     {
         let (ctx, ssl) = tls_client_handshake(&mut tcp, host, insecure != 0)?;
         let _ = tcp.set_read_timeout(None);
         let _ = tcp.set_write_timeout(None);
-        Ok(sock_push(SockRec {
-            kind: SockKind::Tls(TlsConn { tcp, ctx, ssl, eof: false }),
-            peer: None,
-        }))
+        Ok(sock_push(sock_new(SockKind::Tls(TlsConn { tcp, ctx, ssl, eof: false }))))
     }
 }
 
@@ -3568,7 +4102,7 @@ enum PValRepr {
     Str(SStr),
     Bytes(SBytes),
     List(Vec<PVal>),
-    Dict(SerpDict<SStr, PVal>),
+    Dict(SerpDict<PVal, PVal>),
 }
 
 fn pyval_none() -> PVal { PVal(Rc::new(PValRepr::None_)) }
@@ -3578,7 +4112,19 @@ fn pyval_float(f: f64) -> PVal { PVal(Rc::new(PValRepr::Float(f))) }
 fn pyval_str(s: SStr) -> PVal { PVal(Rc::new(PValRepr::Str(s))) }
 fn pyval_bytes(b: SBytes) -> PVal { PVal(Rc::new(PValRepr::Bytes(b))) }
 fn pyval_list(v: Vec<PVal>) -> PVal { PVal(Rc::new(PValRepr::List(v))) }
-fn pyval_dict(d: SerpDict<SStr, PVal>) -> PVal { PVal(Rc::new(PValRepr::Dict(d))) }
+fn pyval_dict(d: SerpDict<PVal, PVal>) -> PVal { PVal(Rc::new(PValRepr::Dict(d))) }
+
+fn json_key_text(k: &PVal) -> String {
+    // CPython json: str keys as-is; int/float/bool/None keys are coerced to text.
+    match &*k.0 {
+        PValRepr::Str(s) => s.as_str().to_string(),
+        PValRepr::Bool(b) => if *b { "true".into() } else { "false".into() },
+        PValRepr::None_ => "null".into(),
+        PValRepr::Int(i) => i.to_string(),
+        PValRepr::Float(f) => f.py_repr(),
+        _ => k.py_repr(),
+    }
+}
 
 fn pyval_type_name(v: &PVal) -> &'static str {
     match &*v.0 {
@@ -3594,6 +4140,109 @@ fn pyval_type_name(v: &PVal) -> &'static str {
 }
 
 fn pyval_kind(v: &PVal) -> SStr { sstr(pyval_type_name(v)) }
+
+// ---------- JSON serialization (serp-json fast path) ----------
+// Byte-for-byte identical to serp_json._dump / _escape_string, but without the
+// per-character Rc<str> churn that made a 28-byte response cost ~14us.
+
+const JSON_HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn json_u4(out: &mut String, n: u32) {
+    out.push_str("\\u");
+    out.push(JSON_HEX[((n >> 12) & 0xf) as usize] as char);
+    out.push(JSON_HEX[((n >> 8) & 0xf) as usize] as char);
+    out.push(JSON_HEX[((n >> 4) & 0xf) as usize] as char);
+    out.push(JSON_HEX[(n & 0xf) as usize] as char);
+}
+
+fn json_escape(out: &mut String, s: &str, ensure_ascii: bool) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            _ => {
+                let n = c as u32;
+                if n < 32 {
+                    out.push_str("\\u00");
+                    out.push(JSON_HEX[((n >> 4) & 0xf) as usize] as char);
+                    out.push(JSON_HEX[(n & 0xf) as usize] as char);
+                } else if n > 126 && ensure_ascii {
+                    if n > 65535 {
+                        let m = n - 65536;
+                        json_u4(out, 55296 + (m >> 10));
+                        json_u4(out, 56320 + (m & 1023));
+                    } else {
+                        json_u4(out, n);
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.push('"');
+}
+
+fn json_float(out: &mut String, f: f64) {
+    if f.is_nan() {
+        out.push_str("NaN");
+    } else if f.is_infinite() {
+        out.push_str(if f > 0.0 { "Infinity" } else { "-Infinity" });
+    } else {
+        out.push_str(&py_float_repr(f));
+    }
+}
+
+fn json_write(out: &mut String, v: &PVal, ensure_ascii: bool, compact: bool) -> SRes<()> {
+    match &*v.0 {
+        PValRepr::None_ => out.push_str("null"),
+        PValRepr::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        PValRepr::Int(i) => out.push_str(&i.to_string()),
+        PValRepr::Float(f) => json_float(out, *f),
+        PValRepr::Str(s) => json_escape(out, s.as_str(), ensure_ascii),
+        PValRepr::List(l) => {
+            out.push('[');
+            for (i, x) in l.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(if compact { "," } else { ", " });
+                }
+                json_write(out, x, ensure_ascii, compact)?;
+            }
+            out.push(']');
+        }
+        PValRepr::Dict(d) => {
+            out.push('{');
+            let mut first = true;
+            for (k, val) in d.items_it() {
+                if !first {
+                    out.push_str(if compact { "," } else { ", " });
+                }
+                first = false;
+                json_escape(out, &json_key_text(k), ensure_ascii);
+                out.push_str(if compact { ":" } else { ": " });
+                json_write(out, val, ensure_ascii, compact)?;
+            }
+            out.push('}');
+        }
+        PValRepr::Bytes(_) => {
+            return serp_err("TypeError",
+                            "Object of type bytes is not JSON serializable".into());
+        }
+    }
+    Ok(())
+}
+
+fn pyval_json(v: &PVal, ensure_ascii: bool, compact: bool) -> SRes<SStr> {
+    let mut out = String::with_capacity(64);
+    json_write(&mut out, v, ensure_ascii, compact)?;
+    Ok(sstring(out))
+}
 
 fn pyval_truthy(v: &PVal) -> bool {
     match &*v.0 {
@@ -3677,14 +4326,14 @@ fn pyval_getitem_i(v: &PVal, i: i64) -> SRes<PVal> {
         }
         PValRepr::Str(s) => Ok(pyval_str(py_str_idx(s, i)?)),
         PValRepr::Bytes(b) => Ok(pyval_int(pyb_index(b, i)?)),
-        PValRepr::Dict(_) => serp_err("KeyError", i.py_repr()),
+        PValRepr::Dict(d) => Ok(d.get_ref(&pyval_int(i))?.clone()),
         _ => serp_err("TypeError", format!("'{}' object is not subscriptable", pyval_type_name(v))),
     }
 }
 
 fn pyval_getitem_s(v: &PVal, k: &SStr) -> SRes<PVal> {
     match &*v.0 {
-        PValRepr::Dict(d) => Ok(d.get_ref(k)?.clone()),
+        PValRepr::Dict(d) => Ok(d.get_ref(&pyval_str(k.clone()))?.clone()),
         PValRepr::List(_) => serp_err("TypeError", "list indices must be integers or slices, not str".into()),
         PValRepr::Str(_) => serp_err("TypeError", "string indices must be integers, not 'str'".into()),
         _ => serp_err("TypeError", format!("'{}' object is not subscriptable", pyval_type_name(v))),
@@ -3693,10 +4342,12 @@ fn pyval_getitem_s(v: &PVal, k: &SStr) -> SRes<PVal> {
 
 fn pyval_getitem_v(v: &PVal, k: &PVal) -> SRes<PVal> {
     match (&*v.0, &*k.0) {
+        (PValRepr::Dict(_), PValRepr::List(_)) | (PValRepr::Dict(_), PValRepr::Dict(_)) =>
+            serp_err("TypeError", format!("unhashable type: '{}'", pyval_type_name(k))),
+        (PValRepr::Dict(d), _) => Ok(d.get_ref(k)?.clone()),
         (_, PValRepr::Int(i)) => pyval_getitem_i(v, *i),
         (_, PValRepr::Bool(b)) => pyval_getitem_i(v, *b as i64),
         (_, PValRepr::Str(s)) => pyval_getitem_s(v, s),
-        (PValRepr::Dict(_), _) => serp_err("KeyError", k.py_repr()),
         (PValRepr::List(_), _) => serp_err("TypeError",
             format!("list indices must be integers or slices, not {}", pyval_type_name(k))),
         _ => serp_err("TypeError", format!("'{}' object is not subscriptable", pyval_type_name(v))),
@@ -3706,10 +4357,9 @@ fn pyval_getitem_v(v: &PVal, k: &PVal) -> SRes<PVal> {
 fn pyval_contains(hay: &PVal, needle: &PVal) -> SRes<bool> {
     match &*hay.0 {
         PValRepr::Dict(d) => match &*needle.0 {
-            PValRepr::Str(s) => Ok(d.contains(s)),
             PValRepr::List(_) | PValRepr::Dict(_) => serp_err("TypeError",
                 format!("unhashable type: '{}'", pyval_type_name(needle))),
-            _ => Ok(false),
+            _ => Ok(d.contains(needle)),
         },
         PValRepr::List(l) => Ok(l.iter().any(|e| pyval_eq(e, needle))),
         PValRepr::Str(s) => match &*needle.0 {
@@ -3734,7 +4384,7 @@ fn pyval_iter(v: &PVal) -> SRes<Vec<PVal>> {
     match &*v.0 {
         PValRepr::List(l) => Ok(l.clone()),
         PValRepr::Str(s) => Ok(py_chars(s).map(pyval_str).collect()),
-        PValRepr::Dict(d) => Ok(d.keys_it().map(|k| pyval_str(k.clone())).collect()),
+        PValRepr::Dict(d) => Ok(d.keys_it().cloned().collect()),
         PValRepr::Bytes(b) => Ok(b.v.iter().map(|x| pyval_int(*x as i64)).collect()),
         _ => serp_err("TypeError", format!("'{}' object is not iterable", pyval_type_name(v))),
     }
@@ -3790,4 +4440,1720 @@ fn pyval_to_float(v: &PVal) -> SRes<f64> {
             "float() argument must be a string or a real number, not '{}'",
             pyval_type_name(v))),
     }
+}
+
+// ---------- rtlib: serp_subprocess (std::process; error messages normalized
+// identically in the CPython delegate so dual runs stay byte-identical) ----------
+
+const SP_STDIN_PIPE: i64 = 1;
+const SP_STDOUT_PIPE: i64 = 2;
+const SP_STDERR_PIPE: i64 = 4;
+const SP_STDERR_TO_STDOUT: i64 = 8;
+const SP_SHELL: i64 = 16;
+const SP_ENV: i64 = 32;
+const SP_STDIN_DEVNULL: i64 = 64;
+const SP_STDOUT_DEVNULL: i64 = 128;
+const SP_STDERR_DEVNULL: i64 = 256;
+
+struct SpProc {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    out_src: Option<Box<dyn std::io::Read + Send>>,
+    err_src: Option<Box<dyn std::io::Read + Send>>,
+    out_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    err_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    code: Option<i64>,
+}
+
+static mut SP_PROCS: Vec<Option<SpProc>> = Vec::new();
+
+fn sp_procs() -> &'static mut Vec<Option<SpProc>> {
+    unsafe { &mut *std::ptr::addr_of_mut!(SP_PROCS) }
+}
+
+fn sp_proc(h: i64) -> SRes<&'static mut SpProc> {
+    let v = sp_procs();
+    if h < 1 || h as usize > v.len() {
+        return serp_err("ValueError", "invalid process handle".into());
+    }
+    match &mut v[h as usize - 1] {
+        Some(p) => Ok(p),
+        None => serp_err("ValueError", "process handle already closed".into()),
+    }
+}
+
+#[cfg(windows)]
+fn sp_pipe() -> SRes<(std::fs::File, std::fs::File)> {
+    use std::os::windows::io::FromRawHandle;
+    #[repr(C)]
+    struct SecAttr { n: u32, d: *mut std::ffi::c_void, inherit: i32 }
+    extern "system" {
+        fn CreatePipe(r: *mut *mut std::ffi::c_void, w: *mut *mut std::ffi::c_void,
+                      sa: *const SecAttr, size: u32) -> i32;
+    }
+    let sa = SecAttr { n: 24, d: std::ptr::null_mut(), inherit: 0 };
+    let mut r: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut w: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe { CreatePipe(&mut r, &mut w, &sa, 0) } == 0 {
+        return serp_err("OSError", "could not create pipe".into());
+    }
+    Ok(unsafe { (std::fs::File::from_raw_handle(r), std::fs::File::from_raw_handle(w)) })
+}
+
+#[cfg(not(windows))]
+fn sp_pipe() -> SRes<(std::fs::File, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    let mut fds = [0i32; 2];
+    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        return serp_err("OSError", "could not create pipe".into());
+    }
+    unsafe {
+        fcntl(fds[0], 2, 1);
+        fcntl(fds[1], 2, 1);
+        Ok((std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])))
+    }
+}
+
+fn sp_parent_stdout() -> SRes<std::process::Stdio> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        match std::io::stdout().as_handle().try_clone_to_owned() {
+            Ok(h) => Ok(std::process::Stdio::from(h)),
+            Err(_) => serp_err("OSError", "could not duplicate stdout".into()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::io::AsFd;
+        match std::io::stdout().as_fd().try_clone_to_owned() {
+            Ok(h) => Ok(std::process::Stdio::from(h)),
+            Err(_) => serp_err("OSError", "could not duplicate stdout".into()),
+        }
+    }
+}
+
+fn sp_exit_code(st: std::process::ExitStatus) -> i64 {
+    #[cfg(windows)]
+    {
+        st.code().map(|c| (c as u32) as i64).unwrap_or(-1)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        match st.code() {
+            Some(c) => c as i64,
+            None => -(st.signal().unwrap_or(0) as i64),
+        }
+    }
+}
+
+fn serp_sp_spawn(argv: &str, cwd: &str, env: &str, flags: i64) -> SRes<i64> {
+    let parts: Vec<&str> = if argv.is_empty() { Vec::new() } else { argv.split('\0').collect() };
+    let mut cmd;
+    if flags & SP_SHELL != 0 {
+        let line = parts.join(" ");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd = std::process::Command::new(
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+            cmd.raw_arg(format!("/c \"{}\"", line));
+        }
+        #[cfg(not(windows))]
+        {
+            cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(line);
+        }
+    } else {
+        if parts.is_empty() {
+            return serp_err("IndexError", "list index out of range".into());
+        }
+        cmd = std::process::Command::new(parts[0]);
+        cmd.args(&parts[1..]);
+    }
+    if !cwd.is_empty() {
+        cmd.current_dir(cwd);
+    }
+    if flags & SP_ENV != 0 {
+        cmd.env_clear();
+        if !env.is_empty() {
+            for kv in env.split('\0') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    cmd.env(k, v);
+                }
+            }
+        }
+    }
+    if flags & SP_STDIN_PIPE != 0 {
+        cmd.stdin(std::process::Stdio::piped());
+    } else if flags & SP_STDIN_DEVNULL != 0 {
+        cmd.stdin(std::process::Stdio::null());
+    }
+    let mut merged: Option<std::fs::File> = None;
+    if flags & SP_STDOUT_PIPE != 0 {
+        if flags & SP_STDERR_TO_STDOUT != 0 {
+            let (r, w) = sp_pipe()?;
+            let w2 = match w.try_clone() {
+                Ok(f) => f,
+                Err(_) => return serp_err("OSError", "could not duplicate pipe".into()),
+            };
+            cmd.stdout(std::process::Stdio::from(w));
+            cmd.stderr(std::process::Stdio::from(w2));
+            merged = Some(r);
+        } else {
+            cmd.stdout(std::process::Stdio::piped());
+        }
+    } else if flags & SP_STDOUT_DEVNULL != 0 {
+        cmd.stdout(std::process::Stdio::null());
+    }
+    if merged.is_none() {
+        if flags & SP_STDERR_PIPE != 0 {
+            cmd.stderr(std::process::Stdio::piped());
+        } else if flags & SP_STDERR_TO_STDOUT != 0 {
+            cmd.stderr(sp_parent_stdout()?);
+        } else if flags & SP_STDERR_DEVNULL != 0 {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let prog = if flags & SP_SHELL != 0 { "sh".to_string() } else { parts[0].to_string() };
+            return match e.kind() {
+                std::io::ErrorKind::NotFound =>
+                    serp_err("FileNotFoundError", format!("No such file or directory: {}", os_repr(&prog))),
+                std::io::ErrorKind::PermissionDenied =>
+                    serp_err("PermissionError", format!("Permission denied: {}", os_repr(&prog))),
+                _ => serp_err("OSError", format!("could not start process: {}", os_repr(&prog))),
+            };
+        }
+    };
+    let stdin = child.stdin.take();
+    let out_src: Option<Box<dyn std::io::Read + Send>> = match merged {
+        Some(r) => Some(Box::new(r)),
+        None => child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    };
+    let err_src: Option<Box<dyn std::io::Read + Send>> =
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>);
+    let procs = sp_procs();
+    procs.push(Some(SpProc {
+        child, stdin, out_src, err_src,
+        out_thread: None, err_thread: None,
+        stdout: Vec::new(), stderr: Vec::new(), code: None,
+    }));
+    Ok(procs.len() as i64)
+}
+
+fn serp_sp_pid(h: i64) -> SRes<i64> {
+    Ok(sp_proc(h)?.child.id() as i64)
+}
+
+fn sp_drain_thread(src: Box<dyn std::io::Read + Send>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut src = src;
+        let mut buf = Vec::new();
+        let _ = src.read_to_end(&mut buf);
+        buf
+    })
+}
+
+fn sp_record_exit(p: &mut SpProc, st: std::process::ExitStatus) {
+    p.code = Some(sp_exit_code(st));
+    if let Some(t) = p.out_thread.take() {
+        p.stdout = t.join().unwrap_or_default();
+    }
+    if let Some(t) = p.err_thread.take() {
+        p.stderr = t.join().unwrap_or_default();
+    }
+}
+
+fn sp_wait_until(p: &mut SpProc, timeout_ms: i64) -> SRes<bool> {
+    if p.code.is_some() {
+        return Ok(true);
+    }
+    if timeout_ms < 0 {
+        return match p.child.wait() {
+            Ok(st) => { sp_record_exit(p, st); Ok(true) }
+            Err(e) => serp_err("OSError", format!("wait failed: {}", e)),
+        };
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        match p.child.try_wait() {
+            Ok(Some(st)) => { sp_record_exit(p, st); return Ok(true); }
+            Ok(None) => {}
+            Err(e) => return serp_err("OSError", format!("wait failed: {}", e)),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn serp_sp_communicate(h: i64, input: &SBytes, has_input: i64, timeout_ms: i64) -> SRes<bool> {
+    let p = sp_proc(h)?;
+    if let Some(src) = p.out_src.take() {
+        p.out_thread = Some(sp_drain_thread(src));
+    }
+    if let Some(src) = p.err_src.take() {
+        p.err_thread = Some(sp_drain_thread(src));
+    }
+    if let Some(mut w) = p.stdin.take() {
+        use std::io::Write;
+        if has_input != 0 {
+            let _ = w.write_all(&input.v);
+        }
+        let _ = w.flush();
+        drop(w);
+    }
+    sp_wait_until(p, timeout_ms)
+}
+
+fn serp_sp_wait(h: i64, timeout_ms: i64) -> SRes<bool> {
+    sp_wait_until(sp_proc(h)?, timeout_ms)
+}
+
+fn serp_sp_poll(h: i64) -> SRes<bool> {
+    let p = sp_proc(h)?;
+    if p.code.is_some() {
+        return Ok(true);
+    }
+    match p.child.try_wait() {
+        Ok(Some(st)) => { sp_record_exit(p, st); Ok(true) }
+        Ok(None) => Ok(false),
+        Err(e) => serp_err("OSError", format!("wait failed: {}", e)),
+    }
+}
+
+fn serp_sp_returncode(h: i64) -> SRes<i64> {
+    match sp_proc(h)?.code {
+        Some(c) => Ok(c),
+        None => serp_err("ValueError", "process has not exited".into()),
+    }
+}
+
+fn serp_sp_stdout(h: i64) -> SRes<SBytes> {
+    Ok(sbytes(sp_proc(h)?.stdout.clone()))
+}
+
+fn serp_sp_stderr(h: i64) -> SRes<SBytes> {
+    Ok(sbytes(sp_proc(h)?.stderr.clone()))
+}
+
+fn serp_sp_kill(h: i64) -> SRes<()> {
+    let p = sp_proc(h)?;
+    if p.code.is_none() {
+        let _ = p.child.kill();
+    }
+    Ok(())
+}
+
+fn serp_sp_terminate(h: i64) -> SRes<()> {
+    let p = sp_proc(h)?;
+    if p.code.is_some() {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let _ = p.child.kill();
+    }
+    #[cfg(not(windows))]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe { kill(p.child.id() as i32, 15); }
+    }
+    Ok(())
+}
+
+fn serp_sp_free(h: i64) -> SRes<()> {
+    let v = sp_procs();
+    if h >= 1 && (h as usize) <= v.len() {
+        v[h as usize - 1] = None;
+    }
+    Ok(())
+}
+
+// ---------- rtlib: serp_threading (D9 v2 — Thread objects + sync primitives) and
+// serp_queue. Tables are Mutex-protected; objects are Arc so handles copied into
+// other threads stay valid. Error messages mirror CPython's threading module. ----------
+
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtOrd};
+use std::sync::{Arc, Condvar, Mutex};
+
+static TH_NEXT_IDENT: AtomicI64 = AtomicI64::new(2);
+static TH_MAIN_ASSIGNED: AtomicBool = AtomicBool::new(false);
+static TH_ALIVE: AtomicI64 = AtomicI64::new(0);
+static TH_NAME_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+thread_local! {
+    static TH_IDENT: std::cell::Cell<i64> = std::cell::Cell::new(0);
+    static TH_NAME: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    static TH_TLS: std::cell::RefCell<std::collections::HashMap<String, PVal>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static Q_LAST: std::cell::RefCell<Option<PVal>> = std::cell::RefCell::new(None);
+}
+
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn th_ident() -> i64 {
+    TH_IDENT.with(|c| {
+        if c.get() == 0 {
+            let id = if !TH_MAIN_ASSIGNED.swap(true, AtOrd::SeqCst) { 1 }
+                     else { TH_NEXT_IDENT.fetch_add(1, AtOrd::SeqCst) };
+            c.set(id);
+            if id == 1 {
+                TH_NAME.with(|n| *n.borrow_mut() = "MainThread".to_string());
+            }
+        }
+        c.get()
+    })
+}
+
+fn serp_th_ident() -> i64 { th_ident() }
+
+fn serp_th_name() -> SStr {
+    th_ident();
+    TH_NAME.with(|n| sstring(n.borrow().clone()))
+}
+
+fn serp_th_active_count() -> i64 { TH_ALIVE.load(AtOrd::SeqCst) + 1 }
+
+fn serp_th_main_ident() -> i64 { 1 }
+
+fn serp_tls_set(key: &str, val: &PVal) {
+    TH_TLS.with(|m| { m.borrow_mut().insert(key.to_string(), val.clone()); });
+}
+
+fn serp_tls_get(key: &str) -> PVal {
+    TH_TLS.with(|m| m.borrow().get(key).cloned().unwrap_or_else(pyval_none))
+}
+
+fn serp_tls_has(key: &str) -> bool {
+    TH_TLS.with(|m| m.borrow().contains_key(key))
+}
+
+fn serp_tls_del(key: &str) -> bool {
+    TH_TLS.with(|m| m.borrow_mut().remove(key).is_some())
+}
+
+type ThreadBody = Box<dyn FnOnce() -> Result<(), (String, String)> + Send>;
+
+struct ThreadRec {
+    name: Mutex<String>,
+    daemon: bool,
+    ident: AtomicI64,
+    started: AtomicBool,
+    body: Mutex<Option<ThreadBody>>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    delay_ms: i64,
+    cancel_m: Mutex<bool>,
+    cancel_cv: Condvar,
+}
+
+type SThread = Arc<ThreadRec>;
+
+static TH_REGISTRY: Mutex<Vec<Arc<ThreadRec>>> = Mutex::new(Vec::new());
+
+fn serp_thread_new(body: ThreadBody, name: Option<String>, daemon: bool, delay_ms: i64,
+                   target_name: &str) -> SThread {
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let n = TH_NAME_COUNTER.fetch_add(1, AtOrd::SeqCst) + 1;
+            if target_name.is_empty() { format!("Thread-{}", n) }
+            else { format!("Thread-{} ({})", n, target_name) }
+        }
+    };
+    Arc::new(ThreadRec {
+        name: Mutex::new(name),
+        daemon,
+        ident: AtomicI64::new(0),
+        started: AtomicBool::new(false),
+        body: Mutex::new(Some(body)),
+        handle: Mutex::new(None),
+        delay_ms,
+        cancel_m: Mutex::new(false),
+        cancel_cv: Condvar::new(),
+    })
+}
+
+fn serp_thread_start(t: &SThread) -> SRes<()> {
+    if t.started.swap(true, AtOrd::SeqCst) {
+        return serp_err("RuntimeError", "threads can only be started once".into());
+    }
+    let body = match lock_ok(&t.body).take() {
+        Some(b) => b,
+        None => return serp_err("RuntimeError", "threads can only be started once".into()),
+    };
+    let ident = TH_NEXT_IDENT.fetch_add(1, AtOrd::SeqCst);
+    t.ident.store(ident, AtOrd::SeqCst);
+    TH_ALIVE.fetch_add(1, AtOrd::SeqCst);
+    if !t.daemon {
+        lock_ok(&TH_REGISTRY).push(t.clone());
+    }
+    let rec = t.clone();
+    let mut guard = lock_ok(&t.handle);
+    let h = std::thread::spawn(move || {
+        TH_IDENT.with(|c| c.set(ident));
+        TH_NAME.with(|n| *n.borrow_mut() = lock_ok(&rec.name).clone());
+        let mut cancelled = false;
+        if rec.delay_ms > 0 {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(rec.delay_ms as u64);
+            let mut c = lock_ok(&rec.cancel_m);
+            while !*c {
+                let now = std::time::Instant::now();
+                if now >= deadline { break; }
+                c = rec.cancel_cv.wait_timeout(c, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner()).0;
+            }
+            cancelled = *c;
+        }
+        if !cancelled {
+            if let Err((kind, msg)) = body() {
+                eprintln!("Exception in thread {}:\n{}: {}", lock_ok(&rec.name), kind, msg);
+            }
+        }
+        TH_ALIVE.fetch_sub(1, AtOrd::SeqCst);
+    });
+    *guard = Some(h);
+    Ok(())
+}
+
+fn serp_thread_join(t: &SThread, timeout_ms: i64) -> SRes<()> {
+    if !t.started.load(AtOrd::SeqCst) {
+        return serp_err("RuntimeError", "cannot join thread before it is started".into());
+    }
+    if t.ident.load(AtOrd::SeqCst) == th_ident() {
+        return serp_err("RuntimeError", "cannot join current thread".into());
+    }
+    if timeout_ms >= 0 {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(timeout_ms as u64);
+        loop {
+            let done = match &*lock_ok(&t.handle) { Some(h) => h.is_finished(), None => true };
+            if done { break; }
+            if std::time::Instant::now() >= deadline { return Ok(()); }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let h = lock_ok(&t.handle).take();
+    if let Some(h) = h {
+        let _ = h.join();
+    }
+    Ok(())
+}
+
+fn serp_thread_is_alive(t: &SThread) -> bool {
+    if !t.started.load(AtOrd::SeqCst) { return false; }
+    match &*lock_ok(&t.handle) { Some(h) => !h.is_finished(), None => false }
+}
+
+fn serp_thread_name(t: &SThread) -> SStr { sstring(lock_ok(&t.name).clone()) }
+
+fn serp_thread_set_name(t: &SThread, name: &str) { *lock_ok(&t.name) = name.to_string(); }
+
+fn serp_thread_ident(t: &SThread) -> i64 { t.ident.load(AtOrd::SeqCst) }
+
+fn serp_thread_daemon(t: &SThread) -> bool { t.daemon }
+
+fn serp_thread_cancel(t: &SThread) {
+    *lock_ok(&t.cancel_m) = true;
+    t.cancel_cv.notify_all();
+}
+
+fn serp_threads_join_all() {
+    loop {
+        let next = lock_ok(&TH_REGISTRY).pop();
+        match next {
+            None => break,
+            Some(t) => {
+                if t.ident.load(AtOrd::SeqCst) == th_ident() { continue; }
+                let h = lock_ok(&t.handle).take();
+                if let Some(h) = h { let _ = h.join(); }
+            }
+        }
+    }
+}
+
+// ---------- asyncio task runtime (DECISIONS.md D45: baton-scheduled tasks) ----------
+// Every task is an OS thread, but exactly one of them runs at any time: the runner
+// holds the baton and hands it over when it suspends (await task / sleep / park /
+// fd wait). Scheduling replays CPython's _run_once: a batch of the ready queue, then
+// one readiness poll (I/O first, then expired timers), so dual runs interleave
+// identically. Because there is never parallelism, Rc values are safe inside tasks.
+
+struct AioTaskRec {
+    go_m: Mutex<bool>,
+    go_cv: Condvar,
+}
+
+struct AioTaskSt {
+    rec: Arc<AioTaskRec>,
+    done: bool,
+    waiters: Vec<usize>,
+}
+
+struct AioFdWait {
+    h: i64,
+    write: bool,
+    tid: usize,
+    deadline: Option<std::time::Instant>,
+}
+
+struct AioLoop {
+    tasks: std::collections::HashMap<usize, AioTaskSt>,
+    ready: std::collections::VecDeque<usize>,
+    timers: Vec<(std::time::Instant, u64, usize)>,
+    fd_waits: Vec<AioFdWait>,
+    fd_results: std::collections::HashMap<usize, bool>,
+    current: usize,
+    next_id: usize,
+    seq: u64,
+    batch_left: usize,
+}
+
+static AIO: std::sync::OnceLock<Mutex<AioLoop>> = std::sync::OnceLock::new();
+
+thread_local! {
+    static AIO_TID: std::cell::Cell<usize> = std::cell::Cell::new(usize::MAX);
+}
+
+fn aio_loop() -> &'static Mutex<AioLoop> {
+    AIO.get_or_init(|| Mutex::new(AioLoop {
+        tasks: std::collections::HashMap::new(),
+        ready: std::collections::VecDeque::new(),
+        timers: Vec::new(),
+        fd_waits: Vec::new(),
+        fd_results: std::collections::HashMap::new(),
+        current: usize::MAX,
+        next_id: 0,
+        seq: 0,
+        batch_left: 0,
+    }))
+}
+
+fn aio_new_rec() -> Arc<AioTaskRec> {
+    Arc::new(AioTaskRec { go_m: Mutex::new(false), go_cv: Condvar::new() })
+}
+
+fn aio_register(lp: &mut AioLoop) -> usize {
+    let id = lp.next_id;
+    lp.next_id += 1;
+    lp.tasks.insert(id, AioTaskSt { rec: aio_new_rec(), done: false, waiters: Vec::new() });
+    id
+}
+
+// The calling thread's task id; the first caller on a thread becomes a task in place
+// (the main task of asyncio.run) and takes the baton if nobody holds it.
+fn aio_me(lp: &mut AioLoop) -> usize {
+    let cur = AIO_TID.with(|c| c.get());
+    if cur != usize::MAX {
+        return cur;
+    }
+    let id = aio_register(lp);
+    AIO_TID.with(|c| c.set(id));
+    if lp.current == usize::MAX {
+        lp.current = id;
+    }
+    id
+}
+
+fn aio_now() -> std::time::Instant { std::time::Instant::now() }
+
+fn aio_wait_go(rec: &AioTaskRec) {
+    let mut g = lock_ok(&rec.go_m);
+    while !*g {
+        g = rec.go_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    *g = false;
+}
+
+fn aio_signal_go(rec: &AioTaskRec) {
+    *lock_ok(&rec.go_m) = true;
+    rec.go_cv.notify_one();
+}
+
+// One CPython `_run_once` readiness pass: poll the waited fds (timeout_ms < 0 = until
+// the earliest deadline), queue I/O-ready tasks in registration order, then expired
+// timers in (when, seq) order, then timed-out fd waits.
+fn aio_select(lp: &mut AioLoop, block: bool) {
+    let now = aio_now();
+    let mut deadline: Option<std::time::Instant> = None;
+    if block {
+        for (t, _, _) in &lp.timers {
+            deadline = Some(match deadline { Some(d) if d <= *t => d, _ => *t });
+        }
+        for w in &lp.fd_waits {
+            if let Some(t) = w.deadline {
+                deadline = Some(match deadline { Some(d) if d <= t => d, _ => t });
+            }
+        }
+    }
+    let timeout_ms: i64 = if !block {
+        0
+    } else {
+        match deadline {
+            Some(d) => if d > now { (d - now).as_millis() as i64 + 1 } else { 0 },
+            None => -1,
+        }
+    };
+    if !lp.fd_waits.is_empty() {
+        let hs: Vec<i64> = lp.fd_waits.iter().map(|w| w.h).collect();
+        let refs = sock_get_many(&hs);
+        let mut instant: Vec<bool> = vec![false; hs.len()];
+        let mut fds: Vec<SockPollFd> = Vec::new();
+        let mut fd_idx: Vec<usize> = Vec::new();
+        for (k, slot) in refs.iter().enumerate() {
+            match slot {
+                None => instant[k] = true,
+                Some(arc) => {
+                    let rec = sock_lock(arc);
+                    let want_write = lp.fd_waits[k].write;
+                    let buffered = !want_write
+                        && matches!(&rec.kind, SockKind::Tls(c) if !c.dec.is_empty());
+                    if buffered {
+                        instant[k] = true;
+                    } else if let Some(fd) = sock_raw(&rec) {
+                        fds.push(SockPollFd {
+                            fd,
+                            events: if want_write { SOCK_POLL_OUT } else { SOCK_POLL_IN },
+                            revents: 0,
+                        });
+                        fd_idx.push(k);
+                    } else {
+                        instant[k] = true;
+                    }
+                }
+            }
+        }
+        let any_instant = instant.iter().any(|&f| f);
+        if !fds.is_empty() {
+            let wait = if any_instant { 0 } else if timeout_ms < 0 { 3_600_000 } else { timeout_ms };
+            let n = sys_poll(&mut fds, wait);
+            if n > 0 {
+                for (pos, &k) in fd_idx.iter().enumerate() {
+                    if fds[pos].revents != 0 {
+                        instant[k] = true;
+                    }
+                }
+            }
+        }
+        let mut keep: Vec<AioFdWait> = Vec::new();
+        for (k, w) in lp.fd_waits.drain(..).enumerate() {
+            if instant[k] {
+                lp.fd_results.insert(w.tid, true);
+                lp.ready.push_back(w.tid);
+            } else {
+                keep.push(w);
+            }
+        }
+        lp.fd_waits = keep;
+    } else if timeout_ms != 0 {
+        match deadline {
+            Some(d) => {
+                let now2 = aio_now();
+                if d > now2 {
+                    std::thread::sleep(d - now2);
+                }
+            }
+            None => {}
+        }
+    }
+    let now = aio_now();
+    lp.timers.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut rest: Vec<(std::time::Instant, u64, usize)> = Vec::new();
+    for (t, seq, tid) in lp.timers.drain(..) {
+        if t <= now {
+            lp.ready.push_back(tid);
+        } else {
+            rest.push((t, seq, tid));
+        }
+    }
+    lp.timers = rest;
+    let mut keep: Vec<AioFdWait> = Vec::new();
+    for w in lp.fd_waits.drain(..) {
+        match w.deadline {
+            Some(d) if d <= now => {
+                lp.fd_results.insert(w.tid, false);
+                lp.ready.push_back(w.tid);
+            }
+            _ => keep.push(w),
+        }
+    }
+    lp.fd_waits = keep;
+}
+
+// Hand the baton to the next runnable task; `me` has already been queued wherever it
+// belongs (ready / timers / waiters / fd_waits) or is exiting. Returns once `me` is
+// scheduled again (never, for an exiting task — the thread just ends).
+fn aio_switch(mut lp: std::sync::MutexGuard<'static, AioLoop>, me: usize, exiting: bool) {
+    loop {
+        if lp.batch_left == 0 {
+            aio_select(&mut lp, false);
+            lp.batch_left = lp.ready.len();
+        }
+        if let Some(next) = lp.ready.pop_front() {
+            lp.batch_left = lp.batch_left.saturating_sub(1);
+            if next == me {
+                return;
+            }
+            lp.current = next;
+            let rec = lp.tasks.get(&next).map(|t| t.rec.clone());
+            let mine = if exiting { None } else { lp.tasks.get(&me).map(|t| t.rec.clone()) };
+            drop(lp);
+            if let Some(r) = rec {
+                aio_signal_go(&r);
+            }
+            if let Some(m) = mine {
+                aio_wait_go(&m);
+            }
+            return;
+        }
+        if lp.timers.is_empty() && lp.fd_waits.is_empty() {
+            // Nothing can ever become runnable: the loop is stuck (CPython hangs too).
+            if exiting {
+                return;
+            }
+            let mine = lp.tasks.get(&me).map(|t| t.rec.clone());
+            drop(lp);
+            if let Some(m) = mine {
+                aio_wait_go(&m);
+            }
+            return;
+        }
+        aio_select(&mut lp, true);
+        lp.batch_left = lp.ready.len();
+    }
+}
+
+fn serp_aio_sleep(secs: f64) -> SRes<()> {
+    let lp0 = aio_loop();
+    let mut lp = lock_ok(lp0);
+    let me = aio_me(&mut lp);
+    if secs > 0.0 {
+        let when = aio_now() + std::time::Duration::from_secs_f64(secs);
+        lp.seq += 1;
+        let seq = lp.seq;
+        lp.timers.push((when, seq, me));
+    } else {
+        lp.ready.push_back(me);
+    }
+    aio_switch(lp, me, false);
+    Ok(())
+}
+
+fn serp_aio_current() -> i64 {
+    let mut lp = lock_ok(aio_loop());
+    aio_me(&mut lp) as i64
+}
+
+// Suspend until another task calls wake(me); a wake that arrives first is not lost
+// only if the waker runs after us — waiters must register before yielding, which
+// the facades do (append id, then park).
+fn serp_aio_park() -> SRes<()> {
+    let mut lp = lock_ok(aio_loop());
+    let me = aio_me(&mut lp);
+    aio_switch(lp, me, false);
+    Ok(())
+}
+
+fn serp_aio_wake(tid: i64) -> SRes<()> {
+    let mut lp = lock_ok(aio_loop());
+    let _ = aio_me(&mut lp);
+    let t = tid as usize;
+    if lp.tasks.contains_key(&t) && !lp.ready.contains(&t) {
+        lp.ready.push_back(t);
+    }
+    Ok(())
+}
+
+// Suspend until socket handle `h` is readable (write=false) or writable; returns
+// False on timeout (timeout_ms < 0 waits forever).
+fn serp_aio_wait_fd(h: i64, write: i64, timeout_ms: i64) -> SRes<bool> {
+    let mut lp = lock_ok(aio_loop());
+    let me = aio_me(&mut lp);
+    let deadline = if timeout_ms >= 0 {
+        Some(aio_now() + std::time::Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    };
+    lp.fd_waits.push(AioFdWait { h, write: write != 0, tid: me, deadline });
+    aio_switch(lp, me, false);
+    let mut lp = lock_ok(aio_loop());
+    Ok(lp.fd_results.remove(&me).unwrap_or(false))
+}
+
+fn serp_aio_running() -> bool {
+    AIO_TID.with(|c| c.get()) != usize::MAX
+}
+
+type AioBody = Box<dyn FnOnce() + Send>;
+
+// Create a task: its first step is queued at the back of the ready queue (CPython
+// call_soon); the body runs on a fresh thread once the baton reaches it.
+fn aio_task_spawn(body: AioBody) -> usize {
+    let mut lp = lock_ok(aio_loop());
+    let _ = aio_me(&mut lp);
+    let tid = aio_register(&mut lp);
+    let rec = lp.tasks.get(&tid).map(|t| t.rec.clone()).expect("task rec");
+    lp.ready.push_back(tid);
+    drop(lp);
+    std::thread::spawn(move || {
+        AIO_TID.with(|c| c.set(tid));
+        aio_wait_go(&rec);
+        body();
+        let mut lp = lock_ok(aio_loop());
+        let waiters: Vec<usize> = match lp.tasks.get_mut(&tid) {
+            Some(t) => { t.done = true; std::mem::take(&mut t.waiters) }
+            None => Vec::new(),
+        };
+        for w in waiters {
+            if !lp.ready.contains(&w) {
+                lp.ready.push_back(w);
+            }
+        }
+        aio_switch(lp, tid, true);
+    });
+    tid
+}
+
+fn aio_task_done(tid: usize) -> bool {
+    let lp = lock_ok(aio_loop());
+    lp.tasks.get(&tid).map(|t| t.done).unwrap_or(true)
+}
+
+// Block the current task until `tid` finishes (no-op when it already has).
+fn aio_task_wait(tid: usize) {
+    loop {
+        let mut lp = lock_ok(aio_loop());
+        let me = aio_me(&mut lp);
+        let done = lp.tasks.get(&tid).map(|t| t.done).unwrap_or(true);
+        if done {
+            return;
+        }
+        if let Some(t) = lp.tasks.get_mut(&tid) {
+            t.waiters.push(me);
+        }
+        aio_switch(lp, me, false);
+    }
+}
+
+pub struct STask<T> {
+    tid: usize,
+    slot: Arc<Mutex<Option<SRes<T>>>>,
+}
+
+fn serp_task_spawn<T, F>(f: F) -> STask<T>
+where T: Send + 'static, F: FnOnce() -> SRes<T> + Send + 'static {
+    let slot: Arc<Mutex<Option<SRes<T>>>> = Arc::new(Mutex::new(None));
+    let s2 = slot.clone();
+    let tid = aio_task_spawn(Box::new(move || {
+        let r = f();
+        *lock_ok(&s2) = Some(r);
+    }));
+    STask { tid, slot }
+}
+
+fn serp_task_await<T>(h: &STask<T>) -> SRes<T> {
+    aio_task_wait(h.tid);
+    match lock_ok(&h.slot).take() {
+        Some(r) => r,
+        None => Err(SerpErr::new("RuntimeError", "task result already taken".to_string())),
+    }
+}
+
+fn serp_task_done<T>(h: &STask<T>) -> bool { aio_task_done(h.tid) }
+
+// ----- asyncio sync primitives (handle tables; wake order mirrors CPython's
+// futures-scheduled-via-call_soon so dual runs interleave identically) -----
+
+struct AioEvent { set: bool, waiters: Vec<usize> }
+struct AioLock { locked: bool, waiters: Vec<(usize, bool)> }
+struct AioSem { value: i64, waiters: Vec<(usize, bool)> }
+struct AioQueue {
+    maxsize: i64,
+    items: std::collections::VecDeque<SendVal>,
+    getters: std::collections::VecDeque<usize>,
+    putters: std::collections::VecDeque<usize>,
+    unfinished: i64,
+    join_waiters: Vec<usize>,
+}
+
+static AIO_EVENTS: Mutex<Vec<AioEvent>> = Mutex::new(Vec::new());
+static AIO_LOCKS: Mutex<Vec<AioLock>> = Mutex::new(Vec::new());
+static AIO_SEMS: Mutex<Vec<AioSem>> = Mutex::new(Vec::new());
+static AIO_QUEUES: Mutex<Vec<AioQueue>> = Mutex::new(Vec::new());
+
+fn aio_idx<T>(tbl: &[T], h: i64, what: &str) -> SRes<usize> {
+    if h < 1 || h as usize > tbl.len() {
+        return serp_err("ValueError", format!("invalid {} handle", what));
+    }
+    Ok(h as usize - 1)
+}
+
+// Queue `tid` at the back of the ready queue (CPython: fut.set_result -> call_soon).
+fn aio_ready(tid: usize) {
+    let mut lp = lock_ok(aio_loop());
+    if lp.tasks.contains_key(&tid) && !lp.ready.contains(&tid) {
+        lp.ready.push_back(tid);
+    }
+}
+
+fn aio_me_now() -> usize {
+    let mut lp = lock_ok(aio_loop());
+    aio_me(&mut lp)
+}
+
+fn aio_park_now(me: usize) {
+    let lp = lock_ok(aio_loop());
+    aio_switch(lp, me, false);
+}
+
+fn serp_aio_ev_new() -> i64 {
+    let mut t = lock_ok(&AIO_EVENTS);
+    t.push(AioEvent { set: false, waiters: Vec::new() });
+    t.len() as i64
+}
+
+fn serp_aio_ev_set(h: i64) -> SRes<()> {
+    let waiters = {
+        let mut t = lock_ok(&AIO_EVENTS);
+        let i = aio_idx(&t, h, "event")?;
+        if t[i].set { return Ok(()); }
+        t[i].set = true;
+        std::mem::take(&mut t[i].waiters)
+    };
+    for w in waiters { aio_ready(w); }
+    Ok(())
+}
+
+fn serp_aio_ev_clear(h: i64) -> SRes<()> {
+    let mut t = lock_ok(&AIO_EVENTS);
+    let i = aio_idx(&t, h, "event")?;
+    t[i].set = false;
+    Ok(())
+}
+
+fn serp_aio_ev_is_set(h: i64) -> SRes<bool> {
+    let t = lock_ok(&AIO_EVENTS);
+    let i = aio_idx(&t, h, "event")?;
+    Ok(t[i].set)
+}
+
+fn serp_aio_ev_wait(h: i64) -> SRes<bool> {
+    let me = aio_me_now();
+    loop {
+        {
+            let mut t = lock_ok(&AIO_EVENTS);
+            let i = aio_idx(&t, h, "event")?;
+            if t[i].set { return Ok(true); }
+            t[i].waiters.push(me);
+        }
+        aio_park_now(me);
+    }
+}
+
+fn serp_aio_lock_new() -> i64 {
+    let mut t = lock_ok(&AIO_LOCKS);
+    t.push(AioLock { locked: false, waiters: Vec::new() });
+    t.len() as i64
+}
+
+// CPython Lock.acquire: fast path only when unlocked AND nobody is queued; a
+// woken waiter stays queued until it runs, so newcomers cannot barge in.
+fn serp_aio_lock_acquire(h: i64) -> SRes<bool> {
+    let me = aio_me_now();
+    {
+        let mut t = lock_ok(&AIO_LOCKS);
+        let i = aio_idx(&t, h, "lock")?;
+        if !t[i].locked && t[i].waiters.is_empty() {
+            t[i].locked = true;
+            return Ok(true);
+        }
+        t[i].waiters.push((me, false));
+    }
+    loop {
+        aio_park_now(me);
+        let mut t = lock_ok(&AIO_LOCKS);
+        let i = aio_idx(&t, h, "lock")?;
+        let pos = t[i].waiters.iter().position(|(w, _)| *w == me);
+        match pos {
+            Some(p) if t[i].waiters[p].1 => {
+                t[i].waiters.remove(p);
+                t[i].locked = true;
+                return Ok(true);
+            }
+            _ => continue,
+        }
+    }
+}
+
+fn serp_aio_lock_release(h: i64) -> SRes<()> {
+    let next = {
+        let mut t = lock_ok(&AIO_LOCKS);
+        let i = aio_idx(&t, h, "lock")?;
+        if !t[i].locked {
+            return serp_err("RuntimeError", "Lock is not acquired.".into());
+        }
+        t[i].locked = false;
+        match t[i].waiters.iter_mut().find(|(_, woken)| !*woken) {
+            Some(w) => { w.1 = true; Some(w.0) }
+            None => None,
+        }
+    };
+    if let Some(w) = next { aio_ready(w); }
+    Ok(())
+}
+
+fn serp_aio_lock_locked(h: i64) -> SRes<bool> {
+    let t = lock_ok(&AIO_LOCKS);
+    let i = aio_idx(&t, h, "lock")?;
+    Ok(t[i].locked)
+}
+
+fn serp_aio_sem_new(value: i64) -> SRes<i64> {
+    if value < 0 {
+        return serp_err("ValueError", "Semaphore initial value must be >= 0".into());
+    }
+    let mut t = lock_ok(&AIO_SEMS);
+    t.push(AioSem { value, waiters: Vec::new() });
+    Ok(t.len() as i64)
+}
+
+fn aio_sem_wake_next(s: &mut AioSem) -> Option<usize> {
+    match s.waiters.iter_mut().find(|(_, woken)| !*woken) {
+        Some(w) => { w.1 = true; Some(w.0) }
+        None => None,
+    }
+}
+
+// CPython 3.11.1+ Semaphore: FIFO fairness (locked() is true while anyone waits);
+// a woken waiter takes one unit and passes any surplus to the next waiter.
+fn serp_aio_sem_acquire(h: i64) -> SRes<bool> {
+    let me = aio_me_now();
+    {
+        let mut t = lock_ok(&AIO_SEMS);
+        let i = aio_idx(&t, h, "semaphore")?;
+        if t[i].value > 0 && t[i].waiters.is_empty() {
+            t[i].value -= 1;
+            return Ok(true);
+        }
+        t[i].waiters.push((me, false));
+    }
+    loop {
+        aio_park_now(me);
+        let next = {
+            let mut t = lock_ok(&AIO_SEMS);
+            let i = aio_idx(&t, h, "semaphore")?;
+            let pos = t[i].waiters.iter().position(|(w, _)| *w == me);
+            match pos {
+                Some(p) if t[i].waiters[p].1 => {
+                    t[i].waiters.remove(p);
+                    t[i].value -= 1;
+                    if t[i].value > 0 { aio_sem_wake_next(&mut t[i]) } else { None }
+                }
+                _ => continue,
+            }
+        };
+        if let Some(w) = next { aio_ready(w); }
+        return Ok(true);
+    }
+}
+
+fn serp_aio_sem_release(h: i64, bounded: i64, initial: i64) -> SRes<()> {
+    let next = {
+        let mut t = lock_ok(&AIO_SEMS);
+        let i = aio_idx(&t, h, "semaphore")?;
+        if bounded != 0 && t[i].value >= initial {
+            return serp_err("ValueError", "BoundedSemaphore released too many times".into());
+        }
+        t[i].value += 1;
+        aio_sem_wake_next(&mut t[i])
+    };
+    if let Some(w) = next { aio_ready(w); }
+    Ok(())
+}
+
+fn serp_aio_sem_locked(h: i64) -> SRes<bool> {
+    let t = lock_ok(&AIO_SEMS);
+    let i = aio_idx(&t, h, "semaphore")?;
+    Ok(t[i].value == 0 || !t[i].waiters.is_empty())
+}
+
+fn serp_aio_sem_value(h: i64) -> SRes<i64> {
+    let t = lock_ok(&AIO_SEMS);
+    let i = aio_idx(&t, h, "semaphore")?;
+    Ok(t[i].value)
+}
+
+fn serp_aio_q_new(maxsize: i64) -> i64 {
+    let mut t = lock_ok(&AIO_QUEUES);
+    t.push(AioQueue {
+        maxsize,
+        items: std::collections::VecDeque::new(),
+        getters: std::collections::VecDeque::new(),
+        putters: std::collections::VecDeque::new(),
+        unfinished: 0,
+        join_waiters: Vec::new(),
+    });
+    t.len() as i64
+}
+
+fn aio_q_full(q: &AioQueue) -> bool { q.maxsize > 0 && q.items.len() as i64 >= q.maxsize }
+
+// asyncio.Queue.put: wait while full (re-checking after each wake), then put_nowait.
+fn serp_aio_q_put(h: i64, item: &PVal, nowait: i64) -> SRes<bool> {
+    let me = aio_me_now();
+    loop {
+        let wake = {
+            let mut t = lock_ok(&AIO_QUEUES);
+            let i = aio_idx(&t, h, "queue")?;
+            if aio_q_full(&t[i]) {
+                if nowait != 0 { return Ok(false); }
+                t[i].putters.push_back(me);
+                None
+            } else {
+                let sv = pv_to_send(item);
+                t[i].items.push_back(sv);
+                t[i].unfinished += 1;
+                Some(t[i].getters.pop_front())
+            }
+        };
+        match wake {
+            None => aio_park_now(me),
+            Some(g) => {
+                if let Some(g) = g { aio_ready(g); }
+                return Ok(true);
+            }
+        }
+    }
+}
+
+fn serp_aio_q_get(h: i64, nowait: i64) -> SRes<bool> {
+    let me = aio_me_now();
+    loop {
+        let got = {
+            let mut t = lock_ok(&AIO_QUEUES);
+            let i = aio_idx(&t, h, "queue")?;
+            match t[i].items.pop_front() {
+                None => {
+                    if nowait != 0 { return Ok(false); }
+                    t[i].getters.push_back(me);
+                    None
+                }
+                Some(sv) => Some((sv, t[i].putters.pop_front())),
+            }
+        };
+        match got {
+            None => aio_park_now(me),
+            Some((sv, p)) => {
+                Q_LAST.with(|c| *c.borrow_mut() = Some(send_to_pv(sv)));
+                if let Some(p) = p { aio_ready(p); }
+                return Ok(true);
+            }
+        }
+    }
+}
+
+fn serp_aio_q_qsize(h: i64) -> SRes<i64> {
+    let t = lock_ok(&AIO_QUEUES);
+    let i = aio_idx(&t, h, "queue")?;
+    Ok(t[i].items.len() as i64)
+}
+
+fn serp_aio_q_maxsize(h: i64) -> SRes<i64> {
+    let t = lock_ok(&AIO_QUEUES);
+    let i = aio_idx(&t, h, "queue")?;
+    Ok(t[i].maxsize)
+}
+
+fn serp_aio_q_task_done(h: i64) -> SRes<()> {
+    let waiters = {
+        let mut t = lock_ok(&AIO_QUEUES);
+        let i = aio_idx(&t, h, "queue")?;
+        if t[i].unfinished <= 0 {
+            return serp_err("ValueError", "task_done() called too many times".into());
+        }
+        t[i].unfinished -= 1;
+        if t[i].unfinished == 0 { std::mem::take(&mut t[i].join_waiters) } else { Vec::new() }
+    };
+    for w in waiters { aio_ready(w); }
+    Ok(())
+}
+
+fn serp_aio_q_join(h: i64) -> SRes<()> {
+    let me = aio_me_now();
+    loop {
+        {
+            let mut t = lock_ok(&AIO_QUEUES);
+            let i = aio_idx(&t, h, "queue")?;
+            if t[i].unfinished == 0 { return Ok(()); }
+            t[i].join_waiters.push(me);
+        }
+        aio_park_now(me);
+    }
+}
+
+// ----- locks -----
+
+struct LockSt { locked: bool, owner: i64, count: i64 }
+struct LockRec { m: Mutex<LockSt>, cv: Condvar }
+static LOCKS: Mutex<Vec<Arc<LockRec>>> = Mutex::new(Vec::new());
+
+fn table_get<T>(tbl: &Mutex<Vec<Arc<T>>>, h: i64, what: &str) -> SRes<Arc<T>> {
+    let v = lock_ok(tbl);
+    if h < 1 || h as usize > v.len() {
+        return serp_err("ValueError", format!("invalid {} handle", what));
+    }
+    Ok(v[h as usize - 1].clone())
+}
+
+fn table_push<T>(tbl: &Mutex<Vec<Arc<T>>>, rec: Arc<T>) -> i64 {
+    let mut v = lock_ok(tbl);
+    v.push(rec);
+    v.len() as i64
+}
+
+fn serp_lock_new() -> i64 {
+    table_push(&LOCKS, Arc::new(LockRec {
+        m: Mutex::new(LockSt { locked: false, owner: 0, count: 0 }), cv: Condvar::new() }))
+}
+
+fn wait_deadline<'a, T>(cv: &Condvar, g: std::sync::MutexGuard<'a, T>,
+                        deadline: Option<std::time::Instant>)
+                        -> (std::sync::MutexGuard<'a, T>, bool) {
+    match deadline {
+        None => (cv.wait(g).unwrap_or_else(|e| e.into_inner()), false),
+        Some(d) => {
+            let now = std::time::Instant::now();
+            if now >= d { return (g, true); }
+            let (g, _) = cv.wait_timeout(g, d - now).unwrap_or_else(|e| e.into_inner());
+            (g, false)
+        }
+    }
+}
+
+fn deadline_of(timeout_ms: i64) -> Option<std::time::Instant> {
+    if timeout_ms < 0 { None }
+    else { Some(std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64)) }
+}
+
+fn serp_lock_acquire(h: i64, timeout_ms: i64, reentrant_flag: i64) -> SRes<bool> {
+    let reentrant = reentrant_flag != 0;
+    let rec = table_get(&LOCKS, h, "lock")?;
+    let me = th_ident();
+    let mut st = lock_ok(&rec.m);
+    if reentrant && st.locked && st.owner == me {
+        st.count += 1;
+        return Ok(true);
+    }
+    let deadline = deadline_of(timeout_ms);
+    while st.locked {
+        if timeout_ms == 0 { return Ok(false); }
+        let (g, expired) = wait_deadline(&rec.cv, st, deadline);
+        st = g;
+        if expired && st.locked { return Ok(false); }
+    }
+    st.locked = true;
+    st.owner = me;
+    st.count = 1;
+    Ok(true)
+}
+
+fn serp_lock_release(h: i64, reentrant_flag: i64) -> SRes<()> {
+    let reentrant = reentrant_flag != 0;
+    let rec = table_get(&LOCKS, h, "lock")?;
+    let mut st = lock_ok(&rec.m);
+    if !st.locked {
+        return serp_err("RuntimeError", if reentrant {
+            "cannot release un-acquired lock".into() } else { "release unlocked lock".into() });
+    }
+    if reentrant && st.owner != th_ident() {
+        return serp_err("RuntimeError", "cannot release un-acquired lock".into());
+    }
+    st.count -= 1;
+    if st.count <= 0 {
+        st.locked = false;
+        st.owner = 0;
+        st.count = 0;
+        drop(st);
+        rec.cv.notify_one();
+    }
+    Ok(())
+}
+
+fn serp_lock_locked(h: i64) -> SRes<bool> {
+    Ok(lock_ok(&table_get(&LOCKS, h, "lock")?.m).locked)
+}
+
+fn serp_lock_owned(h: i64) -> SRes<bool> {
+    let rec = table_get(&LOCKS, h, "lock")?;
+    let st = lock_ok(&rec.m);
+    Ok(st.locked && st.owner == th_ident())
+}
+
+fn lock_release_save(rec: &LockRec) -> SRes<i64> {
+    let mut st = lock_ok(&rec.m);
+    if !st.locked || st.owner != th_ident() {
+        return serp_err("RuntimeError", "cannot wait on un-acquired lock".into());
+    }
+    let saved = st.count;
+    st.locked = false;
+    st.owner = 0;
+    st.count = 0;
+    drop(st);
+    rec.cv.notify_one();
+    Ok(saved)
+}
+
+fn lock_acquire_restore(rec: &LockRec, count: i64) {
+    let mut st = lock_ok(&rec.m);
+    while st.locked {
+        st = rec.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    st.locked = true;
+    st.owner = th_ident();
+    st.count = count.max(1);
+}
+
+// ----- events -----
+
+struct EventRec { m: Mutex<bool>, cv: Condvar }
+static EVENTS: Mutex<Vec<Arc<EventRec>>> = Mutex::new(Vec::new());
+
+fn serp_event_new() -> i64 {
+    table_push(&EVENTS, Arc::new(EventRec { m: Mutex::new(false), cv: Condvar::new() }))
+}
+
+fn serp_event_set(h: i64) -> SRes<()> {
+    let rec = table_get(&EVENTS, h, "event")?;
+    *lock_ok(&rec.m) = true;
+    rec.cv.notify_all();
+    Ok(())
+}
+
+fn serp_event_clear(h: i64) -> SRes<()> {
+    *lock_ok(&table_get(&EVENTS, h, "event")?.m) = false;
+    Ok(())
+}
+
+fn serp_event_is_set(h: i64) -> SRes<bool> {
+    Ok(*lock_ok(&table_get(&EVENTS, h, "event")?.m))
+}
+
+fn serp_event_wait(h: i64, timeout_ms: i64) -> SRes<bool> {
+    let rec = table_get(&EVENTS, h, "event")?;
+    let deadline = deadline_of(timeout_ms);
+    let mut st = lock_ok(&rec.m);
+    while !*st {
+        if timeout_ms == 0 { return Ok(false); }
+        let (g, expired) = wait_deadline(&rec.cv, st, deadline);
+        st = g;
+        if expired && !*st { return Ok(false); }
+    }
+    Ok(true)
+}
+
+// ----- semaphores -----
+
+struct SemRec { m: Mutex<i64>, cv: Condvar }
+static SEMS: Mutex<Vec<Arc<SemRec>>> = Mutex::new(Vec::new());
+
+fn serp_sem_new(value: i64) -> SRes<i64> {
+    if value < 0 {
+        return serp_err("ValueError", "semaphore initial value must be >= 0".into());
+    }
+    Ok(table_push(&SEMS, Arc::new(SemRec { m: Mutex::new(value), cv: Condvar::new() })))
+}
+
+fn serp_sem_acquire(h: i64, timeout_ms: i64) -> SRes<bool> {
+    let rec = table_get(&SEMS, h, "semaphore")?;
+    let deadline = deadline_of(timeout_ms);
+    let mut st = lock_ok(&rec.m);
+    while *st <= 0 {
+        if timeout_ms == 0 { return Ok(false); }
+        let (g, expired) = wait_deadline(&rec.cv, st, deadline);
+        st = g;
+        if expired && *st <= 0 { return Ok(false); }
+    }
+    *st -= 1;
+    Ok(true)
+}
+
+fn serp_sem_release(h: i64, n: i64) -> SRes<()> {
+    if n < 1 {
+        return serp_err("ValueError", "n must be one or more".into());
+    }
+    let rec = table_get(&SEMS, h, "semaphore")?;
+    *lock_ok(&rec.m) += n;
+    rec.cv.notify_all();
+    Ok(())
+}
+
+fn serp_sem_value(h: i64) -> SRes<i64> {
+    Ok(*lock_ok(&table_get(&SEMS, h, "semaphore")?.m))
+}
+
+// ----- conditions -----
+
+struct CondSt { waiting: i64, tickets: i64 }
+struct CondRec { m: Mutex<CondSt>, cv: Condvar }
+static CONDS: Mutex<Vec<Arc<CondRec>>> = Mutex::new(Vec::new());
+
+fn serp_cond_new() -> i64 {
+    table_push(&CONDS, Arc::new(CondRec {
+        m: Mutex::new(CondSt { waiting: 0, tickets: 0 }), cv: Condvar::new() }))
+}
+
+fn serp_cond_wait(h: i64, lock_h: i64, timeout_ms: i64) -> SRes<bool> {
+    let cond = table_get(&CONDS, h, "condition")?;
+    let lock = table_get(&LOCKS, lock_h, "lock")?;
+    let saved = lock_release_save(&lock)?;
+    let deadline = deadline_of(timeout_ms);
+    let got;
+    {
+        let mut st = lock_ok(&cond.m);
+        st.waiting += 1;
+        loop {
+            if st.tickets > 0 {
+                st.tickets -= 1;
+                st.waiting -= 1;
+                got = true;
+                break;
+            }
+            if timeout_ms == 0 {
+                st.waiting -= 1;
+                got = false;
+                break;
+            }
+            let (g, expired) = wait_deadline(&cond.cv, st, deadline);
+            st = g;
+            if expired && st.tickets <= 0 {
+                st.waiting -= 1;
+                got = false;
+                break;
+            }
+        }
+    }
+    lock_acquire_restore(&lock, saved);
+    Ok(got)
+}
+
+fn serp_cond_notify(h: i64, n: i64) -> SRes<()> {
+    let cond = table_get(&CONDS, h, "condition")?;
+    let mut st = lock_ok(&cond.m);
+    let avail = (st.waiting - st.tickets).max(0);
+    st.tickets += n.min(avail);
+    drop(st);
+    cond.cv.notify_all();
+    Ok(())
+}
+
+// ----- barriers -----
+
+struct BarSt { count: i64, generation: i64, broken: bool }
+struct BarRec { parties: i64, m: Mutex<BarSt>, cv: Condvar }
+static BARS: Mutex<Vec<Arc<BarRec>>> = Mutex::new(Vec::new());
+
+fn serp_barrier_new(parties: i64) -> SRes<i64> {
+    if parties < 1 {
+        return serp_err("ValueError", "parties must be > 0".into());
+    }
+    Ok(table_push(&BARS, Arc::new(BarRec { parties,
+        m: Mutex::new(BarSt { count: 0, generation: 0, broken: false }), cv: Condvar::new() })))
+}
+
+// Returns the arrival index, -1 when the barrier is broken, -2 on timeout (breaks it).
+fn serp_barrier_wait(h: i64, timeout_ms: i64) -> SRes<i64> {
+    let rec = table_get(&BARS, h, "barrier")?;
+    let deadline = deadline_of(timeout_ms);
+    let mut st = lock_ok(&rec.m);
+    if st.broken { return Ok(-1); }
+    let idx = st.count;
+    st.count += 1;
+    if st.count == rec.parties {
+        st.count = 0;
+        st.generation += 1;
+        drop(st);
+        rec.cv.notify_all();
+        return Ok(idx);
+    }
+    let gen = st.generation;
+    while st.generation == gen && !st.broken {
+        let (g, expired) = wait_deadline(&rec.cv, st, deadline);
+        st = g;
+        if expired && st.generation == gen && !st.broken {
+            st.broken = true;
+            drop(st);
+            rec.cv.notify_all();
+            return Ok(-2);
+        }
+    }
+    if st.broken && st.generation == gen { return Ok(-1); }
+    Ok(idx)
+}
+
+fn serp_barrier_reset(h: i64) -> SRes<()> {
+    let rec = table_get(&BARS, h, "barrier")?;
+    let mut st = lock_ok(&rec.m);
+    if st.count > 0 {
+        st.broken = true;
+        st.generation += 1;
+    } else {
+        st.broken = false;
+    }
+    st.count = 0;
+    drop(st);
+    rec.cv.notify_all();
+    Ok(())
+}
+
+fn serp_barrier_abort(h: i64) -> SRes<()> {
+    let rec = table_get(&BARS, h, "barrier")?;
+    lock_ok(&rec.m).broken = true;
+    rec.cv.notify_all();
+    Ok(())
+}
+
+fn serp_barrier_parties(h: i64) -> SRes<i64> { Ok(table_get(&BARS, h, "barrier")?.parties) }
+
+fn serp_barrier_n_waiting(h: i64) -> SRes<i64> {
+    Ok(lock_ok(&table_get(&BARS, h, "barrier")?.m).count)
+}
+
+fn serp_barrier_broken(h: i64) -> SRes<bool> {
+    Ok(lock_ok(&table_get(&BARS, h, "barrier")?.m).broken)
+}
+
+// ----- queues (PyVal items deep-copied across threads) -----
+
+enum SendVal {
+    None_, Bool(bool), Int(i64), Float(f64), Str(String), Bytes(Vec<u8>),
+    List(Vec<SendVal>), Dict(Vec<(SendVal, SendVal)>),
+}
+
+fn pv_to_send(v: &PVal) -> SendVal {
+    match &*v.0 {
+        PValRepr::None_ => SendVal::None_,
+        PValRepr::Bool(b) => SendVal::Bool(*b),
+        PValRepr::Int(i) => SendVal::Int(*i),
+        PValRepr::Float(f) => SendVal::Float(*f),
+        PValRepr::Str(s) => SendVal::Str(s.as_str().to_string()),
+        PValRepr::Bytes(b) => SendVal::Bytes((*b.v).clone()),
+        PValRepr::List(l) => SendVal::List(l.iter().map(pv_to_send).collect()),
+        PValRepr::Dict(d) => SendVal::Dict(
+            d.items_it().map(|(k, val)| (pv_to_send(k), pv_to_send(val))).collect()),
+    }
+}
+
+fn send_to_pv(v: SendVal) -> PVal {
+    match v {
+        SendVal::None_ => pyval_none(),
+        SendVal::Bool(b) => pyval_bool(b),
+        SendVal::Int(i) => pyval_int(i),
+        SendVal::Float(f) => pyval_float(f),
+        SendVal::Str(s) => pyval_str(sstring(s)),
+        SendVal::Bytes(b) => pyval_bytes(sbytes(b)),
+        SendVal::List(l) => pyval_list(l.into_iter().map(send_to_pv).collect()),
+        SendVal::Dict(d) => {
+            let mut out: SerpDict<PVal, PVal> = SerpDict::new();
+            for (k, val) in d { out.set(send_to_pv(k), send_to_pv(val)); }
+            pyval_dict(out)
+        }
+    }
+}
+
+struct QSt { items: std::collections::VecDeque<SendVal>, unfinished: i64 }
+struct QueueRec { maxsize: i64, lifo: bool, m: Mutex<QSt>, not_empty: Condvar,
+                  not_full: Condvar, all_done: Condvar }
+static QUEUES: Mutex<Vec<Arc<QueueRec>>> = Mutex::new(Vec::new());
+
+fn serp_q_new(maxsize: i64, lifo_flag: i64) -> i64 {
+    let lifo = lifo_flag != 0;
+    table_push(&QUEUES, Arc::new(QueueRec { maxsize, lifo,
+        m: Mutex::new(QSt { items: std::collections::VecDeque::new(), unfinished: 0 }),
+        not_empty: Condvar::new(), not_full: Condvar::new(), all_done: Condvar::new() }))
+}
+
+fn serp_q_put(h: i64, item: &PVal, block_flag: i64, timeout_ms: i64) -> SRes<bool> {
+    let block = block_flag != 0;
+    let q = table_get(&QUEUES, h, "queue")?;
+    let deadline = deadline_of(timeout_ms);
+    let mut st = lock_ok(&q.m);
+    if q.maxsize > 0 {
+        while st.items.len() as i64 >= q.maxsize {
+            if !block || timeout_ms == 0 { return Ok(false); }
+            let (g, expired) = wait_deadline(&q.not_full, st, deadline);
+            st = g;
+            if expired && st.items.len() as i64 >= q.maxsize { return Ok(false); }
+        }
+    }
+    st.items.push_back(pv_to_send(item));
+    st.unfinished += 1;
+    drop(st);
+    q.not_empty.notify_one();
+    Ok(true)
+}
+
+fn serp_q_get(h: i64, block_flag: i64, timeout_ms: i64) -> SRes<bool> {
+    let block = block_flag != 0;
+    let q = table_get(&QUEUES, h, "queue")?;
+    let deadline = deadline_of(timeout_ms);
+    let mut st = lock_ok(&q.m);
+    while st.items.is_empty() {
+        if !block || timeout_ms == 0 { return Ok(false); }
+        let (g, expired) = wait_deadline(&q.not_empty, st, deadline);
+        st = g;
+        if expired && st.items.is_empty() { return Ok(false); }
+    }
+    let item = if q.lifo { st.items.pop_back() } else { st.items.pop_front() };
+    drop(st);
+    q.not_full.notify_one();
+    Q_LAST.with(|c| *c.borrow_mut() = item.map(send_to_pv));
+    Ok(true)
+}
+
+fn serp_q_last() -> PVal {
+    Q_LAST.with(|c| c.borrow_mut().take().unwrap_or_else(pyval_none))
+}
+
+fn serp_q_qsize(h: i64) -> SRes<i64> {
+    Ok(lock_ok(&table_get(&QUEUES, h, "queue")?.m).items.len() as i64)
+}
+
+fn serp_q_task_done(h: i64) -> SRes<()> {
+    let q = table_get(&QUEUES, h, "queue")?;
+    let mut st = lock_ok(&q.m);
+    if st.unfinished <= 0 {
+        return serp_err("ValueError", "task_done() called too many times".into());
+    }
+    st.unfinished -= 1;
+    if st.unfinished == 0 {
+        drop(st);
+        q.all_done.notify_all();
+    }
+    Ok(())
+}
+
+fn serp_q_join(h: i64) -> SRes<()> {
+    let q = table_get(&QUEUES, h, "queue")?;
+    let mut st = lock_ok(&q.m);
+    while st.unfinished > 0 {
+        st = q.all_done.wait(st).unwrap_or_else(|e| e.into_inner());
+    }
+    Ok(())
 }

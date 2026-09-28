@@ -66,6 +66,23 @@ def objects_section() -> None:
         print("caught:", e)
     nowd = utcnow()
     print(nowd.year >= 2026)
+    print(date.fromisoformat("2024-02-29").isoformat())
+    print(datetime.fromisoformat("2026-07-22T14:30:05").isoformat())
+    print(datetime.fromisoformat("2026-07-22 14:30").isoformat())
+    print(datetime.fromisoformat("2026-07-22T14:30:05.5Z").isoformat())
+    print(datetime.fromisoformat("2026-07-22").isoformat())
+    print(datetime.fromtimestamp(0.0).isoformat())
+    isobad: list[str] = ["2026-07", "2026-7-22", "2026-07-22T14",
+                         "2026-07-22T14:30:05+01:00", "2026-07-22T14:30:05.1234567"]
+    for s in isobad:
+        try:
+            print(datetime.fromisoformat(s).isoformat())
+        except ValueError as e6:
+            print("caught:", e6)
+    try:
+        print(date.fromisoformat("2026-07-22T14:30").isoformat())
+    except ValueError as e7:
+        print("caught:", e7)
     print(d1)
     print(str(d2), f"day={d1}")
     print(t1)

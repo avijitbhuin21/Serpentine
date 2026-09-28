@@ -18,13 +18,15 @@ scope-exit and unwind-path drops share one mechanism (SIR's drop discipline).
 """
 
 import ast
+import re
 
 from llvmlite import ir
 
 from .frontend import Module, exc_handler_names
-from .ptypes import (Type, TBool, TByteArray, TBytes, TClass, TDict, TExc, TFile, TFloat,
-                     TFunc, TInt, TList, TNone, TOptional, TPyVal, TShared, TStr, TTuple,
-                     TWeak, mangle_type, subst_type)
+from .ptypes import (NONE, Type, TBool, TByteArray, TBytes, TClass, TDict, TEnum, TExc, TFile,
+                     TFloat,
+                     TFunc, TInt, TJoin, TList, TNone, TOptional, TPyVal, TSet, TShared, TStr, TThread,
+                     TTuple, TUnion, TWeak, mangle_type, subst_type, union_slot, walk_types)
 from .typecheck import FuncSig, Param, TIterObj, TypeChecker
 
 I64 = ir.IntType(64)
@@ -46,7 +48,16 @@ DTORTY = ir.FunctionType(VOID, [I8P])             # closure-env destructor
 
 OVERFLOW_MSG = "Serpentine int operation overflowed 64 bits"
 
-SCALARS = (TInt, TFloat, TBool)
+SCALARS = (TInt, TFloat, TBool, TEnum)
+
+
+def _tykey(t: Type) -> str:
+    """A mangling key that keeps same-named classes from different modules apart."""
+    parts = [mangle_type(t)]
+    for s in walk_types(t):
+        if isinstance(s, (TClass, TEnum)):
+            parts.append(f"{s.module}_{s.name}")
+    return re.sub(r"[^A-Za-z0-9]+", "_", "__".join(parts)).strip("_")
 
 
 class LLVMUnsupported(Exception):
@@ -62,6 +73,8 @@ def needs_clone(t: Type) -> bool:
         return any(needs_clone(i) for i in t.items)
     if isinstance(t, TOptional):
         return needs_clone(t.inner)
+    if isinstance(t, TUnion):
+        return any(needs_clone(m) for m in t.members)
     return False
 
 
@@ -132,6 +145,48 @@ RT_SIGS = {
     "rt_list_reverse": (VOID, [SLISTP, I64]),
     "rt_shared_alloc": (I8P, [I64]),
     "rt_shared_free": (VOID, [I8P, I64]),
+    "rt_buf_alloc": (I8P, [I64]),
+    "rt_buf_free": (VOID, [I8P, I64]),
+    "rt_str_send": (I8P, [SSTRP]),
+    "rt_str_recv": (VOID, [I8P, SSTRP]),
+    "rt_bytes_send": (I8P, [I8P]),
+    "rt_bytes_recv": (I8P, [I8P]),
+    "rt_box_ok": (I8P, [I64]),
+    "rt_box_err": (I8P, []),
+    "rt_thread_spawn": (I8P, [I8P, I8P]),
+    "rt_thread_join": (I8, [I8P, I64.as_pointer()]),
+    "rt_thread_drop": (VOID, [I8P]),
+    "rt_task_spawn": (I8P, [I8P, I8P]),
+    "rt_task_await": (I8, [I8P, I64.as_pointer()]),
+    "rt_task_done": (I8, [I8P]),
+    "rt_task_drop": (VOID, [I8P]),
+    "rt_aio_sleep": (I8, [F64]),
+    "rt_aio_current": (I64, []),
+    "rt_aio_park": (I8, []),
+    "rt_aio_wake": (I8, [I64]),
+    "rt_aio_wait_fd": (I8, [I64, I64, I64, I8.as_pointer()]),
+    "rt_aio_running": (I8, []),
+    "rt_aio_ev_new": (I64, []),
+    "rt_aio_ev_set": (I8, [I64]),
+    "rt_aio_ev_clear": (I8, [I64]),
+    "rt_aio_ev_is_set": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_ev_wait": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_lock_new": (I64, []),
+    "rt_aio_lock_acquire": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_lock_release": (I8, [I64]),
+    "rt_aio_lock_locked": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_sem_new": (I8, [I64, I64.as_pointer()]),
+    "rt_aio_sem_acquire": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_sem_release": (I8, [I64, I64, I64]),
+    "rt_aio_sem_locked": (I8, [I64, I8.as_pointer()]),
+    "rt_aio_sem_value": (I8, [I64, I64.as_pointer()]),
+    "rt_aio_q_new": (I64, [I64]),
+    "rt_aio_q_put": (I8, [I64, I8P, I64, I8.as_pointer()]),
+    "rt_aio_q_get": (I8, [I64, I64, I8.as_pointer()]),
+    "rt_aio_q_qsize": (I8, [I64, I64.as_pointer()]),
+    "rt_aio_q_maxsize": (I8, [I64, I64.as_pointer()]),
+    "rt_aio_q_task_done": (I8, [I64]),
+    "rt_aio_q_join": (I8, [I64]),
     "rt_file_open": (I8, [SSTRP, SSTRP, I8P.as_pointer()]),
     "rt_file_read": (I8, [I8P, SSTRP]),
     "rt_file_write": (I8, [I8P, SSTRP, I64.as_pointer()]),
@@ -264,14 +319,80 @@ RT_SIGS = {
     "rt_sqlite_col_blob": (I8, [I64, I64, I8P.as_pointer()]),
     "rt_sqlite_reset": (I8, [I64]),
     "rt_sqlite_finalize": (I8, [I64]),
+    "rt_sp_spawn": (I8, [SSTRP, SSTRP, SSTRP, I64, I64.as_pointer()]),
+    "rt_sp_pid": (I8, [I64, I64.as_pointer()]),
+    "rt_sp_communicate": (I8, [I64, I8P, I64, I64, I8.as_pointer()]),
+    "rt_sp_wait": (I8, [I64, I64, I8.as_pointer()]),
+    "rt_sp_poll": (I8, [I64, I8.as_pointer()]),
+    "rt_sp_returncode": (I8, [I64, I64.as_pointer()]),
+    "rt_sp_stdout": (I8, [I64, I8P.as_pointer()]),
+    "rt_sp_stderr": (I8, [I64, I8P.as_pointer()]),
+    "rt_sp_kill": (I8, [I64]),
+    "rt_sp_terminate": (I8, [I64]),
+    "rt_sp_free": (I8, [I64]),
+    "rt_thread_new": (I8P, [I8P, I8P, SSTRP, I64, I8, I64, SSTRP]),
+    "rt_thread_start": (I8, [I8P]),
+    "rt_thread_join_t": (I8, [I8P, I64]),
+    "rt_thread_alive": (I8, [I8P]),
+    "rt_thread_name": (VOID, [I8P, SSTRP]),
+    "rt_thread_set_name": (VOID, [I8P, SSTRP]),
+    "rt_thread_ident": (I64, [I8P]),
+    "rt_thread_daemon": (I8, [I8P]),
+    "rt_thread_cancel": (VOID, [I8P]),
+    "rt_thread_free": (VOID, [I8P]),
+    "rt_threads_join_all": (VOID, []),
+    "rt_th_ident": (I64, []),
+    "rt_th_name": (VOID, [SSTRP]),
+    "rt_th_active_count": (I64, []),
+    "rt_th_main_ident": (I64, []),
+    "rt_tls_set": (VOID, [SSTRP, I8P]),
+    "rt_tls_get": (VOID, [SSTRP, I8P.as_pointer()]),
+    "rt_tls_has": (I8, [SSTRP]),
+    "rt_tls_del": (I8, [SSTRP]),
+    "rt_lock_new": (I64, []),
+    "rt_lock_acquire": (I8, [I64, I64, I64, I8.as_pointer()]),
+    "rt_lock_release": (I8, [I64, I64]),
+    "rt_lock_locked": (I8, [I64, I8.as_pointer()]),
+    "rt_lock_owned": (I8, [I64, I8.as_pointer()]),
+    "rt_event_new": (I64, []),
+    "rt_event_set": (I8, [I64]),
+    "rt_event_clear": (I8, [I64]),
+    "rt_event_is_set": (I8, [I64, I8.as_pointer()]),
+    "rt_event_wait": (I8, [I64, I64, I8.as_pointer()]),
+    "rt_sem_new": (I8, [I64, I64.as_pointer()]),
+    "rt_sem_acquire": (I8, [I64, I64, I8.as_pointer()]),
+    "rt_sem_release": (I8, [I64, I64]),
+    "rt_sem_value": (I8, [I64, I64.as_pointer()]),
+    "rt_cond_new": (I64, []),
+    "rt_cond_wait": (I8, [I64, I64, I64, I8.as_pointer()]),
+    "rt_cond_notify": (I8, [I64, I64]),
+    "rt_barrier_new": (I8, [I64, I64.as_pointer()]),
+    "rt_barrier_wait": (I8, [I64, I64, I64.as_pointer()]),
+    "rt_barrier_reset": (I8, [I64]),
+    "rt_barrier_abort": (I8, [I64]),
+    "rt_barrier_parties": (I8, [I64, I64.as_pointer()]),
+    "rt_barrier_n_waiting": (I8, [I64, I64.as_pointer()]),
+    "rt_barrier_broken": (I8, [I64, I8.as_pointer()]),
+    "rt_q_new": (I64, [I64, I64]),
+    "rt_q_put": (I8, [I64, I8P, I64, I64, I8.as_pointer()]),
+    "rt_q_get": (I8, [I64, I64, I64, I8.as_pointer()]),
+    "rt_q_last": (VOID, [I8P.as_pointer()]),
+    "rt_q_qsize": (I8, [I64, I64.as_pointer()]),
+    "rt_q_task_done": (I8, [I64]),
+    "rt_q_join": (I8, [I64]),
     "rt_sock_connect": (I8, [SSTRP, I64, I64, I64.as_pointer()]),
     "rt_sock_tls_connect": (I8, [SSTRP, I64, I64, I64, I64.as_pointer()]),
     "rt_sock_listen": (I8, [SSTRP, I64, I64.as_pointer()]),
     "rt_sock_accept": (I8, [I64, I64.as_pointer()]),
     "rt_sock_send": (I8, [I64, I8P, I64.as_pointer()]),
+    "rt_sock_send_all": (I8, [I64, I8P, I64, I64.as_pointer()]),
     "rt_sock_recv": (I8, [I64, I64, I8P.as_pointer()]),
     "rt_sock_shutdown_write": (I8, [I64]),
     "rt_sock_set_timeout": (I8, [I64, I64]),
+    "rt_sock_set_nonblocking": (I8, [I64]),
+    "rt_sock_set_async": (I8, [I64]),
+    "rt_sock_accept_nb": (I8, [I64, I64.as_pointer()]),
+    "rt_sock_poll_ready": (I8, [I8P, I64, I8P.as_pointer()]),
     "rt_sock_local_port": (I8, [I64, I64.as_pointer()]),
     "rt_sock_close": (I8, [I64]),
     "rt_sock_udp_bind": (I8, [SSTRP, I64, I64.as_pointer()]),
@@ -289,10 +410,12 @@ RT_SIGS = {
     "rt_pyval_list_new": (I8P, []),
     "rt_pyval_list_push": (VOID, [I8P, I8P]),
     "rt_pyval_dict_new": (I8P, []),
-    "rt_pyval_dict_set": (VOID, [I8P, SSTRP, I8P]),
+        "rt_pyval_dict_set": (VOID, [I8P, SSTRP, I8P]),
+        "rt_pyval_dict_set_pv": (VOID, [I8P, I8P, I8P]),
     "rt_pyval_clone": (VOID, [I8P]),
     "rt_pyval_drop": (VOID, [I8P]),
     "rt_pyval_kind": (VOID, [I8P, SSTRP]),
+    "rt_pyval_json": (I8, [I8P, I8, I8, SSTRP]),
     "rt_pyval_truthy": (I8, [I8P]),
     "rt_pyval_eq": (I8, [I8P, I8P]),
     "rt_pyval_len": (I8, [I8P, I64.as_pointer()]),
@@ -385,6 +508,7 @@ class LLVMGen:
         self.di_files: dict[str, object] = {}
         self.di_cu = None
         self.pending_lambdas: list[dict] = []
+        self.thread_wrappers: dict = {}
         self.lambda_counter = 0
         self.thunks: dict[tuple, ir.Function] = {}
         self._setup_debug_info()
@@ -498,6 +622,8 @@ class LLVMGen:
         """LLVM storage type for a Serpentine type."""
         if isinstance(t, TInt):
             return I64
+        if isinstance(t, TEnum):
+            return I64                                 # member ordinal
         if isinstance(t, TFloat):
             return F64
         if isinstance(t, TBool):
@@ -506,21 +632,23 @@ class LLVMGen:
             return I1                                  # dummy zero-ish slot
         if isinstance(t, TStr):
             return SSTR
-        if isinstance(t, (TList, TDict)):
+        if isinstance(t, (TList, TDict, TSet)):
             return SLIST
         if isinstance(t, TTuple):
             return ir.LiteralStructType([self._lty(i) for i in t.items])
         if isinstance(t, TOptional):
             return ir.LiteralStructType([I1, self._lty(t.inner)])
+        if isinstance(t, TUnion):
+            return ir.LiteralStructType([I8] + [self._lty(m) for m in t.members])
         if isinstance(t, TClass):
-            key = mangle_type(t)
+            key = _tykey(t)
             if key not in self.class_types:
                 info = self.tc.classes[(t.module, t.name)]
                 sub = dict(zip(info.typevars, t.args))
                 self.class_types[key] = ir.LiteralStructType(
                     [self._lty(subst_type(info.fields[f], sub)) for f in info.field_order])
             return self.class_types[key]
-        if isinstance(t, (TShared, TWeak, TFile, TBytes, TPyVal)):
+        if isinstance(t, (TShared, TWeak, TFile, TBytes, TPyVal, TJoin, TThread)):
             return I8P
         if isinstance(t, TByteArray):
             return SLIST
@@ -533,23 +661,25 @@ class LLVMGen:
         raise LLVMUnsupported(f"no LLVM type for {t}")
 
     def _is_agg(self, t: Type) -> bool:
-        return isinstance(t, (TStr, TList, TDict, TTuple, TOptional, TClass, TExc,
-                              TIterObj, TFunc, TByteArray))
+        return isinstance(t, (TStr, TList, TDict, TSet, TTuple, TOptional, TClass, TExc,
+                              TIterObj, TFunc, TByteArray, TUnion))
 
     def _sizeof(self, t: Type) -> int:
-        key = mangle_type(t)
+        key = _tykey(t)
         if key not in self._size_cache:
             self._size_cache[key] = self._lty(t).get_abi_size(self.td)
         return self._size_cache[key]
 
     def _droppable(self, t: Type) -> bool:
-        if isinstance(t, (TStr, TList, TDict, TShared, TWeak, TExc, TFile, TFunc,
-                          TBytes, TByteArray, TPyVal)):
+        if isinstance(t, (TStr, TList, TDict, TSet, TShared, TWeak, TExc, TFile, TFunc,
+                          TBytes, TByteArray, TPyVal, TJoin, TThread)):
             return True
         if isinstance(t, TTuple):
             return any(self._droppable(i) for i in t.items)
         if isinstance(t, TOptional):
             return self._droppable(t.inner)
+        if isinstance(t, TUnion):
+            return any(self._droppable(m) for m in t.members)
         if isinstance(t, TClass):
             info = self.tc.classes[(t.module, t.name)]
             sub = dict(zip(info.typevars, t.args))
@@ -560,6 +690,8 @@ class LLVMGen:
     def _elem_of(self, t: Type) -> Type:
         """The raw element type stored in a list/dict buffer."""
         if isinstance(t, TList):
+            return t.elem
+        if isinstance(t, TSet):
             return t.elem
         assert isinstance(t, TDict)
         return TTuple((t.key, t.value))
@@ -606,11 +738,11 @@ class LLVMGen:
 
     def _helper(self, kind: str, t: Type, argtys, retty, emit_body) -> ir.Function:
         """Get-or-emit a per-type helper function; safe under recursion."""
-        key = (kind, mangle_type(t))
+        key = (kind, _tykey(t))
         if key in self.helpers:
             return self.helpers[key]
         fn = ir.Function(self.module, ir.FunctionType(retty, argtys),
-                         name=f"{kind}_{mangle_type(t)}")
+                         name=f"{kind}_{_tykey(t)}")
         fn.linkage = "internal"
         self.helpers[key] = fn
         b = ir.IRBuilder(fn.append_basic_block("entry"))
@@ -628,6 +760,12 @@ class LLVMGen:
             return
         if isinstance(t, TFile):
             b.call(self._rt("rt_file_drop"), [v.ssa])
+            return
+        if isinstance(t, TJoin):
+            b.call(self._rt("rt_task_drop" if t.task else "rt_thread_drop"), [v.ssa])
+            return
+        if isinstance(t, TThread):
+            b.call(self._rt("rt_thread_free"), [v.ssa])
             return
         if isinstance(t, TShared):
             b.call(self._shared_drop_fn(t.inner), [v.ssa])
@@ -663,7 +801,7 @@ class LLVMGen:
                                     DTORTY.as_pointer().as_pointer())
                     b.call(b.load(dpp), [env])
             return
-        if isinstance(t, (TList, TDict)):
+        if isinstance(t, (TList, TDict, TSet)):
             b.call(self._drop_fn(t), [v.ptr])
             return
         if isinstance(t, TTuple):
@@ -677,6 +815,15 @@ class LLVMGen:
             with b.if_then(has):
                 p = b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
                 self._drop(b, t.inner, self._as_v(b, t.inner, p))
+            return
+        if isinstance(t, TUnion):
+            tag = b.load(b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            for i, m in enumerate(t.members):
+                if not self._droppable(m):
+                    continue
+                with b.if_then(b.icmp_unsigned("==", tag, ir.Constant(I8, i))):
+                    p = b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                    self._drop(b, m, self._as_v(b, m, p))
             return
         if isinstance(t, TClass):
             info = self.tc.classes[(t.module, t.name)]
@@ -805,7 +952,7 @@ class LLVMGen:
         if isinstance(t, TByteArray):
             b.call(self._rt("rt_ba_clone"), [src_ptr, dst_ptr])
             return
-        if isinstance(t, (TList, TDict)):
+        if isinstance(t, (TList, TDict, TSet)):
             b.call(self._clone_fn(t), [src_ptr, dst_ptr])
             return
         if isinstance(t, TTuple):
@@ -822,6 +969,16 @@ class LLVMGen:
             with b.if_then(hs):
                 s = b.gep(src_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
                 self._clone_any(b, t.inner, s, payload_d)
+            return
+        if isinstance(t, TUnion):
+            b.store(ir.Constant(self._lty(t), None), dst_ptr)
+            tag = b.load(b.gep(src_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            b.store(tag, b.gep(dst_ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            for i, m in enumerate(t.members):
+                with b.if_then(b.icmp_unsigned("==", tag, ir.Constant(I8, i))):
+                    s = b.gep(src_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                    d = b.gep(dst_ptr, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                    self._clone_any(b, m, s, d)
             return
         if isinstance(t, TClass):
             info = self.tc.classes[(t.module, t.name)]
@@ -840,7 +997,7 @@ class LLVMGen:
             self._clone_into(b, t, src_ptr, dst_ptr)
             return
         val = b.load(src_ptr)
-        if isinstance(t, (TShared, TWeak, TPyVal)):
+        if isinstance(t, (TShared, TWeak, TPyVal, TBytes)):
             val = self._clone_scalar(b, t, val)
         b.store(val, dst_ptr)
 
@@ -881,7 +1038,7 @@ class LLVMGen:
 
     def _eq_vals(self, b: ir.IRBuilder, t: Type, a: V, c: V):
         """i1 equality between two values of type t."""
-        if isinstance(t, TInt):
+        if isinstance(t, (TInt, TEnum)):
             return b.icmp_signed("==", a.ssa, c.ssa)
         if isinstance(t, TBool):
             return b.icmp_unsigned("==", a.ssa, c.ssa)
@@ -917,7 +1074,7 @@ class LLVMGen:
 
         def body(b, fn):
             ap, cp = fn.args
-            if isinstance(t, (TList, TDict)):
+            if isinstance(t, (TList, TDict, TSet)):
                 self._emit_eq_list_body(b, fn, t, ap, cp)
                 return
             result = ir.Constant(I1, 1)
@@ -941,6 +1098,22 @@ class LLVMGen:
                     e = self._eq_vals(b, t.inner, self._as_v(b, t.inner, pa),
                                       self._as_v(b, t.inner, pc))
                     b.store(e, out)
+                b.ret(b.load(out))
+                return
+            elif isinstance(t, TUnion):
+                ta = b.load(b.gep(ap, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+                tcg = b.load(b.gep(cp, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+                same = b.icmp_unsigned("==", ta, tcg)
+                out = b.alloca(I1)
+                b.store(same, out)
+                with b.if_then(same):
+                    for i, m in enumerate(t.members):
+                        with b.if_then(b.icmp_unsigned("==", ta, ir.Constant(I8, i))):
+                            pa = b.gep(ap, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                            pc = b.gep(cp, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                            e = self._eq_vals(b, m, self._as_v(b, m, pa),
+                                              self._as_v(b, m, pc))
+                            b.store(e, out)
                 b.ret(b.load(out))
                 return
             else:
@@ -982,8 +1155,28 @@ class LLVMGen:
             e = self._eq_vals(b, elem, self._as_v(b, elem, pa), self._as_v(b, elem, pc))
             b.store(b.add(i, ir.Constant(I64, 1)), idx)
             b.cbranch(e, head, neq)
+        elif isinstance(t, TSet):
+            found = b.alloca(I1)
+            b.store(ir.Constant(I1, 0), found)
+            jdx = b.alloca(I64)
+            b.store(ir.Constant(I64, 0), jdx)
+            shead = fn.append_basic_block("shead")
+            sloop = fn.append_basic_block("sloop")
+            sdone = fn.append_basic_block("sdone")
+            b.branch(shead)
+            b.position_at_end(shead)
+            j = b.load(jdx)
+            b.cbranch(b.icmp_signed("<", j, nc), sloop, sdone)
+            b.position_at_end(sloop)
+            pc = self._elem_ptr(b, cp, elem, j)
+            hit = self._eq_vals(b, elem, self._as_v(b, elem, pa), self._as_v(b, elem, pc))
+            b.store(b.or_(b.load(found), hit), found)
+            b.store(b.add(j, ir.Constant(I64, 1)), jdx)
+            b.branch(shead)
+            b.position_at_end(sdone)
+            b.store(b.add(i, ir.Constant(I64, 1)), idx)
+            b.cbranch(b.load(found), head, neq)
         else:
-            assert isinstance(t, TDict)
             kt, vt = t.key, t.value
             ka = b.gep(pa, [ir.Constant(I32, 0), ir.Constant(I32, 0)])
             va = b.gep(pa, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
@@ -1075,8 +1268,35 @@ class LLVMGen:
         p, n = self._cstr(text)
         b.call(self._rt("rt_sb_push_bytes"), [sb, p, ir.Constant(I64, n)])
 
+    @staticmethod
+    def _enum_text(info, member: str, value, as_repr: bool) -> str:
+        """CPython's str()/repr() text for one enum member (constant per member)."""
+        if as_repr:
+            return f"<{info.name}.{member}: {value!r}>"
+        if info.base == "IntEnum":
+            return str(value)
+        if info.base == "StrEnum":
+            return str(value)
+        return f"{info.name}.{member}"
+
+    def _select_cstr(self, b: ir.IRBuilder, texts: list[str], idx):
+        """(i8*, i64) of the text chosen by a 0-based runtime index."""
+        consts = [self._cstr(s) for s in texts]
+        p, n = consts[0][0], ir.Constant(I64, consts[0][1])
+        for i, (pi, ni) in enumerate(consts[1:], start=1):
+            hit = b.icmp_signed("==", idx, ir.Constant(I64, i))
+            p = b.select(hit, pi, p)
+            n = b.select(hit, ir.Constant(I64, ni), n)
+        return p, n
+
     def _push(self, b: ir.IRBuilder, t: Type, v: V, sb, as_repr: bool) -> None:
         """Append py_str/py_repr of v to string-builder sb (CPython parity)."""
+        if isinstance(t, TEnum):
+            info = self.tc.enums[(t.module, t.name)]
+            texts = [self._enum_text(info, m, val, as_repr) for m, val in info.members]
+            p, n = self._select_cstr(b, texts, v.ssa)
+            b.call(self._rt("rt_sb_push_bytes"), [sb, p, n])
+            return
         if isinstance(t, TInt):
             b.call(self._rt("rt_sb_push_i64"), [sb, v.ssa])
             return
@@ -1120,6 +1340,23 @@ class LLVMGen:
             b.branch(join)
             b.position_at_end(join)
             return
+        if isinstance(t, TUnion):
+            tag = b.load(b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            fnc = b.function
+            ujoin = fnc.append_basic_block("uni.join")
+            for i, m in enumerate(t.members):
+                hit = b.icmp_unsigned("==", tag, ir.Constant(I8, i))
+                blk = fnc.append_basic_block(f"uni.m{i}")
+                nxt = fnc.append_basic_block(f"uni.n{i}")
+                b.cbranch(hit, blk, nxt)
+                b.position_at_end(blk)
+                p = b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, i + 1)])
+                self._push(b, m, self._as_v(b, m, p), sb, as_repr)
+                b.branch(ujoin)
+                b.position_at_end(nxt)
+            b.branch(ujoin)
+            b.position_at_end(ujoin)
+            return
         if isinstance(t, TShared):
             payload = b.bitcast(b.gep(v.ssa, [ir.Constant(I64, 24)]),
                                 self._lty(t.inner).as_pointer())
@@ -1158,11 +1395,20 @@ class LLVMGen:
 
         def body(b, fn):
             sb, vp = fn.args
-            if isinstance(t, (TList, TDict)):
+            if isinstance(t, (TList, TDict, TSet)):
                 elem = self._elem_of(t)
                 is_dict = isinstance(t, TDict)
-                self._push_bytes(b, sb, "{" if is_dict else "[")
+                is_set = isinstance(t, TSet)
                 n = self._list_len(b, vp)
+                if is_set:
+                    empty = fn.append_basic_block("set.empty")
+                    nonempty = fn.append_basic_block("set.nonempty")
+                    b.cbranch(b.icmp_signed("==", n, ir.Constant(I64, 0)), empty, nonempty)
+                    b.position_at_end(empty)
+                    self._push_bytes(b, sb, "set()")
+                    b.ret_void()
+                    b.position_at_end(nonempty)
+                self._push_bytes(b, sb, "[" if isinstance(t, TList) else "{")
                 idx = b.alloca(I64)
                 b.store(ir.Constant(I64, 0), idx)
                 head = fn.append_basic_block("head")
@@ -1188,7 +1434,7 @@ class LLVMGen:
                 b.store(b.add(i, ir.Constant(I64, 1)), idx)
                 b.branch(head)
                 b.position_at_end(done)
-                self._push_bytes(b, sb, "}" if is_dict else "]")
+                self._push_bytes(b, sb, "]" if isinstance(t, TList) else "}")
                 b.ret_void()
                 return
             if isinstance(t, TTuple):
@@ -1259,6 +1505,7 @@ class LLVMGen:
         with b.if_then(errbit):
             b.call(self._rt("rt_abort_pending"), [])
             b.unreachable()
+        b.call(self._rt("rt_threads_join_all"), [])
         b.ret_void()
         if self.define_c_main:
             mn = ir.Function(self.module, ir.FunctionType(I32, []), name="main")
@@ -2162,7 +2409,7 @@ class LLVMGen:
                     seq = self._chars_temp(seq)
                     elem_t = TStr()
                 else:
-                    assert isinstance(it_t, TList), f"cannot iterate {it_t}"
+                    assert isinstance(it_t, (TList, TSet)), f"cannot iterate {it_t}"
                     elem_t = it_t.elem
             n = self._list_len(self.b, seq.ptr)
             seq2 = None
@@ -2280,6 +2527,19 @@ class LLVMGen:
             payload = self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
             self._store_into(payload, inner)
             return tmp
+        if isinstance(dst, TUnion) and not isinstance(src, TUnion):
+            slot = union_slot(src, dst)
+            if slot is None:
+                raise LLVMUnsupported(f"cannot widen {src} into {dst}")
+            inner = self._coerce(v, dst.members[slot])
+            tmp = self._temp(dst)
+            self.b.store(ir.Constant(self._lty(dst), None), tmp.ptr)
+            self.b.store(ir.Constant(I8, slot),
+                         self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            payload = self.b.gep(tmp.ptr,
+                                 [ir.Constant(I32, 0), ir.Constant(I32, slot + 1)])
+            self._store_into(payload, inner)
+            return tmp
         if isinstance(dst, TFloat) and isinstance(src, TInt):
             return V(dst, ssa=self.b.sitofp(v.ssa, F64))
         if isinstance(dst, TPyVal) and not isinstance(src, TPyVal):
@@ -2354,9 +2614,11 @@ class LLVMGen:
                 p = self._elem_ptr(b, src, elem, i)
                 kp = b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 0)])
                 vp = b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
+                kh = b.call(self._pyval_from_fn(t.key), [kp])
                 eh = b.call(self._pyval_from_fn(t.value), [vp])
-                b.call(self._rt("rt_pyval_dict_set"), [h, kp, eh])
+                b.call(self._rt("rt_pyval_dict_set_pv"), [h, kh, eh])
                 b.call(self._rt("rt_pyval_drop"), [eh])
+                b.call(self._rt("rt_pyval_drop"), [kh])
                 b.store(b.add(i, ir.Constant(I64, 1)), idx)
                 b.branch(head)
                 b.position_at_end(done)
@@ -2372,11 +2634,16 @@ class LLVMGen:
         return self._helper("topyval", t, [self._lty(t).as_pointer()], I8P, body)
 
     def _expr(self, node: ast.expr, mode: str, expect: Type | None = None) -> V:
+        et = self.tc.expr_types.get(id(node))
+        if mode == "val" and isinstance(expect, TPyVal) and et is not None \
+                and not isinstance(et, TPyVal) \
+                and isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+            mode = "ref"
         oc = self.tc.op_calls.get(id(node))
         if oc is not None:
-            return self._call(oc, mode)
-        if isinstance(node, (ast.ListComp, ast.DictComp)):
-            return self._comp_expr(node)
+            return self._expr(oc, mode)
+        if isinstance(node, (ast.ListComp, ast.DictComp, ast.SetComp)):
+            return self._comp_expr(node, expect)
         if isinstance(node, ast.Constant):
             return self._const(node)
         if isinstance(node, ast.Name):
@@ -2391,6 +2658,15 @@ class LLVMGen:
             for e in node.elts:
                 ev = self._coerce(self._expr(e, "val", expect=t.elem), t.elem)
                 self._list_push(tmp.ptr, t.elem, ev)
+            return tmp
+        if isinstance(node, ast.Set):
+            t = self._t(node)
+            assert isinstance(t, TSet)
+            tmp = self._temp(t)
+            self.b.store(ir.Constant(SLIST, None), tmp.ptr)
+            for e in node.elts:
+                ev = self._coerce(self._expr(e, "val", expect=t.elem), t.elem)
+                self._set_add(tmp.ptr, t.elem, ev)
             return tmp
         if isinstance(node, ast.Dict):
             t = self._t(node)
@@ -2427,6 +2703,20 @@ class LLVMGen:
         if isinstance(node, ast.IfExp):
             return self._ifexp(node)
         if isinstance(node, ast.Call):
+            nc = getattr(node, "_narrow", None)
+            if nc is not None:
+                ut, mt = nc
+                uv = self._call(node, "val")
+                slot = union_slot(mt, ut)
+                p = self.b.gep(uv.ptr, [ir.Constant(I32, 0), ir.Constant(I32, slot + 1)])
+                if mode != "val" or not self._is_agg(mt):
+                    return self._read_place(mt, p, mode)
+                # Bitwise move of the live member; the union temp then holds nothing that
+                # needs dropping, so it must not be dropped at statement end.
+                tmp = self._temp(mt)
+                self.b.store(self.b.load(p), tmp.ptr)
+                self._consume(uv)
+                return tmp
             return self._call(node, mode)
         if isinstance(node, ast.Attribute):
             return self._attribute(node, mode)
@@ -2486,15 +2776,25 @@ class LLVMGen:
             ptr = self.b.load(ptr)
         narrowed = id(node) in self.tc.narrowed_uses
         if narrowed:
+            slot = self.tc.narrow_variant.get(id(node))
+            if slot is not None:
+                assert isinstance(t, TUnion)
+                member = t.members[slot]
+                payload = self.b.gep(ptr, [ir.Constant(I32, 0), ir.Constant(I32, slot + 1)])
+                return self._read_place(member, payload, mode,
+                                        moveable=(bind["flag"] if not bind["ref"] else None),
+                                        borrowed=bind["ref"])
             assert isinstance(t, TOptional)
             inner = t.inner
             payload = self.b.gep(ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
             return self._read_place(inner, payload, mode,
-                                    moveable=(bind["flag"] if not bind["ref"] else None))
+                                    moveable=(bind["flag"] if not bind["ref"] else None),
+                                    borrowed=bind["ref"])
         return self._read_place(t, ptr, mode,
-                                moveable=(bind["flag"] if not bind["ref"] else None))
+                                moveable=(bind["flag"] if not bind["ref"] else None),
+                                borrowed=bind["ref"])
 
-    def _read_place(self, t: Type, ptr, mode: str, moveable=None) -> V:
+    def _read_place(self, t: Type, ptr, mode: str, moveable=None, borrowed: bool = False) -> V:
         """Read a storage location in the requested mode with Copy/move parity."""
         if mode in ("ref", "mut"):
             if self._is_agg(t):
@@ -2518,6 +2818,10 @@ class LLVMGen:
             return tmp
         # non-Copy aggregate: a move — copy out and neutralize the source so
         # later drops of the containing place (partial moves) are no-ops
+        if borrowed:
+            tmp = self._temp(t)
+            self._clone_into(self.b, t, ptr, tmp.ptr)
+            return tmp
         tmp = self._temp(t)
         self.b.store(self.b.load(ptr), tmp.ptr)
         self.b.store(ir.Constant(self._lty(t), None), ptr)
@@ -2533,7 +2837,9 @@ class LLVMGen:
             if bind["ref"]:
                 ptr = self.b.load(ptr)
             if id(e) in self.tc.narrowed_uses:
-                ptr = self.b.gep(ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
+                slot = self.tc.narrow_variant.get(id(e))
+                idx = 1 if slot is None else slot + 1
+                ptr = self.b.gep(ptr, [ir.Constant(I32, 0), ir.Constant(I32, idx)])
             return ptr
         if isinstance(e, ast.Attribute):
             base_t = self._t(e.value)
@@ -2543,9 +2849,11 @@ class LLVMGen:
                 return self._field_ptr(payload, base_t.inner, e.attr)
             p = self._field_ptr(self._place(e.value, mut), base_t, e.attr)
             if id(e) in self.tc.narrowed_uses:
-                p = self.b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
+                slot = self.tc.narrow_variant.get(id(e))
+                idx = 1 if slot is None else slot + 1
+                p = self.b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, idx)])
             return p
-        if isinstance(e, ast.Subscript):
+        if isinstance(e, ast.Subscript) and id(e) not in self.tc.op_calls:
             base_t = self._t(e.value)
             shared = isinstance(base_t, TShared)
             inner = base_t.inner if shared else base_t
@@ -2556,6 +2864,10 @@ class LLVMGen:
                 return self._elem_ptr(self.b, recv.ptr, inner.elem, j)
             assert isinstance(inner, TDict)
             return self._dict_lookup(recv.ptr, inner, idx)
+        if isinstance(e, (ast.Subscript, ast.Call, ast.BinOp, ast.UnaryOp, ast.Compare)):
+            v = self._expr(e, "val")
+            if v.ptr is not None:
+                return v.ptr
         raise LLVMUnsupported("unsupported place expression")
 
     def _field_ptr(self, base_ptr, t: TClass, attr: str):
@@ -2576,6 +2888,29 @@ class LLVMGen:
                 self.b.call(self._rt("rt_argv"), [tmp.ptr])
                 return tmp
             raise LLVMUnsupported(f"sys.{node.attr}")
+        member = self.tc.enum_members.get(id(node))
+        if member is not None:
+            emod, ename, mname = member
+            info = self.tc.enums[(emod, ename)]
+            idx = [m for m, _ in info.members].index(mname)
+            return V(TEnum(emod, ename), ssa=ir.Constant(I64, idx))
+        if isinstance(self._t(node.value), TEnum):
+            return self._enum_attr(node)
+        if isinstance(self._t(node.value), TThread):
+            h = self._expr(node.value, "ref").ssa
+            if node.attr == "name":
+                tmp = self._temp(TStr())
+                self.b.call(self._rt("rt_thread_name"), [h, tmp.ptr])
+                return tmp
+            if node.attr == "ident":
+                idv = self.b.call(self._rt("rt_thread_ident"), [h])
+                tmp = self._temp(TOptional(TInt()))
+                has = self.b.icmp_signed("!=", idv, ir.Constant(I64, 0))
+                self.b.store(has, self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+                self.b.store(idv, self.b.gep(tmp.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+                return tmp
+            d = self.b.call(self._rt("rt_thread_daemon"), [h])
+            return V(TBool(), ssa=self.b.trunc(d, I1))
         t = self._t(node)
         base_t = self._t(node.value)
         narrowed = id(node) in self.tc.narrowed_uses
@@ -2592,6 +2927,12 @@ class LLVMGen:
                             base_t, node.attr)
         ft = self._field_type(base_t, node.attr)
         if narrowed:
+            slot = self.tc.narrow_variant.get(id(node))
+            if slot is not None:
+                assert isinstance(ft, TUnion)
+                p = self.b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, slot + 1)])
+                ft = ft.members[slot]
+                return self._read_place(ft, p, mode)
             assert isinstance(ft, TOptional)
             p = self.b.gep(p, [ir.Constant(I32, 0), ir.Constant(I32, 1)])
             ft = ft.inner
@@ -2698,6 +3039,14 @@ class LLVMGen:
             elif isinstance(idx_t, TPyVal):
                 idx = self._expr(node.slice, "ref")
                 st = self.b.call(self._rt("rt_pyval_getitem_v"), [recv.ssa, idx.ssa, out])
+            elif isinstance(idx_t, (TFloat, TBool)):
+                idx = self._expr(node.slice, "val")
+                if isinstance(idx_t, TFloat):
+                    kh = self.b.call(self._rt("rt_pyval_float"), [idx.ssa])
+                else:
+                    kh = self.b.call(self._rt("rt_pyval_bool"), [self.b.zext(idx.ssa, I8)])
+                st = self.b.call(self._rt("rt_pyval_getitem_v"), [recv.ssa, kh, out])
+                self.b.call(self._rt("rt_pyval_drop"), [kh])
             else:
                 idx = self._expr(node.slice, "val")
                 st = self.b.call(self._rt("rt_pyval_getitem_i"), [recv.ssa, idx.ssa, out])
@@ -2831,6 +3180,53 @@ class LLVMGen:
         p = self._elem_ptr(self.b, listptr, elem_t, n)
         self._store_into(p, val)
         self._set_list_len(self.b, listptr, self.b.add(n, ir.Constant(I64, 1)))
+
+    # ---------- set primitives (scan-based, insertion-ordered) ----------
+
+    def _set_scan(self, setptr, elem_t: Type, val: V):
+        """Return (found i1, index i64) for val in a set buffer."""
+        found = self._entry_alloca(I1)
+        pos = self._entry_alloca(I64)
+        self.b.store(ir.Constant(I1, 0), found)
+        self.b.store(ir.Constant(I64, 0), pos)
+        n = self._list_len(self.b, setptr)
+
+        def body(i):
+            p = self._elem_ptr(self.b, setptr, elem_t, i)
+            eq = self._eq_vals(self.b, elem_t, self._as_v(self.b, elem_t, p), val)
+            with self.b.if_then(eq):
+                self.b.store(ir.Constant(I1, 1), found)
+                self.b.store(i, pos)
+
+        self._simple_loop(n, body)
+        return self.b.load(found), self.b.load(pos)
+
+    def _set_add(self, setptr, elem_t: Type, val: V) -> None:
+        """Insert val into a set unless it is already present (consumes val)."""
+        found, _ = self._set_scan(setptr, elem_t, val)
+        hit = self.fn.append_basic_block("sadd.hit")
+        miss = self.fn.append_basic_block("sadd.miss")
+        done = self.fn.append_basic_block("sadd.done")
+        self.b.cbranch(found, hit, miss)
+        self.b.position_at_end(hit)
+        if self._droppable(elem_t):
+            self._drop(self.b, elem_t, val)
+        self.b.branch(done)
+        self.b.position_at_end(miss)
+        self._list_push(setptr, elem_t, val)
+        self.b.branch(done)
+        self.b.position_at_end(done)
+        self._consume(val)
+
+    def _set_each(self, setptr, elem_t: Type, body) -> None:
+        """Call body(elem_ptr) for every element of a set buffer."""
+        n = self._list_len(self.b, setptr)
+        self._simple_loop(n, lambda i: body(self._elem_ptr(self.b, setptr, elem_t, i)))
+
+    def _set_contains_ptr(self, setptr, elem_t: Type, srcptr) -> ir.Value:
+        """i1: does the set contain the value stored at srcptr?"""
+        found, _ = self._set_scan(setptr, elem_t, self._as_v(self.b, elem_t, srcptr))
+        return found
 
     # ---------- operators ----------
 
@@ -3047,7 +3443,26 @@ class LLVMGen:
     def _compare(self, e: ast.Compare) -> V:
         op0 = e.ops[0]
         if isinstance(op0, (ast.Is, ast.IsNot)):
+            lt = self._t(e.left)
             v = self._expr(e.left, "ref")
+            if isinstance(lt, TPyVal):
+                kind = self._temp(TStr())
+                self.b.call(self._rt("rt_pyval_kind"), [v.ssa, kind.ptr])
+                none = self._temp(TStr())
+                p, n = self._cstr("NoneType")
+                self.b.call(self._rt("rt_str_new"), [p, ir.Constant(I64, n), none.ptr])
+                hit = self.b.icmp_unsigned("!=", self.b.call(self._rt("rt_str_eq"),
+                                                              [kind.ptr, none.ptr]),
+                                           ir.Constant(I8, 0))
+                r = hit if isinstance(op0, ast.Is) else self.b.not_(hit)
+                return V(TBool(), ssa=r)
+            if isinstance(lt, TUnion):
+                slot = union_slot(NONE, lt)
+                tag = self.b.load(self.b.gep(v.ptr,
+                                             [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+                hit = self.b.icmp_unsigned("==", tag, ir.Constant(I8, slot))
+                r = hit if isinstance(op0, ast.Is) else self.b.not_(hit)
+                return V(TBool(), ssa=r)
             has = self.b.load(self.b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
             r = self.b.not_(has) if isinstance(op0, ast.Is) else has
             return V(TBool(), ssa=r)
@@ -3082,7 +3497,7 @@ class LLVMGen:
                 found, _ = self._dict_scan(recv.ptr, ct, needle)
                 res = found
             else:
-                assert isinstance(ct, TList)
+                assert isinstance(ct, (TList, TSet))
                 elem = ct.elem
                 out = self._entry_alloca(I1)
                 self.b.store(ir.Constant(I1, 0), out)
@@ -3112,9 +3527,13 @@ class LLVMGen:
                 acc = c if acc is None else self.b.and_(acc, c)
             return V(TBool(), ssa=acc)
         vals = []
+        opt_t = next((self._t(o) for o in operands if isinstance(self._t(o), TOptional)), None)
         for o in operands:
             t = self._t(o)
-            vals.append(self._expr(o, "ref" if self._is_agg(t) else "val"))
+            v = self._expr(o, "ref" if self._is_agg(t) else "val")
+            if opt_t is not None and not isinstance(t, TOptional):
+                v = self._coerce(v, opt_t)
+            vals.append(v)
         acc = None
         for i, op in enumerate(e.ops):
             c = self._cmp_pair(op, vals[i], vals[i + 1])
@@ -3127,6 +3546,7 @@ class LLVMGen:
         agg = self._is_agg(t)
         if agg:
             out = self._temp(t)
+            self._consume(out)
         else:
             out = self._entry_alloca(self._lty(t))
         then_b = self.fn.append_basic_block("tern.then")
@@ -3139,16 +3559,15 @@ class LLVMGen:
             mark_b = len(self.active_borrows)
             v = self._coerce(self._expr(sub, "val", expect=t), t)
             if agg:
-                self._consume(out)          # keep out alive across the drain
                 self._store_into(out.ptr, v)
                 self._drain(mark_t, mark_b)
-                self.stmt_temps.append(out)
             else:
                 self.b.store(v.ssa, out)
                 self._drain(mark_t, mark_b)
             self.b.branch(end)
         self.b.position_at_end(end)
         if agg:
+            self.stmt_temps.append(out)
             return out
         return V(t, ssa=self.b.load(out))
 
@@ -3193,13 +3612,15 @@ class LLVMGen:
         self.b.call(self._rt("rt_sb_finish"), [sb, out.ptr])
         return out
 
-    def _comp_expr(self, node) -> V:
+    def _comp_expr(self, node, expect: Type | None = None) -> V:
         kind = self.tc.loop_iter_kind[id(node)]
         gen = node.generators[0]
         targets = [gen.target] if isinstance(gen.target, ast.Name) \
             else list(gen.target.elts)
         names = [t.id for t in targets if isinstance(t, ast.Name)]
         t = self._t(node)
+        if expect is not None and type(expect) is type(t) and expect != t:
+            t = expect
         out = self._temp(t)
         self.b.store(ir.Constant(SLIST, None), out.ptr)
 
@@ -3211,6 +3632,9 @@ class LLVMGen:
                 kv = self._expr(node.key, "val")
                 vv = self._coerce(self._expr(node.value, "val", expect=t.value), t.value)
                 self._dict_set(out.ptr, t, kv, vv)
+            elif isinstance(node, ast.SetComp):
+                ev = self._coerce(self._expr(node.elt, "val", expect=t.elem), t.elem)
+                self._set_add(out.ptr, t.elem, ev)
             else:
                 ev = self._coerce(self._expr(node.elt, "val", expect=t.elem), t.elem)
                 self._list_push(out.ptr, t.elem, ev)
@@ -3248,8 +3672,22 @@ class LLVMGen:
         name = node.func.id
         if id(node) in self.tc.move_calls:
             return self._expr(node.args[0], mode)
+        chk = self.tc.isinstance_checks.get(id(node))
+        if chk is not None:
+            declared, member = chk
+            assert isinstance(declared, TUnion)
+            v = self._expr(node.args[0], "ref")
+            tag = self.b.load(self.b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+            slot = union_slot(member, declared)
+            return V(TBool(), ssa=self.b.icmp_unsigned("==", tag, ir.Constant(I8, slot)))
         if id(node) in self.tc.ctor_calls:
             return self._ctor_call(node)
+        if id(node) in self.tc.enum_calls:
+            return self._enum_lookup(node)
+        if id(node) in self.tc.spawn_calls:
+            return self._spawn_call(node)
+        if id(node) in self.tc.thread_calls:
+            return self._thread_call(node)
         if name == "share":
             inner = self._t(node).inner
             payload = self._expr(node.args[0], "val", expect=inner)
@@ -3285,6 +3723,15 @@ class LLVMGen:
             tmp = self._temp(TStr())
             self.b.call(self._rt("rt_pyval_kind"), [v.ssa, tmp.ptr])
             return tmp
+        if name == "pyval_json":
+            v = self._expr(node.args[0], "ref")
+            ea = self._expr(node.args[1], "val").ssa
+            cp = self._expr(node.args[2], "val").ssa
+            tmp = self._temp(TStr())
+            st = self.b.call(self._rt("rt_pyval_json"),
+                             [v.ssa, self.b.zext(ea, I8), self.b.zext(cp, I8), tmp.ptr])
+            self._check_err_i8(st)
+            return tmp
         if name == "open":
             path = self._expr(node.args[0], "ref")
             if len(node.args) > 1:
@@ -3306,6 +3753,169 @@ class LLVMGen:
             return self._user_call(node, sig)
         return self._builtin(node, name)
 
+    def _send_words(self, t: Type) -> int:
+        """How many 8-byte env words a Send argument of type t occupies."""
+        if isinstance(t, TClass):
+            info = self.tc.classes[(t.module, t.name)]
+            return max(len(info.field_order), 1)
+        return 1
+
+    def _pack_send_env(self, args: list[ast.expr], sig):
+        """Copy Send arguments into a fresh heap buffer of 8-byte words (D9 by-copy boundary)."""
+        b = self.b
+        n = max(sum(self._send_words(p.typ) for p in sig.params), 1)
+        env = b.call(self._rt("rt_buf_alloc"), [ir.Constant(I64, 8 * n)])
+        envw = b.bitcast(env, I64.as_pointer())
+        off = 0
+        for a, p in zip(args, sig.params):
+            if isinstance(p.typ, TClass):
+                v = self._expr(a, "ref")
+                info = self.tc.classes[(p.typ.module, p.typ.name)]
+                for j, f in enumerate(info.field_order):
+                    fv = b.load(b.gep(v.ptr, [ir.Constant(I32, 0), ir.Constant(I32, j)]))
+                    ft = info.fields[f]
+                    if isinstance(ft, TFloat):
+                        w = b.bitcast(fv, I64)
+                    elif isinstance(ft, TBool):
+                        w = b.zext(fv, I64)
+                    else:
+                        w = fv
+                    b.store(w, b.gep(envw, [ir.Constant(I64, off + j)]))
+                off += self._send_words(p.typ)
+                continue
+            slot = b.gep(envw, [ir.Constant(I64, off)])
+            off += 1
+            if isinstance(p.typ, TStr):
+                v = self._expr(a, "ref")
+                tmp = self._temp(TStr())
+                b.call(self._rt("rt_str_clone"), [v.ptr, tmp.ptr])
+                w = b.ptrtoint(b.call(self._rt("rt_str_send"), [tmp.ptr]), I64)
+                self._consume(tmp)
+            elif isinstance(p.typ, TBytes):
+                h0 = self._expr(a, "ref").ssa
+                b.call(self._rt("rt_bytes_clone"), [h0])
+                w = b.ptrtoint(b.call(self._rt("rt_bytes_send"), [h0]), I64)
+            else:
+                v = self._coerce(self._expr(a, "val", expect=p.typ), p.typ)
+                if isinstance(p.typ, TFloat):
+                    w = b.bitcast(v.ssa, I64)
+                elif isinstance(p.typ, TBool):
+                    w = b.zext(v.ssa, I64)
+                else:
+                    w = v.ssa
+            b.store(w, slot)
+        return env
+
+    def _spawn_call(self, node: ast.Call) -> V:
+        """Lower spawn(f, args...): pack Send args into a buffer, start the thread."""
+        key = self.tc.spawn_calls[id(node)]
+        sig = self.tc.sigs[key]
+        env = self._pack_send_env(node.args[1:], sig)
+        wrapper = self._thread_wrapper(key, sig)
+        task = self._t(node).task
+        h = self.b.call(self._rt("rt_task_spawn" if task else "rt_thread_spawn"),
+                        [self.b.bitcast(wrapper, I8P), env])
+        return self._register_temp_ssa(TJoin(sig.ret, task=task), h)
+
+    def _thread_call(self, node: ast.Call) -> V:
+        """Lower Thread(target=..)/Timer(..): pack args now, run at start()."""
+        info = self.tc.thread_calls[id(node)]
+        key = info["target"]
+        sig = self.tc.sigs[key]
+        b = self.b
+        env = self._pack_send_env(info["args"], sig)
+        wrapper = self._thread_wrapper(key, sig)
+        if info["name"] is not None:
+            name = self._expr(info["name"], "ref")
+            name_ptr, has_name = name.ptr, ir.Constant(I64, 1)
+        else:
+            name_ptr, has_name = ir.Constant(SSTRP, None), ir.Constant(I64, 0)
+        daemon = ir.Constant(I8, 0)
+        if info["daemon"] is not None:
+            daemon = b.zext(self._expr(info["daemon"], "val").ssa, I8)
+        delay = ir.Constant(I64, 0)
+        if info["interval"] is not None:
+            iv = self._coerce(self._expr(info["interval"], "val", expect=TFloat()), TFloat())
+            delay = b.fptosi(b.fmul(iv.ssa, ir.Constant(F64, 1000.0)), I64)
+        target = self._temp(TStr())
+        p, n = self._cstr("" if info["timer"] else key[1])
+        b.call(self._rt("rt_str_new"), [p, ir.Constant(I64, n), target.ptr])
+        h = b.call(self._rt("rt_thread_new"),
+                   [b.bitcast(wrapper, I8P), env, name_ptr, has_name, daemon, delay, target.ptr])
+        return self._register_temp_ssa(TThread(), h)
+
+    def _thread_wrapper(self, key: tuple[str, str], sig) -> ir.Function:
+        """The extern-ABI entry a spawned thread runs: unpack env, call, box result."""
+        if key in self.thread_wrappers:
+            return self.thread_wrappers[key]
+        fn = ir.Function(self.module, ir.FunctionType(I8P, [I8P]),
+                         name=self._sanitize(f"tw_{key[0]}_{key[1]}"))
+        fn.linkage = "internal"
+        b = ir.IRBuilder(fn.append_basic_block("entry"))
+        envw = b.bitcast(fn.args[0], I64.as_pointer())
+        args = []
+        off = 0
+        for p in sig.params:
+            if isinstance(p.typ, TClass):
+                info = self.tc.classes[(p.typ.module, p.typ.name)]
+                slot = b.alloca(self._lty(p.typ))
+                for j, f in enumerate(info.field_order):
+                    w = b.load(b.gep(envw, [ir.Constant(I64, off + j)]))
+                    ft = info.fields[f]
+                    if isinstance(ft, TFloat):
+                        fv = b.bitcast(w, F64)
+                    elif isinstance(ft, TBool):
+                        fv = b.trunc(w, self._lty(TBool()))
+                    else:
+                        fv = w
+                    b.store(fv, b.gep(slot, [ir.Constant(I32, 0), ir.Constant(I32, j)]))
+                args.append(b.load(slot))
+                off += self._send_words(p.typ)
+                continue
+            w = b.load(b.gep(envw, [ir.Constant(I64, off)]))
+            off += 1
+            if isinstance(p.typ, TStr):
+                slot = b.alloca(self._lty(TStr()))
+                b.call(self._rt("rt_str_recv"), [b.inttoptr(w, I8P), slot])
+                args.append(b.load(slot))
+            elif isinstance(p.typ, TBytes):
+                args.append(b.call(self._rt("rt_bytes_recv"), [b.inttoptr(w, I8P)]))
+            elif isinstance(p.typ, TFloat):
+                args.append(b.bitcast(w, F64))
+            elif isinstance(p.typ, TBool):
+                args.append(b.trunc(w, self._lty(TBool())))
+            else:
+                args.append(w)
+        n = max(sum(self._send_words(p.typ) for p in sig.params), 1)
+        b.call(self._rt("rt_buf_free"), [fn.args[0], ir.Constant(I64, 8 * n)])
+        res = b.call(self.funcs[key], args)
+        errbit = res if isinstance(sig.ret, TNone) else b.extract_value(res, 0)
+        okb = fn.append_basic_block("ok")
+        errb = fn.append_basic_block("err")
+        b.cbranch(errbit, errb, okb)
+        b.position_at_end(errb)
+        b.ret(b.call(self._rt("rt_box_err"), []))
+        b.position_at_end(okb)
+        if isinstance(sig.ret, TNone):
+            w = ir.Constant(I64, 0)
+        else:
+            val = b.extract_value(res, 1)
+            if isinstance(sig.ret, TStr):
+                slot2 = b.alloca(self._lty(TStr()))
+                b.store(val, slot2)
+                w = b.ptrtoint(b.call(self._rt("rt_str_send"), [slot2]), I64)
+            elif isinstance(sig.ret, TBytes):
+                w = b.ptrtoint(b.call(self._rt("rt_bytes_send"), [val]), I64)
+            elif isinstance(sig.ret, TFloat):
+                w = b.bitcast(val, I64)
+            elif isinstance(sig.ret, TBool):
+                w = b.zext(val, I64)
+            else:
+                w = val
+        b.ret(b.call(self._rt("rt_box_ok"), [w]))
+        self.thread_wrappers[key] = fn
+        return fn
+
     def _rtlib_call(self, node: ast.Call, rf) -> V:
         """Lower a runtime-backed library call (rtlib.py) to its rt.rs extern."""
         b = self.b
@@ -3319,17 +3929,21 @@ class LLVMGen:
                 v = self._expr(a, "ref")
                 args.append(v.ssa)
                 continue
+            if p == "p":
+                v = self._coerce(self._expr(a, "val", expect=TPyVal()), TPyVal())
+                args.append(v.ssa)
+                continue
             pt = TFloat() if p == "f" else TInt()
             v = self._coerce(self._expr(a, "val", expect=pt), pt)
             args.append(v.ssa)
-        if rf.ret == "y":
+        if rf.ret in ("y", "p"):
             out = self._entry_alloca(I8P)
             if rf.can_raise:
                 st = b.call(self._rt(rf.rt), args + [out])
                 self._check_err_i8(st)
             else:
                 b.call(self._rt(rf.rt), args + [out])
-            return self._register_temp_ssa(TBytes(), b.load(out))
+            return self._register_temp_ssa(TBytes() if rf.ret == "y" else TPyVal(), b.load(out))
         if rf.ret in ("s", "S"):
             tmp = self._temp(TStr() if rf.ret == "s" else TList(TStr()))
             if rf.can_raise:
@@ -3376,9 +3990,75 @@ class LLVMGen:
                 self._finish_call(self.funcs[(cmod, psig.name)], [tmp.ptr], TNone())
         return tmp
 
+    def _str_from_texts(self, texts: list[str], idx) -> V:
+        """A str temp holding texts[idx], chosen at runtime."""
+        p, n = self._select_cstr(self.b, texts, idx)
+        tmp = self._temp(TStr())
+        self.b.call(self._rt("rt_str_new"), [p, n, tmp.ptr])
+        return tmp
+
+    def _enum_attr(self, node: ast.Attribute) -> V:
+        """Lower `member.value` / `member.name` on an enum value."""
+        t = self._t(node.value)
+        info = self.tc.enums[(t.module, t.name)]
+        idx = self._expr(node.value, "val").ssa
+        if node.attr == "name":
+            return self._str_from_texts([m for m, _ in info.members], idx)
+        if isinstance(info.value_type, TStr):
+            return self._str_from_texts([str(v) for _, v in info.members], idx)
+        res = ir.Constant(I64, int(info.members[0][1]))
+        for i, (_, val) in enumerate(info.members[1:], start=1):
+            hit = self.b.icmp_signed("==", idx, ir.Constant(I64, i))
+            res = self.b.select(hit, ir.Constant(I64, int(val)), res)
+        return V(TInt(), ssa=res)
+
+    def _enum_lookup(self, node: ast.Call) -> V:
+        """Lower `Color(value)`: value -> ordinal, ValueError when unmatched."""
+        key = self.tc.enum_calls[id(node)]
+        info = self.tc.enums[key]
+        arg = self._expr(node.args[0], "val")
+        found = ir.Constant(I64, -1)
+        for i, (_, val) in enumerate(info.members):
+            if isinstance(info.value_type, TStr):
+                lit = self._temp(TStr())
+                p, n = self._cstr(str(val))
+                self.b.call(self._rt("rt_str_new"), [p, ir.Constant(I64, n), lit.ptr])
+                hit = self.b.trunc(self.b.call(self._rt("rt_str_eq"), [arg.ptr, lit.ptr]), I1)
+            else:
+                hit = self.b.icmp_signed("==", arg.ssa, ir.Constant(I64, int(val)))
+            found = self.b.select(hit, ir.Constant(I64, i), found)
+        bad = self.fn.append_basic_block("enum_bad")
+        ok = self.fn.append_basic_block("enum_ok")
+        self.b.cbranch(self.b.icmp_signed("<", found, ir.Constant(I64, 0)), bad, ok)
+        self.b.position_at_end(bad)
+        sb = self.b.call(self._rt("rt_sb_new"), [])
+        self._push(self.b, arg.ty, arg, sb, as_repr=True)
+        self._push_bytes(self.b, sb, f" is not a valid {info.name}")
+        msg = self._entry_alloca(SSTR)
+        self.b.call(self._rt("rt_sb_finish"), [sb, msg])
+        kp, kl = self._cstr("ValueError")
+        ktmp = self._entry_alloca(SSTR)
+        self.b.call(self._rt("rt_str_new"), [kp, ir.Constant(I64, kl), ktmp])
+        self.b.call(self._rt("rt_raise"), [ktmp, msg])
+        self.b.call(self._rt("rt_str_drop"), [ktmp])
+        self.b.call(self._rt("rt_str_drop"), [msg])
+        self._release_borrows(self.b)
+        self.b.branch(self._err_target())
+        self.b.position_at_end(ok)
+        return V(TEnum(*key), ssa=found)
+
     def _arg_value(self, a: ast.expr, p) -> ir.Value:
         """Evaluate one call argument per the parameter's convention."""
         if p.conv in ("ref", "mut"):
+            at = self.tc.expr_types.get(id(a))
+            if isinstance(p.typ, TUnion) and at is not None and not isinstance(at, TUnion):
+                if p.conv == "ref" and self._is_agg(at) and not at.is_copy() \
+                        and isinstance(a, (ast.Name, ast.Attribute, ast.Subscript)):
+                    src = self._expr(a, "ref")
+                    tmp = self._temp(at)
+                    self._clone_into(self.b, at, src.ptr, tmp.ptr)
+                    return self._coerce(tmp, p.typ).ptr
+                return self._coerce(self._expr(a, "val", expect=p.typ), p.typ).ptr
             v = self._expr(a, p.conv)
             if self._is_agg(p.typ):
                 return v.ptr
@@ -3482,12 +4162,70 @@ class LLVMGen:
                 self.b.call(self._rt("rt_file_close"), [h])
                 return V(TNone(), ssa=ir.Constant(I1, 0))
             raise LLVMUnsupported(f"file method {method}")
+        if isinstance(inner, TThread):
+            h = self._expr(recv, "ref").ssa
+            if method == "start":
+                st = self.b.call(self._rt("rt_thread_start"), [h])
+                self._check_err_i8(st)
+                return V(TNone(), ssa=ir.Constant(I1, 0))
+            if method == "join":
+                ms = ir.Constant(I64, -1)
+                if node.args and not (isinstance(node.args[0], ast.Constant)
+                                      and node.args[0].value is None):
+                    at = self._t(node.args[0])
+                    if isinstance(at, TOptional):
+                        ov = self._expr(node.args[0], "ref")
+                        has = self.b.load(self.b.gep(ov.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 0)]))
+                        pv = self.b.load(self.b.gep(ov.ptr, [ir.Constant(I32, 0), ir.Constant(I32, 1)]))
+                        fv = pv if isinstance(at.inner, TFloat) else self.b.sitofp(pv, F64)
+                        msv = self.b.fptosi(self.b.fmul(fv, ir.Constant(F64, 1000.0)), I64)
+                        ms = self.b.select(has, msv, ir.Constant(I64, -1))
+                    else:
+                        tv = self._coerce(self._expr(node.args[0], "val", expect=TFloat()), TFloat())
+                        ms = self.b.fptosi(self.b.fmul(tv.ssa, ir.Constant(F64, 1000.0)), I64)
+                st = self.b.call(self._rt("rt_thread_join_t"), [h, ms])
+                self._check_err_i8(st)
+                return V(TNone(), ssa=ir.Constant(I1, 0))
+            if method == "is_alive":
+                r = self.b.call(self._rt("rt_thread_alive"), [h])
+                return V(TBool(), ssa=self.b.trunc(r, I1))
+            if method == "cancel":
+                self.b.call(self._rt("rt_thread_cancel"), [h])
+                return V(TNone(), ssa=ir.Constant(I1, 0))
+            raise LLVMUnsupported(f"Thread method {method}")
+        if isinstance(inner, TJoin):
+            h = self._expr(recv, "ref").ssa
+            if inner.task and method == "done":
+                r = self.b.call(self._rt("rt_task_done"), [h])
+                return V(TBool(), ssa=self.b.trunc(r, I1))
+            out = self._entry_alloca(I64)
+            st = self.b.call(self._rt("rt_task_await" if inner.task else "rt_thread_join"), [h, out])
+            self._check_err_i8(st)
+            w = self.b.load(out)
+            jr = inner.ret
+            if isinstance(jr, TStr):
+                tmp = self._temp(TStr())
+                self.b.call(self._rt("rt_str_recv"), [self.b.inttoptr(w, I8P), tmp.ptr])
+                return tmp
+            if isinstance(jr, TBytes):
+                return self._register_temp_ssa(
+                    TBytes(), self.b.call(self._rt("rt_bytes_recv"),
+                                          [self.b.inttoptr(w, I8P)]))
+            if isinstance(jr, TFloat):
+                return V(TFloat(), ssa=self.b.bitcast(w, F64))
+            if isinstance(jr, TBool):
+                return V(TBool(), ssa=self.b.trunc(w, self._lty(TBool())))
+            if isinstance(jr, TNone):
+                return V(TNone(), ssa=ir.Constant(I1, 0))
+            return V(TInt(), ssa=w)
         if isinstance(inner, TBytes):
             return self._bytes_method(node, method, args)
         if isinstance(inner, TByteArray):
             return self._bytearray_method(node, method, args)
         if isinstance(inner, TList):
             return self._list_method(node, rt, inner, method, args)
+        if isinstance(inner, TSet):
+            return self._set_method(node, rt, inner, method, args)
         if isinstance(inner, TDict):
             return self._dict_method(node, rt, inner, method, args)
         if isinstance(inner, TStr):
@@ -3667,6 +4405,160 @@ class LLVMGen:
             self.rt["rt_list_sort"] = ir.Function(self.module, fnty, name="rt_list_sort")
         return self.rt["rt_list_sort"]
 
+    def _set_method(self, node, rt, t: TSet, method: str, args) -> V:
+        """Emit a Tier-2 set method call."""
+        elem = t.elem
+        esize = ir.Constant(I64, self._sizeof(elem))
+        none = V(TNone(), ssa=ir.Constant(I1, 0))
+        if method == "add":
+            v = self._coerce(self._expr(args[0], "val", expect=elem), elem)
+            recv = self._recv(node.func.value, True)
+            self._set_add(recv.ptr, elem, v)
+            return none
+        if method in ("discard", "remove"):
+            v = self._coerce(self._expr(args[0], "val", expect=elem), elem)
+            recv = self._recv(node.func.value, True)
+            found, pos = self._set_scan(recv.ptr, elem, v)
+            hit = self.fn.append_basic_block("srem.hit")
+            miss = self.fn.append_basic_block("srem.miss")
+            done = self.fn.append_basic_block("srem.done")
+            self.b.cbranch(found, hit, miss)
+            self.b.position_at_end(hit)
+            p = self._elem_ptr(self.b, recv.ptr, elem, pos)
+            if self._droppable(elem):
+                self._drop(self.b, elem, self._as_v(self.b, elem, p))
+            self.b.call(self._rt("rt_list_remove"), [recv.ptr, esize, pos])
+            self.b.branch(done)
+            self.b.position_at_end(miss)
+            if method == "remove":
+                self._raise_key_repr(elem, v)
+            else:
+                self.b.branch(done)
+            self.b.position_at_end(done)
+            if self._droppable(elem):
+                self._drop(self.b, elem, v)
+            self._consume(v)
+            return none
+        if method == "clear":
+            recv = self._recv(node.func.value, True)
+            if self._droppable(elem):
+                self._set_each(recv.ptr, elem,
+                               lambda p: self._drop(self.b, elem, self._as_v(self.b, elem, p)))
+            self._set_list_len(self.b, recv.ptr, ir.Constant(I64, 0))
+            return none
+        if method == "pop":
+            recv = self._recv(node.func.value, True)
+            n = self._list_len(self.b, recv.ptr)
+            self._cond_raise_static(self.b.icmp_signed("==", n, ir.Constant(I64, 0)),
+                                    "KeyError", "pop from an empty set")
+            p = self._elem_ptr(self.b, recv.ptr, elem, ir.Constant(I64, 0))
+            if self._is_agg(elem):
+                out = self._temp(elem)
+                self.b.store(self.b.load(p), out.ptr)
+            else:
+                out = V(elem, ssa=self.b.load(p))
+            self.b.call(self._rt("rt_list_remove"), [recv.ptr, esize, ir.Constant(I64, 0)])
+            return out
+        if method in ("update", "difference_update", "intersection_update"):
+            other = self._expr(args[0], "ref")
+            recv = self._recv(node.func.value, True)
+            if method == "update":
+                self._set_each(other.ptr, elem,
+                               lambda p: self._set_add(recv.ptr, elem,
+                                                       self._read_place(elem, p, "val")))
+                return none
+            keep = self._temp(t, register=False)
+            self.b.store(ir.Constant(SLIST, None), keep.ptr)
+
+            def sift(p):
+                inn = self._set_contains_ptr(other.ptr, elem, p)
+                cond = self.b.not_(inn) if method == "difference_update" else inn
+                yes = self.fn.append_basic_block("supd.keep")
+                no = self.fn.append_basic_block("supd.skip")
+                self.b.cbranch(cond, yes, no)
+                self.b.position_at_end(yes)
+                self._list_push(keep.ptr, elem, self._as_v(self.b, elem, p))
+                self.b.branch(no)
+                self.b.position_at_end(no)
+                with self.b.if_then(self.b.not_(cond)):
+                    if self._droppable(elem):
+                        self._drop(self.b, elem, self._as_v(self.b, elem, p))
+
+            self._set_each(recv.ptr, elem, sift)
+            self.b.call(self._rt("rt_list_free"), [recv.ptr, esize])
+            self.b.store(self.b.load(keep.ptr), recv.ptr)
+            return none
+        if method in ("union", "intersection", "difference", "symmetric_difference"):
+            recv = self._recv(node.func.value, False)
+            other = self._expr(args[0], "ref")
+            out = self._temp(t)
+            self.b.store(ir.Constant(SLIST, None), out.ptr)
+
+            def take_left(p):
+                if method == "union":
+                    cond = None
+                else:
+                    inn = self._set_contains_ptr(other.ptr, elem, p)
+                    cond = inn if method == "intersection" else self.b.not_(inn)
+                if cond is None:
+                    self._set_add(out.ptr, elem, self._read_place(elem, p, "val"))
+                else:
+                    with self.b.if_then(cond):
+                        self._set_add(out.ptr, elem, self._read_place(elem, p, "val"))
+
+            self._set_each(recv.ptr, elem, take_left)
+            if method in ("union", "symmetric_difference"):
+                def take_right(p):
+                    if method == "union":
+                        self._set_add(out.ptr, elem, self._read_place(elem, p, "val"))
+                    else:
+                        with self.b.if_then(self.b.not_(
+                                self._set_contains_ptr(recv.ptr, elem, p))):
+                            self._set_add(out.ptr, elem, self._read_place(elem, p, "val"))
+
+                self._set_each(other.ptr, elem, take_right)
+            return out
+        if method in ("issubset", "issuperset", "isdisjoint"):
+            recv = self._recv(node.func.value, False)
+            other = self._expr(args[0], "ref")
+            acc = self._entry_alloca(I1)
+            self.b.store(ir.Constant(I1, method != "isdisjoint"), acc)
+            src, dst = (recv, other) if method != "issuperset" else (other, recv)
+
+            def scan(p):
+                inn = self._set_contains_ptr(dst.ptr, elem, p)
+                if method == "isdisjoint":
+                    self.b.store(self.b.or_(self.b.load(acc), inn), acc)
+                else:
+                    self.b.store(self.b.and_(self.b.load(acc), inn), acc)
+
+            self._set_each(src.ptr, elem, scan)
+            r = self.b.load(acc)
+            if method == "isdisjoint":
+                r = self.b.not_(r)
+            return V(TBool(), ssa=r)
+        if method == "copy":
+            recv = self._recv(node.func.value, False)
+            out = self._temp(t)
+            self.b.call(self._clone_fn(t), [recv.ptr, out.ptr])
+            return out
+        raise LLVMUnsupported(f"set method {method}")
+
+    def _raise_key_repr(self, t: Type, key: V) -> None:
+        """raise KeyError(repr(key)) — CPython's message for set.remove misses."""
+        sb = self.b.call(self._rt("rt_sb_new"), [])
+        self._push(self.b, t, key, sb, as_repr=True)
+        msg = self._entry_alloca(SSTR)
+        self.b.call(self._rt("rt_sb_finish"), [sb, msg])
+        kp, kl = self._cstr("KeyError")
+        ktmp = self._entry_alloca(SSTR)
+        self.b.call(self._rt("rt_str_new"), [kp, ir.Constant(I64, kl), ktmp])
+        self.b.call(self._rt("rt_raise"), [ktmp, msg])
+        self.b.call(self._rt("rt_str_drop"), [ktmp])
+        self.b.call(self._rt("rt_str_drop"), [msg])
+        self._release_borrows(self.b)
+        self.b.branch(self._err_target())
+
     def _dict_method(self, node, rt, t: TDict, method: str, args) -> V:
         if method == "get":
             recv = self._recv(node.func.value, False)
@@ -3769,6 +4661,25 @@ class LLVMGen:
     def _builtin(self, node: ast.Call, name: str) -> V:
         b = self.b
         args = node.args
+        if name in ("set", "frozenset"):
+            t = self._t(node)
+            assert isinstance(t, TSet)
+            out = self._temp(t)
+            self.b.store(ir.Constant(SLIST, None), out.ptr)
+            if args:
+                src = self._expr(args[0], "ref")
+                st = self._t(args[0])
+                if isinstance(st, TShared):
+                    src = self._recv(args[0], False)
+                    st = st.inner
+                n = self._list_len(self.b, src.ptr)
+
+                def body(i):
+                    p = self._elem_ptr(self.b, src.ptr, t.elem, i)
+                    self._set_add(out.ptr, t.elem, self._read_place(t.elem, p, "val"))
+
+                self._simple_loop(n, body)
+            return out
         if name == "len":
             t = self._t(args[0])
             if isinstance(t, TShared):
@@ -3776,7 +4687,7 @@ class LLVMGen:
                 t = t.inner
             else:
                 recv = self._expr(args[0], "ref")
-            if isinstance(t, (TList, TDict, TByteArray)):
+            if isinstance(t, (TList, TDict, TSet, TByteArray)):
                 return V(TInt(), ssa=self._list_len(b, recv.ptr))
             if isinstance(t, TBytes):
                 return V(TInt(), ssa=b.call(self._rt("rt_bytes_len"), [recv.ssa]))

@@ -33,6 +33,15 @@ def main() -> None:
     print(fixed.hex)
     print(fixed.version, fixed.variant)
     print(fixed == parse("12345678-1234-4234-9234-123456789ABC"))
+    plain: UUID = UUID("12345678123442349234123456789abc")
+    braced: UUID = UUID("{12345678-1234-4234-9234-123456789abc}")
+    urned: UUID = UUID("urn:uuid:12345678-1234-4234-9234-123456789ABC")
+    print(plain == fixed, braced == fixed, urned == fixed)
+    try:
+        short: UUID = UUID("1234")
+        print(str(short))
+    except ValueError as e0:
+        print("caught:", e0)
     try:
         bad: UUID = parse("not-a-uuid")
         print(str(bad))

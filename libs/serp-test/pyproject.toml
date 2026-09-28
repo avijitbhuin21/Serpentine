@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-test"
-version = "0.1.0"
+version = "0.2.0"
 description = "Serpentine test library: assertion helpers for `serp test` (pure Serpentine, dual-runs under CPython)"
 readme = "README.md"
 license = { text = "MIT" }

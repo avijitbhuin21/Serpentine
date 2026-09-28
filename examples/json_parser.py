@@ -1,4 +1,4 @@
-"""json_parser — the Serpentine north-star demo (docs/archive/research.md §9).
+"""json_parser — the Serpentine north-star demo.
 
 A complete JSON parser + serializer written once in the Serpentine subset:
 develop and debug it under CPython (`python json_parser.py [file.json]`),

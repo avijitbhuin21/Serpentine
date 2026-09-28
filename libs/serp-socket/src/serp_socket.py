@@ -15,6 +15,7 @@ from _serp_socket import listen as _listen
 from _serp_socket import local_port as _local_port
 from _serp_socket import recv as _recv
 from _serp_socket import send as _send
+from _serp_socket import send_all as _send_all
 from _serp_socket import set_timeout as _set_timeout
 from _serp_socket import shutdown_write as _shutdown_write
 from _serp_socket import udp_bind as _udp_bind
@@ -133,7 +134,7 @@ class socket:
 
     def sendall(self: Ref[socket], data: bytes) -> None:
         try:
-            n: int = _send(self.fd, data)
+            n: int = _send_all(self.fd, data, self.timeout_ms)
         except OSError as e:
             _mapped(str(e))
 

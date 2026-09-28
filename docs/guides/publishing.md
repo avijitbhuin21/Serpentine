@@ -56,7 +56,7 @@ Both package names were verified unregistered (2026-07-17); first upload claims 
 - **Trusted publishing (recommended)**: on PyPI, add a "trusted publisher" for the GitHub
   repo + a `release.yml` workflow — future releases then publish from CI on tag push with
   **no long-lived tokens at all**. I can write that workflow when you want it.
-- **Announce**: the release notes write themselves from `../archive/checklist.md` + `../language/tour.md`
+- **Announce**: the release notes write themselves from `../features.md` + `../language/tour.md`
   ("a Python subset that compiles to 140 KB native binaries with a borrow checker —
   same file runs under CPython"). Typical venues: r/ProgrammingLanguages, Hacker News
   (Show HN), lobste.rs, the Python Discourse #show-and-tell.

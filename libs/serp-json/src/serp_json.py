@@ -10,7 +10,7 @@ Caps: ints saturate at int64 natively (OverflowError instead of big ints);
 are not provided.
 """
 from __future__ import annotations
-from serpentine import Mut, PyVal, pyval_kind, dataclass
+from serpentine import Mut, PyVal, pyval_json, pyval_kind, dataclass
 
 HEX: str = "0123456789abcdef"
 
@@ -290,7 +290,7 @@ def _dump_float(v: PyVal) -> str:
     return text
 
 
-def _dump(v: PyVal, ensure_ascii: bool, sort_keys: bool) -> str:
+def _dump(v: PyVal, ensure_ascii: bool, sort_keys: bool, compact: bool) -> str:
     kind: str = pyval_kind(v)
     if kind == "NoneType":
         return "null"
@@ -305,7 +305,9 @@ def _dump(v: PyVal, ensure_ascii: bool, sort_keys: bool) -> str:
     if kind == "list":
         inner: list[str] = []
         for x in v:
-            inner.append(_dump(x, ensure_ascii, sort_keys))
+            inner.append(_dump(x, ensure_ascii, sort_keys, compact))
+        if compact:
+            return "[" + ",".join(inner) + "]"
         return "[" + ", ".join(inner) + "]"
     if kind == "dict":
         keys: list[str] = []
@@ -314,12 +316,18 @@ def _dump(v: PyVal, ensure_ascii: bool, sort_keys: bool) -> str:
         if sort_keys:
             keys = sorted(keys)
         parts: list[str] = []
+        sep: str = ":" if compact else ": "
         for key in keys:
-            parts.append(_escape_string(key, ensure_ascii) + ": "
-                         + _dump(v[key], ensure_ascii, sort_keys))
+            parts.append(_escape_string(key, ensure_ascii) + sep
+                         + _dump(v[key], ensure_ascii, sort_keys, compact))
+        if compact:
+            return "{" + ",".join(parts) + "}"
         return "{" + ", ".join(parts) + "}"
     raise TypeError(f"Object of type {kind} is not JSON serializable")
 
 
-def dumps(obj: PyVal, ensure_ascii: bool = True, sort_keys: bool = False) -> str:
-    return _dump(obj, ensure_ascii, sort_keys)
+def dumps(obj: PyVal, ensure_ascii: bool = True, sort_keys: bool = False,
+          compact: bool = False) -> str:
+    if not sort_keys:
+        return pyval_json(obj, ensure_ascii, compact)
+    return _dump(obj, ensure_ascii, sort_keys, compact)

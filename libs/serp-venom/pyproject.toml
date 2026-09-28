@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serp-venom"
+version = "0.4.0"
+description = "Venom — Serpentine's FastAPI drop-in: module-level app, @app.get/post decorators with parameter injection (path/query/serp_molt bodies), HTTPException(status_code=, detail=), JSONResponse, TestClient(app), serp_uvicorn.run, event-loop and threaded HTTP servers (pure Serpentine over serp-http-server, dual-runs under CPython)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Serpentine contributors" }]
+keywords = ["serpentine", "web", "framework", "fastapi", "venom"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = ["serpentine-shim>=0.9.0", "serp-http-server", "serp-socket", "serp-json", "serp-url", "serp-asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/avijitbhuin21/Serpentine"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["serp_fastapi", "serp_uvicorn"]

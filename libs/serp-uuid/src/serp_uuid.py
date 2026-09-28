@@ -2,12 +2,13 @@
 
 Pure Serpentine ([P] over the serp_uuid_core rtlib module). uuid4() returns a
 UUID object that prints as the dashed lowercase hex string (like stdlib);
-.hex/.urn/.version/.variant are properties. Caps: only version 4 generation;
-the constructor takes the dashed string (stdlib UUID() accepts many forms);
-no .int/.bytes/.fields (int would overflow int64).
+.hex/.urn/.version/.variant are properties. UUID(text) accepts the dashed,
+bare-32-hex, braced and urn:uuid: spellings in any case. Caps: only version 4
+generation; no .int/.bytes/.fields (int would overflow int64) and no
+bytes=/fields= keyword constructors.
 """
 from __future__ import annotations
-from serpentine import Ref, dataclass
+from serpentine import Mut, Ref, dataclass
 from serp_uuid_core import u4_str
 
 _HEX: str = "0123456789abcdef"
@@ -16,6 +17,9 @@ _HEX: str = "0123456789abcdef"
 @dataclass
 class UUID:
     _s: str
+
+    def __post_init__(self: Mut[UUID]) -> None:
+        self._s = _normalized(self._s)
 
     def __str__(self: Ref[UUID]) -> str:
         return self._s
@@ -62,13 +66,24 @@ def _validate(s: str) -> None:
             raise ValueError("badly formed hexadecimal UUID string")
 
 
+def _normalized(s: str) -> str:
+    """Canonical dashed lowercase text from any accepted UUID spelling."""
+    t: str = s.strip().lower()
+    if t.startswith("urn:uuid:"):
+        t = t[9:]
+    if t.startswith("{") and t.endswith("}"):
+        t = t[1:len(t) - 1]
+    if len(t) == 32:
+        t = f"{t[:8]}-{t[8:12]}-{t[12:16]}-{t[16:20]}-{t[20:]}"
+    _validate(t)
+    return t
+
+
 def uuid4() -> UUID:
     """Return a random version-4 UUID object (uuid.uuid4)."""
     return UUID(u4_str())
 
 
 def parse(s: str) -> UUID:
-    """Build a UUID from dashed lowercase text (subset of uuid.UUID(hex=...))."""
-    lowered: str = s.lower()
-    _validate(lowered)
-    return UUID(lowered)
+    """Build a UUID from text (dashed, plain-hex, braced or urn spellings)."""
+    return UUID(s)

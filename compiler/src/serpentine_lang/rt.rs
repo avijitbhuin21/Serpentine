@@ -29,10 +29,16 @@ pub struct SErrC {
     pub msg: SStr,
 }
 
-static mut PENDING: Option<SerpErr> = None;
+std::thread_local! {
+    static PENDING: std::cell::RefCell<Option<SerpErr>> = std::cell::RefCell::new(None);
+}
 
 fn set_pending(e: SerpErr) {
-    unsafe { PENDING = Some(e) }
+    PENDING.with(|p| *p.borrow_mut() = Some(e));
+}
+
+fn take_pending() -> SerpErr {
+    PENDING.with(|p| p.borrow_mut().take()).expect("serp rt: no pending error")
 }
 
 unsafe fn s(p: *const SStr) -> &'static str {
@@ -57,7 +63,7 @@ pub unsafe extern "C" fn rt_raise_static(kp: *const u8, kl: i64, mp: *const u8, 
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_err_take(out: *mut SErrC) {
-    let e = PENDING.take().expect("serp rt: no pending error");
+    let e = take_pending();
     out.write(SErrC { kind: sstr(&e.kind), msg: sstr(&e.msg) });
 }
 
@@ -84,7 +90,7 @@ pub unsafe extern "C" fn rt_err_repr(e: *const SErrC, out: *mut SStr) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_abort_pending() -> ! {
-    let e = PENDING.take().expect("serp rt: no pending error");
+    let e = take_pending();
     serp_abort(e)
 }
 
@@ -928,6 +934,9 @@ pub unsafe extern "C" fn rt_bytes_clone(h: *const u8) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_bytes_drop(h: *const u8) {
+    if h.is_null() {
+        return;
+    }
     drop(Rc::from_raw(h as *const Vec<u8>));
 }
 
@@ -1439,6 +1448,12 @@ pub unsafe extern "C" fn rt_sock_send(h: i64, data: *const u8, out: *mut i64) ->
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rt_sock_send_all(h: i64, data: *const u8, timeout_ms: i64,
+                                          out: *mut i64) -> i8 {
+    st_i64(serp_sock_send_all(h, &bview(data), timeout_ms), out)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rt_sock_recv(h: i64, maxlen: i64, out: *mut *const u8) -> i8 {
     st_y(serp_sock_recv(h, maxlen), out)
 }
@@ -1451,6 +1466,27 @@ pub unsafe extern "C" fn rt_sock_shutdown_write(h: i64) -> i8 {
 #[no_mangle]
 pub unsafe extern "C" fn rt_sock_set_timeout(h: i64, ms: i64) -> i8 {
     st_n(serp_sock_set_timeout(h, ms))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_set_nonblocking(h: i64) -> i8 {
+    st_n(serp_sock_set_nonblocking(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_set_async(h: i64) -> i8 {
+    st_n(serp_sock_set_async(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_accept_nb(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sock_accept_nb(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sock_poll_ready(packed: *const u8, timeout_ms: i64,
+                                            out: *mut *const u8) -> i8 {
+    st_y(serp_sock_poll_ready(&bview(packed), timeout_ms), out)
 }
 
 #[no_mangle]
@@ -1551,7 +1587,15 @@ pub unsafe extern "C" fn rt_pyval_dict_new() -> *const u8 {
 pub unsafe extern "C" fn rt_pyval_dict_set(h: *const u8, k: *const SStr, val: *const u8) {
     let mut rc = std::mem::ManuallyDrop::new(Rc::from_raw(h as *const PValRepr));
     if let Some(PValRepr::Dict(d)) = Rc::get_mut(&mut *rc) {
-        d.set((*k).clone(), (*pview(val)).clone());
+        d.set(pyval_str((*k).clone()), (*pview(val)).clone());
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_dict_set_pv(h: *const u8, k: *const u8, val: *const u8) {
+    let mut rc = std::mem::ManuallyDrop::new(Rc::from_raw(h as *const PValRepr));
+    if let Some(PValRepr::Dict(d)) = Rc::get_mut(&mut *rc) {
+        d.set((*pview(k)).clone(), (*pview(val)).clone());
     }
 }
 
@@ -1562,12 +1606,27 @@ pub unsafe extern "C" fn rt_pyval_clone(h: *const u8) {
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_pyval_drop(h: *const u8) {
+    if h.is_null() {
+        return;
+    }
     drop(Rc::from_raw(h as *const PValRepr));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_pyval_kind(h: *const u8, out: *mut SStr) {
     out.write(pyval_kind(&*pview(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pyval_json(h: *const u8, ensure_ascii: i8, compact: i8,
+                                       out: *mut SStr) -> i8 {
+    match pyval_json(&*pview(h), ensure_ascii != 0, compact != 0) {
+        Ok(s) => {
+            out.write(s);
+            0
+        }
+        Err(e) => { set_pending(e); 1 }
+    }
 }
 
 #[no_mangle]
@@ -1663,3 +1722,513 @@ pub unsafe extern "C" fn rt_pyval_str_of(h: *const u8, out: *mut SStr) {
 pub unsafe extern "C" fn rt_pyval_repr(h: *const u8, out: *mut SStr) {
     out.write(sstring(pview(h).py_repr()));
 }
+
+// ---------- threads (DECISIONS.md D9: Send-checked spawn/join) ----------
+
+struct SendPtr(*mut u8);
+unsafe impl Send for SendPtr {}
+
+struct RtThread {
+    h: Option<std::thread::JoinHandle<SendPtr>>,
+}
+
+enum RtThreadRes {
+    Ok(i64),
+    Err(String, String),
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_buf_alloc(n: i64) -> *mut u8 {
+    rust_alloc(Layout::from_size_align(n.max(8) as usize, 8).unwrap())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_buf_free(p: *mut u8, n: i64) {
+    rust_dealloc(p, Layout::from_size_align(n.max(8) as usize, 8).unwrap());
+}
+
+// Consumes the SStr blob; produces a Send box for the thread boundary.
+#[no_mangle]
+pub unsafe extern "C" fn rt_str_send(p: *mut SStr) -> *mut u8 {
+    let s = std::ptr::read(p);
+    let out = s.as_str().to_string();
+    drop(s);
+    Box::into_raw(Box::new(out)) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_str_recv(p: *mut u8, out: *mut SStr) {
+    let s = Box::from_raw(p as *mut String);
+    out.write(sstring(*s));
+}
+
+// Consumes the bytes handle; produces a Send box for the thread boundary.
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_send(h: *const u8) -> *mut u8 {
+    let rc = Rc::from_raw(h as *const Vec<u8>);
+    let v = (*rc).clone();
+    drop(rc);
+    Box::into_raw(Box::new(v)) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bytes_recv(p: *mut u8) -> *const u8 {
+    let v = Box::from_raw(p as *mut Vec<u8>);
+    Rc::into_raw(Rc::new(*v)) as *const u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_box_ok(payload: i64) -> *mut u8 {
+    Box::into_raw(Box::new(RtThreadRes::Ok(payload))) as *mut u8
+}
+
+// Takes the thread-local pending error into a Send result box.
+#[no_mangle]
+pub unsafe extern "C" fn rt_box_err() -> *mut u8 {
+    let e = take_pending();
+    Box::into_raw(Box::new(RtThreadRes::Err(e.kind, e.msg))) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_spawn(f: extern "C" fn(*mut u8) -> *mut u8,
+                                         env: *mut u8) -> *mut u8 {
+    let env = SendPtr(env);
+    let h = std::thread::spawn(move || {
+        let env = env;
+        SendPtr(f(env.0))
+    });
+    Box::into_raw(Box::new(RtThread { h: Some(h) })) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_join(hp: *mut u8, out: *mut i64) -> i8 {
+    let t = &mut *(hp as *mut RtThread);
+    match t.h.take() {
+        None => {
+            set_pending(SerpErr::new("ValueError", "thread already joined".to_string()));
+            1
+        }
+        Some(j) => match j.join() {
+            Err(_) => {
+                set_pending(SerpErr::new("RuntimeError", "thread panicked".to_string()));
+                1
+            }
+            Ok(p) => {
+                let res = Box::from_raw(p.0 as *mut RtThreadRes);
+                match *res {
+                    RtThreadRes::Ok(v) => { *out = v; 0 }
+                    RtThreadRes::Err(k, m) => { set_pending(SerpErr::new(&k, m)); 1 }
+                }
+            }
+        },
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_drop(hp: *mut u8) {
+    drop(Box::from_raw(hp as *mut RtThread));
+}
+
+// ---------- asyncio tasks (D45) + rtlib: _serp_asyncio ----------
+
+struct RtTask {
+    tid: usize,
+    slot: Arc<Mutex<Option<SendPtr>>>,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_task_spawn(f: extern "C" fn(*mut u8) -> *mut u8,
+                                       env: *mut u8) -> *mut u8 {
+    let env = SendPtr(env);
+    let slot: Arc<Mutex<Option<SendPtr>>> = Arc::new(Mutex::new(None));
+    let s2 = slot.clone();
+    let tid = aio_task_spawn(Box::new(move || {
+        let env = env;
+        let r = SendPtr(f(env.0));
+        *lock_ok(&s2) = Some(r);
+    }));
+    Box::into_raw(Box::new(RtTask { tid, slot })) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_task_await(hp: *mut u8, out: *mut i64) -> i8 {
+    let t = &*(hp as *const RtTask);
+    aio_task_wait(t.tid);
+    let taken = lock_ok(&t.slot).take();
+    match taken {
+        None => {
+            set_pending(SerpErr::new("RuntimeError", "task result already taken".to_string()));
+            1
+        }
+        Some(p) => {
+            let res = Box::from_raw(p.0 as *mut RtThreadRes);
+            match *res {
+                RtThreadRes::Ok(v) => { *out = v; 0 }
+                RtThreadRes::Err(k, m) => { set_pending(SerpErr::new(&k, m)); 1 }
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_task_done(hp: *mut u8) -> i8 {
+    let t = &*(hp as *const RtTask);
+    aio_task_done(t.tid) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_task_drop(hp: *mut u8) {
+    drop(Box::from_raw(hp as *mut RtTask));
+}
+
+#[no_mangle]
+pub extern "C" fn rt_aio_sleep(secs: f64) -> i8 {
+    match serp_aio_sleep(secs) { Ok(()) => 0, Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub extern "C" fn rt_aio_current() -> i64 { serp_aio_current() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_park() -> i8 { st_n(serp_aio_park()) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_wake(tid: i64) -> i8 { st_n(serp_aio_wake(tid)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_wait_fd(h: i64, write: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_aio_wait_fd(h, write, timeout_ms), out)
+}
+
+#[no_mangle]
+pub extern "C" fn rt_aio_running() -> i8 { serp_aio_running() as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_ev_new() -> i64 { serp_aio_ev_new() }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_ev_set(h: i64) -> i8 { st_n(serp_aio_ev_set(h)) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_ev_clear(h: i64) -> i8 { st_n(serp_aio_ev_clear(h)) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_ev_is_set(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_ev_is_set(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_ev_wait(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_ev_wait(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_lock_new() -> i64 { serp_aio_lock_new() }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_lock_acquire(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_lock_acquire(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_lock_release(h: i64) -> i8 { st_n(serp_aio_lock_release(h)) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_lock_locked(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_lock_locked(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_sem_new(v: i64, out: *mut i64) -> i8 { st_i64(serp_aio_sem_new(v), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_sem_acquire(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_sem_acquire(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_sem_release(h: i64, bounded: i64, initial: i64) -> i8 {
+    st_n(serp_aio_sem_release(h, bounded, initial))
+}
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_sem_locked(h: i64, out: *mut i8) -> i8 { st_b(serp_aio_sem_locked(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_sem_value(h: i64, out: *mut i64) -> i8 { st_i64(serp_aio_sem_value(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_new(maxsize: i64) -> i64 { serp_aio_q_new(maxsize) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_put(h: i64, item: *const u8, nowait: i64, out: *mut i8) -> i8 {
+    st_b(serp_aio_q_put(h, &pv_arg(item), nowait), out)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_get(h: i64, nowait: i64, out: *mut i8) -> i8 {
+    st_b(serp_aio_q_get(h, nowait), out)
+}
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_qsize(h: i64, out: *mut i64) -> i8 { st_i64(serp_aio_q_qsize(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_maxsize(h: i64, out: *mut i64) -> i8 { st_i64(serp_aio_q_maxsize(h), out) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_task_done(h: i64) -> i8 { st_n(serp_aio_q_task_done(h)) }
+#[no_mangle]
+pub unsafe extern "C" fn rt_aio_q_join(h: i64) -> i8 { st_n(serp_aio_q_join(h)) }
+
+// ---------- rtlib: serp_subprocess ----------
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_spawn(argv: *const SStr, cwd: *const SStr, env: *const SStr,
+                                     flags: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sp_spawn(s(argv), s(cwd), s(env), flags), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_pid(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sp_pid(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_communicate(h: i64, input: *const u8, has_input: i64,
+                                           timeout_ms: i64, out: *mut i8) -> i8 {
+    match serp_sp_communicate(h, &bview(input), has_input, timeout_ms) {
+        Ok(v) => { out.write(v as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_wait(h: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    match serp_sp_wait(h, timeout_ms) {
+        Ok(v) => { out.write(v as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_poll(h: i64, out: *mut i8) -> i8 {
+    match serp_sp_poll(h) {
+        Ok(v) => { out.write(v as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_returncode(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_sp_returncode(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_stdout(h: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_sp_stdout(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_stderr(h: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_sp_stderr(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_kill(h: i64) -> i8 {
+    st_n(serp_sp_kill(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_terminate(h: i64) -> i8 {
+    st_n(serp_sp_terminate(h))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sp_free(h: i64) -> i8 {
+    st_n(serp_sp_free(h))
+}
+
+// ---------- Thread objects (D9 v2) + rtlib: serp_threading_core / serp_queue_core ----------
+
+unsafe fn thv(h: *mut u8) -> std::mem::ManuallyDrop<SThread> {
+    std::mem::ManuallyDrop::new(Arc::from_raw(h as *const ThreadRec))
+}
+
+unsafe fn pv_arg(h: *const u8) -> std::mem::ManuallyDrop<PVal> { pview(h) }
+
+unsafe fn st_p(r: PVal, out: *mut *const u8) { out.write(pout(r)); }
+
+unsafe fn st_b(r: SRes<bool>, out: *mut i8) -> i8 {
+    match r { Ok(v) => { out.write(v as i8); 0 } Err(e) => { set_pending(e); 1 } }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_new(f: extern "C" fn(*mut u8) -> *mut u8, env: *mut u8,
+                                       name: *const SStr, has_name: i64, daemon: i8,
+                                       delay_ms: i64, target: *const SStr) -> *mut u8 {
+    let env = SendPtr(env);
+    let body: ThreadBody = Box::new(move || {
+        let env = env;
+        let res = Box::from_raw(f(env.0) as *mut RtThreadRes);
+        match *res {
+            RtThreadRes::Ok(_) => Ok(()),
+            RtThreadRes::Err(k, m) => Err((k, m)),
+        }
+    });
+    let nm = if has_name != 0 { Some(s(name).to_string()) } else { None };
+    let t = serp_thread_new(body, nm, daemon != 0, delay_ms, s(target));
+    Arc::into_raw(t) as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_start(h: *mut u8) -> i8 { st_n(serp_thread_start(&thv(h))) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_join_t(h: *mut u8, timeout_ms: i64) -> i8 {
+    st_n(serp_thread_join(&thv(h), timeout_ms))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_alive(h: *mut u8) -> i8 { serp_thread_is_alive(&thv(h)) as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_name(h: *mut u8, out: *mut SStr) {
+    out.write(serp_thread_name(&thv(h)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_set_name(h: *mut u8, name: *const SStr) {
+    serp_thread_set_name(&thv(h), s(name));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_ident(h: *mut u8) -> i64 { serp_thread_ident(&thv(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_daemon(h: *mut u8) -> i8 { serp_thread_daemon(&thv(h)) as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_cancel(h: *mut u8) { serp_thread_cancel(&thv(h)); }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_thread_free(h: *mut u8) {
+    drop(Arc::from_raw(h as *const ThreadRec));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_threads_join_all() { serp_threads_join_all(); }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_th_ident() -> i64 { serp_th_ident() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_th_name(out: *mut SStr) { out.write(serp_th_name()); }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_th_active_count() -> i64 { serp_th_active_count() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_th_main_ident() -> i64 { serp_th_main_ident() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_tls_set(key: *const SStr, val: *const u8) {
+    serp_tls_set(s(key), &pv_arg(val));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_tls_get(key: *const SStr, out: *mut *const u8) {
+    st_p(serp_tls_get(s(key)), out);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_tls_has(key: *const SStr) -> i8 { serp_tls_has(s(key)) as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_tls_del(key: *const SStr) -> i8 { serp_tls_del(s(key)) as i8 }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_lock_new() -> i64 { serp_lock_new() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_lock_acquire(h: i64, timeout_ms: i64, reentrant: i64, out: *mut i8) -> i8 {
+    st_b(serp_lock_acquire(h, timeout_ms, reentrant), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_lock_release(h: i64, reentrant: i64) -> i8 {
+    st_n(serp_lock_release(h, reentrant))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_lock_locked(h: i64, out: *mut i8) -> i8 { st_b(serp_lock_locked(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_lock_owned(h: i64, out: *mut i8) -> i8 { st_b(serp_lock_owned(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_event_new() -> i64 { serp_event_new() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_event_set(h: i64) -> i8 { st_n(serp_event_set(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_event_clear(h: i64) -> i8 { st_n(serp_event_clear(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_event_is_set(h: i64, out: *mut i8) -> i8 { st_b(serp_event_is_set(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_event_wait(h: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_event_wait(h, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sem_new(value: i64, out: *mut i64) -> i8 { st_i64(serp_sem_new(value), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sem_acquire(h: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_sem_acquire(h, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sem_release(h: i64, n: i64) -> i8 { st_n(serp_sem_release(h, n)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sem_value(h: i64, out: *mut i64) -> i8 { st_i64(serp_sem_value(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_cond_new() -> i64 { serp_cond_new() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_cond_wait(h: i64, lock_h: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_cond_wait(h, lock_h, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_cond_notify(h: i64, n: i64) -> i8 { st_n(serp_cond_notify(h, n)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_new(parties: i64, out: *mut i64) -> i8 {
+    st_i64(serp_barrier_new(parties), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_wait(h: i64, timeout_ms: i64, out: *mut i64) -> i8 {
+    st_i64(serp_barrier_wait(h, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_reset(h: i64) -> i8 { st_n(serp_barrier_reset(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_abort(h: i64) -> i8 { st_n(serp_barrier_abort(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_parties(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_barrier_parties(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_n_waiting(h: i64, out: *mut i64) -> i8 {
+    st_i64(serp_barrier_n_waiting(h), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_barrier_broken(h: i64, out: *mut i8) -> i8 { st_b(serp_barrier_broken(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_new(maxsize: i64, lifo: i64) -> i64 { serp_q_new(maxsize, lifo) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_put(h: i64, item: *const u8, block: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_q_put(h, &pv_arg(item), block, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_get(h: i64, block: i64, timeout_ms: i64, out: *mut i8) -> i8 {
+    st_b(serp_q_get(h, block, timeout_ms), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_last(out: *mut *const u8) { st_p(serp_q_last(), out); }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_qsize(h: i64, out: *mut i64) -> i8 { st_i64(serp_q_qsize(h), out) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_task_done(h: i64) -> i8 { st_n(serp_q_task_done(h)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_q_join(h: i64) -> i8 { st_n(serp_q_join(h)) }

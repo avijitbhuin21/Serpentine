@@ -85,6 +85,19 @@ def main() -> int:
         bad = [b for b in outputs if outputs[b] != py_out]
         if bad:
             failures.append(rel)
+            # A native crash (Windows 0xC0000005, POSIX signal) is not an output
+            # divergence: report it as a crash so it is not mistaken for a codegen
+            # mismatch. See .rustic/memory/molt-0.7-secretstr-base64.md.
+            crashed = [b for b in bad
+                       if outputs[b][1] not in (0, py_out[1])
+                       and (outputs[b][1] > 0xFF000000 or outputs[b][1] < 0)]
+            if crashed and all(outputs[b][0] == py_out[0][:len(outputs[b][0])]
+                               for b in crashed):
+                codes = ", ".join(f"{b}=0x{outputs[b][1] & 0xFFFFFFFF:08X}"
+                                  for b in crashed)
+                print(f"CRASH {rel}: native binary aborted ({codes}); "
+                      f"stdout matched cpython up to the abort")
+                continue
             print(f"FAIL {rel}: outputs differ (cpython exit {py_out[1]})")
             print(f"  cpython: {py_out[0][:400]!r}")
             for b in bad:

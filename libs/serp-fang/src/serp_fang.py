@@ -16,7 +16,7 @@ from serpentine import Mut, Owned, PyVal, Ref, dataclass, move
 from serp_base64 import b64encode
 from serp_io import append_bytes, read_bytes, write_bytes
 from serp_json import dumps, loads
-from _serp_socket import close, connect, recv, send, set_timeout, tls_connect
+from _serp_socket import close, connect, recv, send, set_async, set_timeout, tls_connect
 from serp_time import monotonic
 from serp_url import SplitResult, urlencode, urljoin, urlsplit
 from serp_uuid_core import u4_str
@@ -441,7 +441,7 @@ def _parse_head(conn: int, url_str: str, method: str, started: float) -> Respons
 
 
 def _perform(method: str, url_str: str, headers: Ref[list[str]], content: bytes,
-             timeout_ms: int, verify: bool, started: float) -> ResponseStream:
+             timeout_ms: int, verify: bool, started: float, aio: bool) -> ResponseStream:
     """Open one connection (TLS for https), send the request, parse the head."""
     u: SplitResult = urlsplit(url_str)
     if u.scheme != "http" and u.scheme != "https":
@@ -467,6 +467,8 @@ def _perform(method: str, url_str: str, headers: Ref[list[str]], content: bytes,
     else:
         conn = connect(host, port, timeout_ms)
     set_timeout(conn, timeout_ms)
+    if aio:
+        set_async(conn)
     host_header: str = host
     if explicit and port != default:
         host_header = host + ":" + str(port)
@@ -562,7 +564,7 @@ def _request_core(method: str, url: str, user_headers: Ref[list[str]], content: 
                   timeout: float, verify: bool, follow: bool, max_redirects: int,
                   auth_user: str, auth_pass: str, client_headers: Ref[list[str]],
                   cookies: Mut[list[str]], base_url: str,
-                  want_stream: bool) -> ResponseStream:
+                  want_stream: bool, aio: bool = False) -> ResponseStream:
     """The redirect-following request engine shared by every verb."""
     started: float = monotonic()
     cur_url: str = _merge_url(base_url, url)
@@ -579,7 +581,7 @@ def _request_core(method: str, url: str, user_headers: Ref[list[str]], content: 
                                          auth_user, auth_pass, send_auth,
                                          want_stream, dropped)
         rs: ResponseStream = _perform(cur_method, cur_url, hs, body, timeout_ms,
-                                      verify, started)
+                                      verify, started, aio)
         _store_cookies(rs.headers, cookies)
         loc: str = header_value(rs.headers, "location")
         if follow and _redirect_status(rs.status_code) and loc != "":
@@ -796,6 +798,120 @@ class Client:
 
     def close(self: Mut[Client]) -> None:
         """No-op: fang opens one connection per request (connection: close)."""
+        return
+
+
+@dataclass
+class AsyncClient:
+    """httpx.AsyncClient equivalent: the same engine over async-mode sockets, so a
+    request suspends the calling task at every would-block instead of blocking the
+    loop (D45). `async with AsyncClient() as c: r = await c.get(url)`."""
+    base_url: str
+    headers: list[str]
+    cookies: list[str]
+    timeout: float
+    follow_redirects: bool
+    max_redirects: int
+    verify: bool
+    auth_user: str
+    auth_pass: str
+
+    def __init__(self: Mut[AsyncClient], base_url: str = "", timeout: float = 5.0,
+                 follow_redirects: bool = False, max_redirects: int = 20,
+                 verify: bool = True, auth_user: str = "", auth_pass: str = "") -> None:
+        self.base_url = base_url
+        self.headers = []
+        self.cookies = []
+        self.timeout = timeout
+        self.follow_redirects = follow_redirects
+        self.max_redirects = max_redirects
+        self.verify = verify
+        self.auth_user = auth_user
+        self.auth_pass = auth_pass
+
+    def set_header(self: Mut[AsyncClient], line: str) -> None:
+        self.headers.append(_norm_header(line))
+        return
+
+    def set_basic_auth(self: Mut[AsyncClient], username: str, password: str) -> None:
+        self.auth_user = username
+        self.auth_pass = password
+        return
+
+    def set_cookie(self: Mut[AsyncClient], name: str, value: str) -> None:
+        _jar_set(self.cookies, name + "=" + value)
+        return
+
+    async def request(self: Mut[AsyncClient], method: str, url: str, headers: Ref[list[str]],
+                      content: bytes) -> Response:
+        ch: list[str] = []
+        for h in self.headers:
+            ch.append(h)
+        rs: ResponseStream = _request_core(method, url, headers, content,
+                                           self.timeout, self.verify,
+                                           self.follow_redirects, self.max_redirects,
+                                           self.auth_user, self.auth_pass, ch,
+                                           self.cookies, self.base_url, False, True)
+        return _finish(move(rs))
+
+    async def get(self: Mut[AsyncClient], url: str) -> Response:
+        hs: list[str] = []
+        return await self.request("GET", url, hs, b"")
+
+    async def head(self: Mut[AsyncClient], url: str) -> Response:
+        hs: list[str] = []
+        return await self.request("HEAD", url, hs, b"")
+
+    async def options(self: Mut[AsyncClient], url: str) -> Response:
+        hs: list[str] = []
+        return await self.request("OPTIONS", url, hs, b"")
+
+    async def delete(self: Mut[AsyncClient], url: str) -> Response:
+        hs: list[str] = []
+        return await self.request("DELETE", url, hs, b"")
+
+    async def post(self: Mut[AsyncClient], url: str, content: bytes,
+                   content_type: str = "application/octet-stream") -> Response:
+        hs: list[str] = ["content-type: " + content_type]
+        return await self.request("POST", url, hs, content)
+
+    async def put(self: Mut[AsyncClient], url: str, content: bytes,
+                  content_type: str = "application/octet-stream") -> Response:
+        hs: list[str] = ["content-type: " + content_type]
+        return await self.request("PUT", url, hs, content)
+
+    async def patch(self: Mut[AsyncClient], url: str, content: bytes,
+                    content_type: str = "application/octet-stream") -> Response:
+        hs: list[str] = ["content-type: " + content_type]
+        return await self.request("PATCH", url, hs, content)
+
+    async def post_form(self: Mut[AsyncClient], url: str, form: Ref[dict[str, str]]) -> Response:
+        hs: list[str] = ["content-type: application/x-www-form-urlencoded"]
+        return await self.request("POST", url, hs, urlencode(form).encode("utf-8"))
+
+    async def post_json(self: Mut[AsyncClient], url: str, payload: PyVal) -> Response:
+        hs: list[str] = ["content-type: application/json"]
+        return await self.request("POST", url, hs, dumps(payload).encode("utf-8"))
+
+    async def stream(self: Mut[AsyncClient], method: str, url: str) -> ResponseStream:
+        """Open a streaming response; `read()` on it suspends cooperatively."""
+        hs: list[str] = []
+        ch: list[str] = []
+        for h in self.headers:
+            ch.append(h)
+        return _request_core(method, url, hs, b"", self.timeout, self.verify,
+                             self.follow_redirects, self.max_redirects,
+                             self.auth_user, self.auth_pass, ch, self.cookies,
+                             self.base_url, True, True)
+
+    async def aclose(self: Mut[AsyncClient]) -> None:
+        """No-op: one connection per request (connection: close)."""
+        return
+
+    async def __aenter__(self: Ref[AsyncClient]) -> AsyncClient:
+        return self
+
+    async def __aexit__(self: Ref[AsyncClient], exc_type: None, exc: None, tb: None) -> None:
         return
 
 

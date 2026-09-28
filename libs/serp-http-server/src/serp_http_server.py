@@ -17,10 +17,15 @@ from _serp_socket import close as _close
 from _serp_socket import listen as _listen
 from _serp_socket import local_port as _local_port
 from _serp_socket import recv as _recv
-from _serp_socket import send as _send
+from _serp_socket import send_all as _send_all
 from _serp_socket import set_timeout as _set_timeout
 
 MAX_HEAD: int = 65536
+
+
+def _send(conn: int, data: bytes) -> int:
+    """Write every byte of data to a connection, blocking until it all lands."""
+    return _send_all(conn, data, 0)
 
 
 def _status_text(code: int) -> str:

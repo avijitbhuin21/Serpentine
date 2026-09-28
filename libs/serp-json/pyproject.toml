@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-json"
-version = "0.2.0"
+version = "0.3.0"
 description = "Serpentine JSON library: loads/dumps written in the Serpentine subset (compiles natively, runs under CPython)"
 readme = "README.md"
 license = { text = "MIT" }

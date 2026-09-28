@@ -1,4 +1,4 @@
-"""Checker-as-library API (docs/archive/research.md §5.13): structured diagnostics for tooling.
+"""Checker-as-library API: structured diagnostics for tooling.
 
 This is the supported programmatic surface for editors, CI hooks, and the LSP
 server. It never prints and never exits; it returns `Diagnostic` values.

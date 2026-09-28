@@ -73,7 +73,23 @@ Behavior parity with httpx:
 - kwargs that take lists/dicts/bytes in httpx are explicit parameters or
   `Client` fields (defaults may only be scalar literals).
 - One connection per request (`connection: close`) — no pooling/keep-alive,
-  no HTTP/2, no async, no proxies.
+  no HTTP/2, no proxies.
 - `text()` decodes UTF-8 (no charset sniffing).
 - Transport errors are the normalized serp-socket `OSError`s
   ("connection refused", "timed out", "tls handshake failed", ...).
+
+## Async (`AsyncClient`, D45)
+
+```python
+async with AsyncClient(base_url="http://127.0.0.1:8000", timeout=5.0) as client:
+    r: Response = await client.get("/items/1")
+```
+
+`AsyncClient` runs the same engine over sockets in *async mode*: every would-block
+suspends only the calling task, so `asyncio.gather` of several requests overlaps them
+(four 300 ms requests complete in ~0.3 s natively). Methods: `request/get/head/options/
+delete/post/put/patch/post_form/post_json/stream/aclose`, `set_header/set_basic_auth/
+set_cookie`, `async with`. Divergences: `stream()` returns a `ResponseStream` whose
+`read()` is a plain (cooperative) call — no `aiter_bytes`; connects/TLS handshakes are
+still blocking; under CPython the async mode is a no-op, so requests there run one at a
+time.

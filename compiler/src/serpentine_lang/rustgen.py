@@ -1,4 +1,4 @@
-"""Backend A: typed AST -> Rust source. rustc is the borrow-check oracle (docs/archive/research.md section 4).
+"""Backend A: typed AST -> Rust source. rustc is the borrow-check oracle.
 
 Emits structured Rust (not linearized SIR) so the generated code stays readable
 and rustc's own borrow checker re-validates every ownership decision.
@@ -10,9 +10,10 @@ import re
 from pathlib import Path
 
 from .frontend import Module, Program, exc_handler_names
-from .ptypes import (Type, TBool, TByteArray, TBytes, TClass, TDict, TExc, TFile, TFloat,
-                     TFunc, TInt, TList, TNone, TOptional, TPyVal, TShared, TStr, TTuple,
-                     TWeak, mangle_type, subst_type, walk_types)
+from .ptypes import (NONE, Type, TBool, TByteArray, TBytes, TClass, TDict, TEnum, TExc, TFile,
+                     TFloat,
+                     TFunc, TInt, TJoin, TList, TNone, TOptional, TPyVal, TSet, TShared, TStr, TThread,
+                     TTuple, TUnion, TWeak, mangle_type, subst_type, union_slot, walk_types)
 from .typecheck import FuncSig, TIter, TypeChecker
 
 PRELUDE = (Path(__file__).parent / "prelude.rs").read_text(encoding="utf-8")
@@ -20,6 +21,12 @@ PRELUDE = (Path(__file__).parent / "prelude.rs").read_text(encoding="utf-8")
 
 def _sanitize(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_]", "_", name)
+
+
+def _esc(s: str) -> str:
+    """Escape a Python string for a Rust string literal."""
+    return (s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            .replace("\r", "\\r").replace("\t", "\\t"))
 
 
 def struct_name(t: TClass) -> str:
@@ -30,8 +37,25 @@ def struct_name(t: TClass) -> str:
     return _sanitize(base)
 
 
+def enum_name(t: "TEnum") -> str:
+    """The Rust enum name for an enum class."""
+    return _sanitize(f"E_{t.module}_{t.name}")
+
+
+def union_name(t: "TUnion") -> str:
+    """The Rust enum name for a union type."""
+    return _sanitize("U_" + "__".join(mangle_type(m) for m in t.members))
+
+
+def union_variant(i: int) -> str:
+    """The Rust variant name for union member index i."""
+    return f"V{i}"
+
+
 def rust_type(t: Type) -> str:
     """Map a Tier-0/1 type to its Rust representation."""
+    if isinstance(t, TEnum):
+        return enum_name(t)
     if isinstance(t, TInt):
         return "i64"
     if isinstance(t, TFloat):
@@ -46,10 +70,14 @@ def rust_type(t: Type) -> str:
         return f"Vec<{rust_type(t.elem)}>"
     if isinstance(t, TDict):
         return f"SerpDict<{rust_type(t.key)}, {rust_type(t.value)}>"
+    if isinstance(t, TSet):
+        return f"SerpSet<{rust_type(t.elem)}>"
     if isinstance(t, TTuple):
         return "(" + ", ".join(rust_type(i) for i in t.items) + ")"
     if isinstance(t, TOptional):
         return f"Option<{rust_type(t.inner)}>"
+    if isinstance(t, TUnion):
+        return union_name(t)
     if isinstance(t, TClass):
         return struct_name(t)
     if isinstance(t, TShared):
@@ -69,7 +97,20 @@ def rust_type(t: Type) -> str:
     if isinstance(t, TFunc):
         params = ", ".join(rust_type(p) for p in t.params)
         return f"Rc<dyn Fn({params}) -> SRes<{rust_type(t.ret)}>>"
+    if isinstance(t, TJoin):
+        return f"{'STask' if t.task else 'SJoin'}<{send_rust_type(t.ret)}>"
+    if isinstance(t, TThread):
+        return "SThread"
     raise CodegenError(f"no Rust type for {t}")
+
+
+def send_rust_type(t: Type) -> str:
+    """Rust type of a Send value as it crosses a thread boundary."""
+    if isinstance(t, TStr):
+        return "String"
+    if isinstance(t, TBytes):
+        return "Vec<u8>"
+    return rust_type(t)
 
 
 class CodegenError(Exception):
@@ -84,6 +125,8 @@ def needs_clone(t: Type) -> bool:
         return any(needs_clone(i) for i in t.items)
     if isinstance(t, TOptional):
         return needs_clone(t.inner)
+    if isinstance(t, TUnion):
+        return True
     return False
 
 
@@ -109,6 +152,10 @@ class RustGen:
         """Emit the complete Rust program (prelude + structs + modules + entry)."""
         self.out = [PRELUDE, ""]
         entry = self.program.entry
+        for key in sorted(self.tc.enums):
+            self._emit_enum(self.tc.enums[key])
+        for u in self._collect_union_insts():
+            self._emit_union(u)
         for t in self._collect_class_insts():
             self._emit_struct(t)
         for mod in self.program.modules.values():
@@ -133,6 +180,7 @@ class RustGen:
         self._line(f"    if let Err(__e) = f_{entry.entry_call}() {{")
         self._line("        serp_abort(__e);")
         self._line("    }")
+        self._line("    serp_threads_join_all();")
         self._line("}")
         return "\n".join(self.out)
 
@@ -205,6 +253,117 @@ class RustGen:
                 if isinstance(inner, TClass) and self._class_has_func(inner, visiting):
                     return True
         return False
+
+    def _emit_enum(self, info) -> None:
+        """Emit the Rust enum, value/name accessors and PyShow impl for one enum class."""
+        name = enum_name(TEnum(info.module, info.name))
+        variants = [f"V_{_sanitize(m)}" for m, _ in info.members]
+        self._line("#[derive(Clone, Copy, PartialEq)]")
+        self._line("#[allow(non_camel_case_types)]")
+        self._line(f"enum {name} {{ {', '.join(variants)} }}")
+        self._line("")
+        self._line(f"impl {name} {{")
+        is_int = isinstance(info.value_type, TInt)
+        vty = "i64" if is_int else "SStr"
+        arms = []
+        for (m, v), var in zip(info.members, variants):
+            lit = f"{v}i64" if is_int else f'sstr("{_esc(v)}")'
+            arms.append(f"{name}::{var} => {lit}")
+        self._line(f"    fn evalue(&self) -> {vty} {{ match self {{ {', '.join(arms)} }} }}")
+        narms = [f'{name}::{var} => sstr("{m}")'
+                 for (m, _), var in zip(info.members, variants)]
+        self._line(f"    fn ename(&self) -> SStr {{ match self {{ {', '.join(narms)} }} }}")
+        farms = []
+        for (m, v), var in zip(info.members, variants):
+            pat = f"{v}" if is_int else f'"{_esc(v)}"'
+            farms.append(f"{pat} => Ok({name}::{var})")
+        arg = "v: i64" if is_int else "v: &SStr"
+        subject = "v" if is_int else "v.as_str()"
+        self._line(f"    fn from_value({arg}) -> SRes<{name}> {{")
+        self._line(f"        match {subject} {{ {', '.join(farms)},")
+        self._line(f'            _ => serp_err("ValueError", '
+                   f'format!("{{}} is not a valid {info.name}", v.py_repr())) }}')
+        self._line("    }")
+        self._line("}")
+        self._line("")
+        self._line(f"impl PyShow for {name} {{")
+        if info.base == "IntEnum":
+            self._line("    fn py_str(&self) -> String { self.evalue().py_repr() }")
+        elif info.base == "StrEnum":
+            self._line("    fn py_str(&self) -> String { self.evalue().py_str() }")
+        else:
+            self._line(f'    fn py_str(&self) -> String '
+                       f'{{ format!("{info.name}.{{}}", self.ename().py_str()) }}')
+        self._line(f'    fn py_repr(&self) -> String {{ format!("<{info.name}.{{}}: {{}}>", '
+                   f'self.ename().py_str(), self.evalue().py_repr()) }}')
+        self._line("}")
+        self._line("")
+
+    def _emit_union(self, t: TUnion) -> None:
+        """Emit the Rust enum, variant accessors and PyShow impl for one union type."""
+        name = union_name(t)
+        derives = ["Clone"]
+        if not any(isinstance(i, (TWeak, TFunc)) for m in t.members for i in walk_types(m)):
+            derives.append("PartialEq")
+        variants = [f"{union_variant(i)}({rust_type(m)})" for i, m in enumerate(t.members)]
+        self._line(f"#[derive({', '.join(derives)})]")
+        self._line("#[allow(non_camel_case_types, dead_code)]")
+        self._line(f"enum {name} {{ {', '.join(variants)} }}")
+        self._line(f"impl {name} {{")
+        for i, m in enumerate(t.members):
+            var, mt = union_variant(i), rust_type(m)
+            self._line(f"    fn is_{i}(&self) -> bool "
+                       f"{{ matches!(self, {name}::{var}(_)) }}")
+            self._line(f"    fn as_{i}(&self) -> &{mt} {{ match self "
+                       f"{{ {name}::{var}(__x) => __x, _ => unreachable!() }} }}")
+            self._line(f"    fn mut_{i}(&mut self) -> &mut {mt} {{ match self "
+                       f"{{ {name}::{var}(__x) => __x, _ => unreachable!() }} }}")
+            self._line(f"    fn into_{i}(self) -> {mt} {{ match self "
+                       f"{{ {name}::{var}(__x) => __x, _ => unreachable!() }} }}")
+        self._line("}")
+        arms_s = ", ".join(
+            f"{name}::{union_variant(i)}(__x) => "
+            + ("{ let _ = __x; \"None\".to_string() }" if isinstance(m, TNone)
+               else "__x.py_str()")
+            for i, m in enumerate(t.members))
+        arms_r = ", ".join(
+            f"{name}::{union_variant(i)}(__x) => "
+            + ("{ let _ = __x; \"None\".to_string() }" if isinstance(m, TNone)
+               else "__x.py_repr()")
+            for i, m in enumerate(t.members))
+        self._line(f"impl PyShow for {name} {{")
+        self._line(f"    fn py_str(&self) -> String {{ match self {{ {arms_s} }} }}")
+        self._line(f"    fn py_repr(&self) -> String {{ match self {{ {arms_r} }} }}")
+        self._line("}")
+        self._line("")
+
+    def _collect_union_insts(self) -> list[TUnion]:
+        """Every concrete union type mentioned anywhere in the program."""
+        seen: dict[str, TUnion] = {}
+
+        def add(t: Type) -> None:
+            for inner in walk_types(t):
+                if isinstance(inner, TUnion) and not self._has_tvar(inner):
+                    seen.setdefault(union_name(inner), inner)
+
+        for sig in self.tc.sigs.values():
+            if sig.is_template:
+                continue
+            for p in sig.params:
+                add(p.typ)
+            add(sig.ret)
+        for facts in self.tc.facts.values():
+            for t in facts.locals.values():
+                add(t)
+        for t in self.tc.expr_types.values():
+            add(t)
+        for cls in self._collect_class_insts():
+            info = self.tc.classes.get((cls.module, cls.name))
+            if info is not None:
+                sub = dict(zip(info.typevars, cls.args))
+                for ft in info.fields.values():
+                    add(subst_type(ft, sub))
+        return [seen[k] for k in sorted(seen)]
 
     def _emit_struct(self, t: TClass) -> None:
         """Emit the struct, PyShow impl, and derives for one class instantiation."""
@@ -509,10 +668,42 @@ class RustGen:
         else:
             self._line(f'println!("{{}}", [{", ".join(parts)}].join(" "));')
 
+    def _hoist(self, code: str) -> str:
+        """Bind a value expression to a `let` temp so it is evaluated before a later
+        `&mut` borrow of a container it may read from (rustc E0502)."""
+        n = getattr(self, "_sv_n", 0)
+        self._sv_n = n + 1
+        tmp = f"__rhs{n}"
+        self._line(f"let {tmp} = {code};")
+        return tmp
+
+    def _emit_setitem_call(self, oc: ast.Call) -> None:
+        """Emit a `__setitem__` desugar, hoisting non-trivial index/value arguments into
+        `let` temps so they are evaluated before the `&mut` receiver borrow (rustc E0502)."""
+        args = list(oc.args)
+        saved = list(oc.args)
+        for i, a in enumerate(args):
+            if isinstance(a, (ast.Name, ast.Constant)):
+                continue
+            t = self._t(a)
+            n = getattr(self, "_sv_n", 0)
+            self._sv_n = n + 1
+            tmp = f"__sv{n}"
+            self._line(f"let v_{tmp} = {self._expr(a, 'val')};")
+            self.scope_types[tmp] = t
+            name = ast.Name(id=tmp, ctx=ast.Load())
+            ast.copy_location(name, a)
+            self.tc.expr_types[id(name)] = t
+            oc.args[i] = name
+        try:
+            self._line(f"{self._expr(oc, 'val')};")
+        finally:
+            oc.args[:] = saved
+
     def _emit_assign(self, stmt: ast.Assign | ast.AnnAssign) -> None:
         oc = self.tc.op_calls.get(id(stmt))
         if oc is not None:
-            self._line(f"{self._expr(oc, 'val')};")
+            self._emit_setitem_call(oc)
             return
         target = stmt.targets[0] if isinstance(stmt, ast.Assign) else stmt.target
         assert stmt.value is not None
@@ -546,16 +737,18 @@ class RustGen:
                 elem = cont_t.elem
                 val = self._coerce(self._expr(stmt.value, "val", expect=elem),
                                    self._t(stmt.value), elem)
+                tmp = self._hoist(val)
                 recv = self._recv(target.value, True) if shared else self._expr(target.value, "mut")
                 idx = self._expr(target.slice, "val")
-                self._line(f"{self._q(f'serp_idx_set({recv}, {idx}, {val})')};")
+                self._line(f"{self._q(f'serp_idx_set({recv}, {idx}, {tmp})')};")
                 return
             if isinstance(cont_t, TDict):
                 val = self._coerce(self._expr(stmt.value, "val", expect=cont_t.value),
                                    self._t(stmt.value), cont_t.value)
+                tmp = self._hoist(val)
                 recv = self._recv(target.value, True) if shared else self._expr(target.value, "mut")
                 key = self._expr(target.slice, "val")
-                self._line(f"({recv}).set({key}, {val});")
+                self._line(f"({recv}).set({key}, {tmp});")
                 return
             if isinstance(cont_t, TByteArray):
                 recv = self._recv(target.value, True) if shared else self._expr(target.value, "mut")
@@ -694,6 +887,13 @@ class RustGen:
                     cast_lines, new_refs
             new_refs.add(names[0])
             return f"for v_{names[0]} in ({recv}).{kind}_it()", cast_lines, new_refs
+        if kind == "set":
+            seq = self._expr(iter_node, "ref")
+            elem_t = self._iter_elems(iter_node, kind)[0]
+            if isinstance(elem_t, (TInt, TFloat, TBool)):
+                return f"for v_{names[0]} in ({seq}).iter_it().copied()", cast_lines, new_refs
+            new_refs.add(names[0])
+            return f"for v_{names[0]} in ({seq}).iter_it()", cast_lines, new_refs
         seq = self._expr(iter_node, "ref")
         elem_t = self._iter_elems(iter_node, kind)[0]
         if isinstance(elem_t, (TInt, TFloat, TBool)):
@@ -705,6 +905,8 @@ class RustGen:
         """Element types yielded by an iterable expression."""
         it_t = self._t(iter_node)
         if isinstance(it_t, TList):
+            return (it_t.elem,)
+        if isinstance(it_t, TSet):
             return (it_t.elem,)
         if isinstance(it_t, TStr):
             return (TStr(),)
@@ -793,6 +995,12 @@ class RustGen:
             return "None"
         if isinstance(dst, TFloat) and isinstance(src, TInt):
             return f"(({code}) as f64)"
+        if isinstance(dst, TUnion) and not isinstance(src, TUnion):
+            slot = union_slot(src, dst)
+            if slot is None:
+                raise CodegenError(f"{src} is not a member of {dst}")
+            inner = self._coerce(code, src, dst.members[slot])
+            return f"{union_name(dst)}::{union_variant(slot)}({inner})"
         if isinstance(dst, TPyVal) and not isinstance(src, TPyVal):
             return self._pyval_from(code, src)
         return code
@@ -814,14 +1022,16 @@ class RustGen:
         if isinstance(src, TBytes):
             return f"pyval_bytes({code})"
         if isinstance(src, TList):
-            inner = self._pyval_from("__e", src.elem)
-            return (f"pyval_list(({code}).into_iter().map(|__e| {inner})"
+            inner = self._pyval_from("__e.clone()", src.elem)
+            return (f"pyval_list(({code}).iter()"
+                    f".map(|__e: &{rust_type(src.elem)}| {inner})"
                     f".collect::<Vec<PVal>>())")
         if isinstance(src, TDict):
             inner = self._pyval_from("__v.clone()", src.value)
-            return (f"{{ let __src = {code}; let mut __m: SerpDict<SStr, PVal> = "
+            kconv = self._pyval_from("__k.clone()", src.key)
+            return (f"{{ let __src = &({code}); let mut __m: SerpDict<PVal, PVal> = "
                     f"SerpDict::new(); for (__k, __v) in __src.items_it() "
-                    f"{{ __m.set(__k.clone(), {inner}); }} pyval_dict(__m) }}")
+                    f"{{ __m.set({kconv}, {inner}); }} pyval_dict(__m) }}")
         raise CodegenError(f"cannot convert {src} to PyVal")
 
     def _expr(self, node: ast.expr, mode: str, expect: Type | None = None) -> str:
@@ -830,8 +1040,8 @@ class RustGen:
             return self._expr(oc, mode, expect)
         if isinstance(node, ast.Lambda):
             return self._wrap_ref(self._lambda_code(node), mode)
-        if isinstance(node, (ast.ListComp, ast.DictComp)):
-            return self._comp_expr(node, mode)
+        if isinstance(node, (ast.ListComp, ast.DictComp, ast.SetComp)):
+            return self._comp_expr(node, mode, expect)
         if isinstance(node, ast.Constant):
             return self._const(node, mode)
         if isinstance(node, ast.Name):
@@ -846,6 +1056,15 @@ class RustGen:
             return self._wrap_ref(f"vec![{', '.join(parts)}]", mode)
         if isinstance(node, ast.Dict):
             return self._dict_literal(node, mode)
+        if isinstance(node, ast.Set):
+            t = self._t(node)
+            assert isinstance(t, TSet)
+            lines = [f"{{ let mut __s: {rust_type(t)} = SerpSet::new();"]
+            for e in node.elts:
+                val = self._coerce(self._expr(e, "val", expect=t.elem), self._t(e), t.elem)
+                lines.append(f"__s.add({val});")
+            lines.append("__s }")
+            return self._wrap_ref(" ".join(lines), mode)
         if isinstance(node, ast.Tuple):
             parts = [self._expr(e, "val") for e in node.elts]
             return self._wrap_ref(f"({', '.join(parts)})", mode)
@@ -871,14 +1090,19 @@ class RustGen:
             b = self._coerce(self._expr(node.orelse, "val"), self._t(node.orelse), t)
             return self._wrap_ref(f"(if {c} {{ {a} }} else {{ {b} }})", mode)
         if isinstance(node, ast.Call):
+            nc = getattr(node, "_narrow", None)
+            if nc is not None:
+                ut, mt = nc
+                code = self._call(node, "val")
+                return self._wrap_ref(f"({code}).into_{union_slot(mt, ut)}()", mode)
             return self._call(node, mode)
         if isinstance(node, ast.Attribute):
             return self._attribute(node, mode)
         raise CodegenError(f"cannot emit expression {type(node).__name__}")
 
-    def _comp_expr(self, node: ast.expr, mode: str) -> str:
+    def _comp_expr(self, node: ast.expr, mode: str, expect: Type | None = None) -> str:
         """Emit a list/dict comprehension as a Rust block expression."""
-        assert isinstance(node, (ast.ListComp, ast.DictComp))
+        assert isinstance(node, (ast.ListComp, ast.DictComp, ast.SetComp))
         kind = self.tc.loop_iter_kind[id(node)]
         gen = node.generators[0]
         targets = [gen.target] if isinstance(gen.target, ast.Name) else list(gen.target.elts)
@@ -886,6 +1110,8 @@ class RustGen:
         elems = self._iter_elems(gen.iter, kind)
         header, cast_lines, new_refs = self._for_header(gen.iter, kind, names)
         t = self._t(node)
+        if expect is not None and type(expect) is type(t) and expect != t:
+            t = expect
         self.tmp_counter += 1
         c = f"__comp{self.tmp_counter}"
         saved_refs = set(self.ref_bound)
@@ -901,6 +1127,12 @@ class RustGen:
             v = self._coerce(self._expr(node.value, "val", expect=t.value),
                              self._t(node.value), t.value)
             push = f"{c}.set({k}, {v});"
+        elif isinstance(node, ast.SetComp):
+            assert isinstance(t, TSet)
+            decl = f"let mut {c}: {rust_type(t)} = SerpSet::new();"
+            elem = self._coerce(self._expr(node.elt, "val", expect=t.elem),
+                                self._t(node.elt), t.elem)
+            push = f"{c}.add({elem});"
         else:
             assert isinstance(t, TList)
             decl = f"let mut {c}: {rust_type(t)} = Vec::new();"
@@ -925,7 +1157,7 @@ class RustGen:
                     else self._q(f"shared_ref({self._expr(e.value, 'ref')})")
                 return f"{guard}.a_{e.attr}"
             return f"{self._place(e.value, mut)}.a_{e.attr}"
-        if isinstance(e, ast.Subscript):
+        if isinstance(e, ast.Subscript) and id(e) not in self.tc.op_calls:
             base_t = self._t(e.value)
             idx = self._expr(e.slice, "val")
             if isinstance(base_t, TShared):
@@ -942,6 +1174,8 @@ class RustGen:
                     return f"(*{self._q(f'({recv}).get_mut(&({idx}))')})"
                 recv = self._expr(e.value, "ref")
                 return f"(*{self._q(f'({recv}).get_ref(&({idx}))')})"
+        if isinstance(e, (ast.Subscript, ast.Call, ast.BinOp, ast.UnaryOp, ast.Compare)):
+            return f"({self._expr(e, 'val')})"
         raise CodegenError("unsupported place expression")
 
     def _attribute(self, node: ast.Attribute, mode: str) -> str:
@@ -949,11 +1183,37 @@ class RustGen:
             if node.attr == "argv":
                 return self._wrap_ref("serp_argv()", mode)
             raise CodegenError(f"cannot emit sys.{node.attr}")
+        member = self.tc.enum_members.get(id(node))
+        if member is not None:
+            emod, ename, mname = member
+            return self._wrap_ref(f"{enum_name(TEnum(emod, ename))}::V_{_sanitize(mname)}", mode)
         t = self._t(node)
         base_t = self._t(node.value)
+        if isinstance(base_t, TEnum):
+            recv = self._expr(node.value, "ref")
+            call = "evalue" if node.attr == "value" else "ename"
+            return self._wrap_ref(f"({recv}).{call}()", mode)
+        if isinstance(base_t, TThread):
+            recv = self._expr(node.value, "ref")
+            if node.attr == "name":
+                return self._wrap_ref(f"serp_thread_name({recv})", mode)
+            if node.attr == "ident":
+                return self._wrap_ref(
+                    f"{{ let __i = serp_thread_ident({recv}); if __i == 0 {{ None }} else {{ Some(__i) }} }}",
+                    mode)
+            return self._wrap_ref(f"serp_thread_daemon({recv})", mode)
         narrowed = id(node) in self.tc.narrowed_uses
+        slot = self.tc.narrow_variant.get(id(node))
         if narrowed and not isinstance(base_t, TShared):
             code = f"{self._place(node.value, mut=(mode == 'mut'))}.a_{node.attr}"
+            if slot is not None:
+                if mode == "mut":
+                    return f"{code}.mut_{slot}()"
+                if mode == "ref":
+                    return f"{code}.as_{slot}()"
+                if needs_clone(t) or not t.is_copy():
+                    return f"{code}.as_{slot}().clone()"
+                return f"(*{code}.as_{slot}())"
             if mode == "mut":
                 return f"{code}.as_mut().unwrap()"
             if mode == "ref":
@@ -974,8 +1234,12 @@ class RustGen:
             return code
         place = self._place(node.value, mut=(mode == "mut"))
         if isinstance(node.value, ast.Name) and id(node.value) in self.tc.narrowed_uses:
-            place = f"{place}.as_mut().unwrap()" if mode == "mut" \
-                else f"{place}.as_ref().unwrap()"
+            vslot = self.tc.narrow_variant.get(id(node.value))
+            if vslot is not None:
+                place = f"{place}.mut_{vslot}()" if mode == "mut" else f"{place}.as_{vslot}()"
+            else:
+                place = f"{place}.as_mut().unwrap()" if mode == "mut" \
+                    else f"{place}.as_ref().unwrap()"
         code = f"{place}.a_{node.attr}"
         if mode == "mut":
             return f"&mut {code}"
@@ -1040,11 +1304,14 @@ class RustGen:
                 return self._const(cnode, mode)
             raise CodegenError(f"unknown name {name}")
         narrowed = id(node) in self.tc.narrowed_uses
+        slot = self.tc.narrow_variant.get(id(node))
         is_ref = name in self.ref_bound or \
             (name in {p.name for p in self.sig.params} and
              next(p.conv for p in self.sig.params if p.name == name) in ("ref", "mut"))
         base = f"v_{name}"
         if mode == "mut":
+            if slot is not None:
+                return f"{base}.mut_{slot}()"
             if narrowed:
                 return f"{base}.as_mut().unwrap()"
             if name in {p.name for p in self.sig.params} and \
@@ -1052,12 +1319,19 @@ class RustGen:
                 return base
             return f"&mut {base}"
         if mode == "ref":
+            if slot is not None:
+                return f"{base}.as_{slot}()"
             if narrowed:
                 t0 = self._t(node)
                 if isinstance(t0, TOptional) and isinstance(t0.inner, (TInt, TFloat, TBool)):
                     return f"&({self._name(node, 'val')})"
                 return f"{base}.as_ref().unwrap()"
             return base if is_ref else f"&{base}"
+        if slot is not None:
+            member = self._t(node)
+            if needs_clone(member) or not member.is_copy():
+                return f"{base}.as_{slot}().clone()"
+            return f"(*{base}.as_{slot}())"
         if narrowed:
             assert isinstance(t, TOptional)
             inner = t.inner
@@ -1069,7 +1343,7 @@ class RustGen:
                 return f"{base}.clone()"
             if isinstance(t, (TInt, TFloat, TBool)):
                 return f"(*{base})"
-            return f"{base}.clone()" if t.is_copy() else base
+            return f"{base}.clone()"
         if needs_clone(t):
             return f"{base}.clone()"
         return base
@@ -1113,6 +1387,9 @@ class RustGen:
             if isinstance(idx_t, TPyVal):
                 idx = self._expr(node.slice, "ref")
                 return self._wrap_ref(self._q(f"pyval_getitem_v({recv}, {idx})"), mode)
+            if isinstance(idx_t, (TFloat, TBool)):
+                idx = self._pyval_from(self._expr(node.slice, "val"), idx_t)
+                return self._wrap_ref(self._q(f"pyval_getitem_v({recv}, &({idx}))"), mode)
             idx = self._expr(node.slice, "val")
             return self._wrap_ref(self._q(f"pyval_getitem_i({recv}, {idx})"), mode)
         if isinstance(base_t, TShared):
@@ -1161,9 +1438,12 @@ class RustGen:
         if isinstance(base_t, TTuple):
             assert isinstance(node.slice, ast.Constant)
             i = node.slice.value
+            item = base_t.items[i]
+            if getattr(node, "_destructure", False) and isinstance(node.value, ast.Name) \
+                    and not item.is_copy() and mode == "val":
+                return f"v_{node.value.id}.{i}"
             recv = self._expr(node.value, "ref")
             code = f"({recv}).{i}"
-            item = base_t.items[i]
             if mode == "ref":
                 return f"&{code}"
             if mode == "val":
@@ -1273,6 +1553,15 @@ class RustGen:
     def _compare(self, node: ast.Compare) -> str:
         op0 = node.ops[0]
         if isinstance(op0, (ast.Is, ast.IsNot)):
+            lt = self._t(node.left)
+            if isinstance(lt, TPyVal):
+                ref = self._expr(node.left, "ref")
+                code = f'(pyval_type_name({ref}) == "NoneType")'
+                return code if isinstance(op0, ast.Is) else f"(!{code})"
+            if isinstance(lt, TUnion):
+                slot = union_slot(NONE, lt)
+                code = f"{self._place(node.left, mut=False)}.is_{slot}()"
+                return code if isinstance(op0, ast.Is) else f"(!{code})"
             method = "is_none" if isinstance(op0, ast.Is) else "is_some"
             if isinstance(node.left, ast.Name):
                 return f"v_{node.left.id}.{method}()"
@@ -1290,7 +1579,7 @@ class RustGen:
             c = self._expr(node.comparators[0], "ref")
             if isinstance(ct, TDict):
                 code = f"({c}).contains(&({l}))"
-            elif isinstance(ct, TList):
+            elif isinstance(ct, (TList, TSet)):
                 code = f"({c}).contains(&({l}))"
             elif isinstance(ct, TBytes):
                 code = f"pyb_contains({c}, &({l}))"
@@ -1309,6 +1598,7 @@ class RustGen:
             code = f"pyval_eq(&({a}), &({b}))"
             return f"(!{code})" if isinstance(node.ops[0], ast.NotEq) else code
         has_float = any(isinstance(t, TFloat) for t in types)
+        has_opt = any(isinstance(t, TOptional) for t in types)
         vals = []
         for o, t in zip(operands, types):
             if not t.is_copy():
@@ -1317,6 +1607,8 @@ class RustGen:
             v = self._expr(o, "val")
             if has_float and isinstance(t, TInt):
                 v = f"(({v}) as f64)"
+            if has_opt and not isinstance(t, (TOptional, TNone)):
+                v = f"Some({v})"
             vals.append(v)
         if len(node.ops) == 1:
             return f"({vals[0]} {self.CMP[type(node.ops[0])]} {vals[1]})"
@@ -1362,6 +1654,67 @@ class RustGen:
         return (f"{{ {lets} (Rc::new(move |{params}| -> SRes<{ret}> "
                 f"{{ Ok({body}) }}) as {rust_type(ft)}) }}")
 
+    def _send_args(self, args: list[ast.expr], sig) -> tuple[list[str], list[str]]:
+        """Copy Send arguments into `let` bindings usable inside a Send closure."""
+        lets, argl = [], []
+        for i, (a, p) in enumerate(zip(args, sig.params)):
+            if isinstance(p.typ, TClass):
+                lets.append(f"let __sp{i} = ({self._expr(a, 'ref')}).clone();")
+                argl.append(f"__sp{i}")
+                continue
+            code = self._coerce(self._expr(a, "val", expect=p.typ), self._t(a), p.typ)
+            if isinstance(p.typ, TStr):
+                lets.append(f"let __sp{i} = send_str(&({code}));")
+                argl.append(f"recv_str(__sp{i})")
+            elif isinstance(p.typ, TBytes):
+                lets.append(f"let __sp{i} = (*({code}).v).clone();")
+                argl.append(f"SBytes {{ v: Rc::new(__sp{i}) }}")
+            else:
+                lets.append(f"let __sp{i} = {code};")
+                argl.append(f"__sp{i}")
+        return lets, argl
+
+    def _thread_call(self, node: ast.Call) -> str:
+        """Emit Thread(target=..)/Timer(..) as serp_thread_new over a deferred Send closure."""
+        info = self.tc.thread_calls[id(node)]
+        fmod, fname = info["target"]
+        sig = self.tc.sigs[(fmod, fname)]
+        qual = f"m_{_sanitize(fmod)}::" if fmod != self.mod.name else ""
+        lets, argl = self._send_args(info["args"], sig)
+        call = f"{qual}f_{_sanitize(fname)}({', '.join(argl)})"
+        body = f"Box::new(move || {{ {call}.map(|_| ()).map_err(|e| (e.kind, e.msg)) }})"
+        name = "None"
+        if info["name"] is not None:
+            name = f"Some(send_str(&({self._expr(info['name'], 'ref')})))"
+        daemon = "false"
+        if info["daemon"] is not None:
+            daemon = self._expr(info["daemon"], "val")
+        delay = "0"
+        if info["interval"] is not None:
+            iv = self._coerce(self._expr(info["interval"], "val", expect=TFloat()),
+                              self._t(info["interval"]), TFloat())
+            delay = f"(({iv}) * 1000.0) as i64"
+        target = '""' if info["timer"] else f'"{fname}"'
+        return (f"{{ {' '.join(lets)} serp_thread_new({body}, {name}, {daemon}, {delay}, "
+                f"{target}) }}")
+
+    def _spawn_call(self, node: ast.Call) -> str:
+        """Emit spawn(f, args...) as serp_spawn over a Send closure (D9)."""
+        key = self.tc.spawn_calls[id(node)]
+        sig = self.tc.sigs[key]
+        fmod, fname = key
+        qual = f"m_{_sanitize(fmod)}::" if fmod != self.mod.name else ""
+        lets, argl = self._send_args(node.args[1:], sig)
+        call = f"{qual}f_{_sanitize(fname)}({', '.join(argl)})"
+        if isinstance(sig.ret, TStr):
+            body = f"{call}.map(|__r| send_str(&__r))"
+        elif isinstance(sig.ret, TBytes):
+            body = f"{call}.map(|__r| (*__r.v).clone())"
+        else:
+            body = call
+        ctor = "serp_task_spawn" if self._t(node).task else "serp_spawn"
+        return f"{{ {' '.join(lets)} {ctor}(move || {{ {body} }}) }}"
+
     def _func_value_call(self, node: ast.Call, ft: TFunc) -> str:
         """Emit a call through a first-class function value."""
         fcode = self._expr(node.func, "val")
@@ -1381,6 +1734,18 @@ class RustGen:
             return self._expr(node.args[0], mode)
         if id(node) in self.tc.ctor_calls:
             return self._wrap_ref(self._ctor_call(node), mode)
+        ekey = self.tc.enum_calls.get(id(node))
+        if ekey is not None:
+            info = self.tc.enums[ekey]
+            arg = self._expr(node.args[0], "val" if isinstance(info.value_type, TInt) else "ref")
+            call = f"{enum_name(TEnum(*ekey))}::from_value({arg})"
+            return self._wrap_ref(self._q(call), mode)
+        if id(node) in self.tc.isinstance_checks:
+            declared, member = self.tc.isinstance_checks[id(node)]
+            assert isinstance(declared, TUnion)
+            slot = union_slot(member, declared)
+            place = self._expr(node.args[0], "ref")
+            return self._wrap_ref(f"({place}).is_{slot}()", mode)
         if name == "share":
             v = self._expr(node.args[0], "val")
             return self._wrap_ref(f"serp_share({v})", mode)
@@ -1392,6 +1757,11 @@ class RustGen:
             return self._wrap_ref(f"serp_upgrade({w})", mode)
         if name == "pyval_kind":
             return self._wrap_ref(f"pyval_kind({self._expr(node.args[0], 'ref')})", mode)
+        if name == "pyval_json":
+            v = self._expr(node.args[0], "ref")
+            ea = self._expr(node.args[1], "val")
+            cp = self._expr(node.args[2], "val")
+            return self._wrap_ref(self._q(f"pyval_json({v}, {ea}, {cp})"), mode)
         if name == "open":
             path = self._expr(node.args[0], "ref")
             fmode = self._expr(node.args[1], "ref") if len(node.args) > 1 else '"r"'
@@ -1403,12 +1773,21 @@ class RustGen:
                 if p in ("s", "y"):
                     parts.append(self._expr(a, "ref"))
                     continue
+                if p == "p":
+                    v = self._coerce(self._expr(a, "val", expect=TPyVal()),
+                                     self._t(a), TPyVal())
+                    parts.append(f"&({v})")
+                    continue
                 pt = TFloat() if p == "f" else TInt()
                 parts.append(self._coerce(self._expr(a, "val", expect=pt), self._t(a), pt))
             code = f"{rf.rust}({', '.join(parts)})"
             if rf.can_raise:
                 code = self._q(code)
             return self._wrap_ref(code, mode)
+        if id(node) in self.tc.spawn_calls:
+            return self._wrap_ref(self._spawn_call(node), mode)
+        if id(node) in self.tc.thread_calls:
+            return self._wrap_ref(self._thread_call(node), mode)
         target = self.tc.call_targets.get(id(node))
         if target is not None:
             return self._wrap_ref(self._user_call(node, self.tc.sigs[target]), mode)
@@ -1453,10 +1832,24 @@ class RustGen:
             code, vt = f'sstr("{esc}")', TStr()
         return self._coerce(code, vt, p.typ)
 
+    def _union_ref_arg(self, a: ast.expr, p) -> str:
+        """Wrap a non-union argument into a `Ref`/`Mut` union parameter's temporary; a live non-Copy place is cloned so the caller keeps ownership."""
+        at = self._t(a)
+        if p.conv == "ref" and not at.is_copy() \
+                and isinstance(a, (ast.Name, ast.Attribute, ast.Subscript)):
+            code = f"({self._expr(a, 'ref')}).clone()"
+        else:
+            code = self._expr(a, "val", expect=p.typ)
+        val = self._coerce(code, at, p.typ)
+        return f"&{'mut ' if p.conv == 'mut' else ''}({val})"
+
     def _user_call(self, node: ast.Call, sig: FuncSig) -> str:
         args = []
         for a, p in zip(node.args, sig.params):
-            if p.conv == "ref":
+            if p.conv in ("ref", "mut") and isinstance(p.typ, TUnion) \
+                    and not isinstance(self._t(a), TUnion):
+                args.append(self._union_ref_arg(a, p))
+            elif p.conv == "ref":
                 args.append(self._expr(a, "ref"))
             elif p.conv == "mut":
                 args.append(self._expr(a, "mut"))
@@ -1483,6 +1876,8 @@ class RustGen:
             if isinstance(t, TList):
                 return f"(({r}).len() as i64)"
             if isinstance(t, TDict):
+                return f"({r}).len_i()"
+            if isinstance(t, TSet):
                 return f"({r}).len_i()"
             if isinstance(t, (TBytes, TByteArray)):
                 return f"({r}).len_i()"
@@ -1547,7 +1942,12 @@ class RustGen:
             assert isinstance(t, TList)
             elem = t.elem
             key = next((kw.value for kw in node.keywords if kw.arg == "key"), None)
-            seq = self._expr(args[0], "ref")
+            if isinstance(self._t(args[0]), TSet):
+                src = self._expr(args[0], "ref")
+                seq = (f"&(({src}).iter_it().cloned()"
+                       f".collect::<Vec<{rust_type(t.elem)}>>())")
+            else:
+                seq = self._expr(args[0], "ref")
             if key is None:
                 return f"serp_sorted({seq})"
             assert isinstance(key, ast.Lambda)
@@ -1602,6 +2002,16 @@ class RustGen:
             if is_b:
                 return f"({self._expr(args[0], 'ref')}).as_bytes()"
             return f"({self._expr(args[0], 'ref')}).clone()"
+        if name in ("set", "frozenset"):
+            t = self._t(node)
+            assert isinstance(t, TSet)
+            if not args:
+                return f"<{rust_type(t)}>::new()"
+            t0 = self._t(args[0])
+            src = self._expr(args[0], "ref")
+            if isinstance(t0, TSet):
+                return f"({src}).clone()"
+            return f"<{rust_type(t)}>::from_vec(&({src}))"
         raise CodegenError(f"cannot emit builtin '{name}'")
 
     def _recv(self, recv: ast.expr, want_mut: bool) -> str:
@@ -1627,7 +2037,10 @@ class RustGen:
         else:
             argv = [self._recv(recv, conv0 == "mut")]
         for a, p in zip(args, sig.params[1:]):
-            if p.conv == "ref":
+            if p.conv in ("ref", "mut") and isinstance(p.typ, TUnion) \
+                    and not isinstance(self._t(a), TUnion):
+                argv.append(self._union_ref_arg(a, p))
+            elif p.conv == "ref":
                 argv.append(self._expr(a, "ref"))
             elif p.conv == "mut":
                 argv.append(self._expr(a, "mut"))
@@ -1662,15 +2075,46 @@ class RustGen:
             if method == "close":
                 return f"({r}).close()"
             raise CodegenError(f"cannot emit file method '{method}'")
+        if isinstance(inner, TJoin):
+            r = self._expr(recv, "ref")
+            if inner.task and method == "done":
+                return f"serp_task_done({r})"
+            code = self._q(f"{'serp_task_await' if inner.task else 'serp_join'}({r})")
+            if isinstance(inner.ret, TStr):
+                return f"recv_str({code})"
+            if isinstance(inner.ret, TBytes):
+                return f"SBytes {{ v: Rc::new({code}) }}"
+            return code
+        if isinstance(inner, TThread):
+            r = self._expr(recv, "ref")
+            if method == "start":
+                return self._q(f"serp_thread_start({r})")
+            if method == "join":
+                ms = "-1"
+                if node.args and not (isinstance(node.args[0], ast.Constant)
+                                      and node.args[0].value is None):
+                    at = self._t(node.args[0])
+                    if isinstance(at, TOptional):
+                        v = self._expr(node.args[0], "val")
+                        ms = f"match {v} {{ Some(t) => (t as f64 * 1000.0) as i64, None => -1 }}"
+                    else:
+                        v = self._coerce(self._expr(node.args[0], "val", expect=TFloat()), at, TFloat())
+                        ms = f"(({v}) * 1000.0) as i64"
+                return self._q(f"serp_thread_join({r}, {ms})")
+            if method == "is_alive":
+                return f"serp_thread_is_alive({r})"
+            if method == "cancel":
+                return f"serp_thread_cancel({r})"
+            raise CodegenError(f"cannot emit Thread method '{method}'")
         if isinstance(inner, TList):
             elem = inner.elem
             if method == "append":
                 v = self._coerce(self._expr(args[0], "val", expect=elem), self._t(args[0]), elem)
-                return f"({self._recv(recv, True)}).push({v})"
+                return f"{{ let __av = {v}; ({self._recv(recv, True)}).push(__av) }}"
             if method == "insert":
                 i = self._expr(args[0], "val")
                 v = self._coerce(self._expr(args[1], "val", expect=elem), self._t(args[1]), elem)
-                return f"serp_insert({self._recv(recv, True)}, {i}, {v})"
+                return f"{{ let __ai = {i}; let __av = {v}; serp_insert({self._recv(recv, True)}, __ai, __av) }}"
             if method == "pop":
                 if args:
                     return self._q(f"serp_pop_at({self._recv(recv, True)}, {self._expr(args[0], 'val')})")
@@ -1685,6 +2129,31 @@ class RustGen:
                 if isinstance(elem, TFloat):
                     return f"serp_sort_f({self._recv(recv, True)})"
                 return f"({self._recv(recv, True)}).sort()"
+        if isinstance(inner, TSet):
+            elem = inner.elem
+            if method == "add":
+                v = self._coerce(self._expr(args[0], "val", expect=elem), self._t(args[0]), elem)
+                return f"({self._recv(recv, True)}).add({v})"
+            if method == "discard":
+                v = self._coerce(self._expr(args[0], "val", expect=elem), self._t(args[0]), elem)
+                return f"({self._recv(recv, True)}).discard(&({v}))"
+            if method == "remove":
+                v = self._coerce(self._expr(args[0], "val", expect=elem), self._t(args[0]), elem)
+                return self._q(f"({self._recv(recv, True)}).remove(&({v}))")
+            if method == "pop":
+                return self._q(f"({self._recv(recv, True)}).take()")
+            if method == "clear":
+                return f"({self._recv(recv, True)}).clear()"
+            if method == "copy":
+                return f"({self._recv(recv, False)}).clone()"
+            if method in ("update", "difference_update", "intersection_update"):
+                return (f"({self._recv(recv, True)}).{method}"
+                        f"(&({self._expr(args[0], 'ref')}))")
+            if method in ("union", "intersection", "difference", "symmetric_difference",
+                          "issubset", "issuperset", "isdisjoint"):
+                return (f"({self._recv(recv, False)}).{method}"
+                        f"(&({self._expr(args[0], 'ref')}))")
+            raise CodegenError(f"cannot emit set method '{method}'")
         if isinstance(inner, TDict):
             if method == "get":
                 return f"({self._recv(recv, False)}).get_opt(&({self._expr(args[0], 'val')}))"

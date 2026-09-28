@@ -1,4 +1,4 @@
-# CPython Interop Boundary (../archive/research.md §5.12)
+# CPython Interop Boundary
 
 > Phase-4 design + implementation record. The question: what happens when a Serpentine
 > program imports something that is not a Serpentine module — can native binaries call

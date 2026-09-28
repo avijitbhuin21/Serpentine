@@ -2,7 +2,7 @@
 
 > **Spec-of-record for the compilable subset.** Changes to this file are spec changes and go
 > through PR review, even with a single contributor. Details and rationale live in
-> `archive/research.md`; where the two disagree, this file wins for Tier-0 behavior.
+> the original research document (archived, removed); where the two disagree, this file wins for Tier-0 behavior.
 
 **Version:** 0.1 (Phase 0)
 **Frontend pin:** CPython **3.12** — the grammar below is defined against the `ast` module of
@@ -50,8 +50,10 @@ attributes, runtime reflection, multiple inheritance, `globals()` mutation.
 | `None` | unit; only as `T \| None` or a `-> None` return | yes |
 | `list[T]` | owned growable sequence | no |
 | `dict[K, V]` | owned insertion-ordered map; `K` must be Copy | no |
+| `set[T]` (= `frozenset[T]`) | owned insertion-ordered set; `T` must be Copy | no |
 | `tuple[T1, ..., Tn]` | fixed-shape product | Copy iff every element is Copy |
 | `T \| None` (= `Optional[T]`) | optional value; the only union (§6) | Copy iff `T` is Copy |
+| enum class (`class C(Enum)`) | C-like member set with `int`/`str` values (D21) | yes |
 
 Ownership wrappers `Owned[T]`, `Ref[T]`, `Mut[T]` are **parameter/variable annotations**, not
 types: they describe how a value is held, never what it is. `Owned[T]` may annotate parameters
@@ -84,17 +86,23 @@ Subset of the CPython 3.12 grammar. Anything not derivable below is `SE201`.
 ### 3.1 Module structure
 
 ```
-module     := docstring? (import_stmt | funcdef | constdef | entry_guard)*
+module     := docstring? (import_stmt | funcdef | constdef | aliasdef | entry_guard)*
 import_stmt:= "from" "serpentine" "import" names          # bin 2, erased (§9)
             | "import" serp_module | "from" serp_module "import" names   # bin 1
 constdef   := NAME ":" copy_type "=" const_expr           # module-level Copy constant
+objdef     := NAME [":" type] "=" NAME "(" args ")"       # module-level object binding (§D41): a build-time factory
+aliasdef   := NAME "=" type_expr                          # type alias (§D28)
 entry_guard:= "if" "__name__" "==" '"__main__"' ":" call_stmt
-funcdef    := "def" NAME "(" params ")" "->" type ":" docstring? block
+funcdef    := ["@" NAME "." NAME "(" args ")"]* "def" NAME "(" params ")" "->" type ":" docstring? block
 docstring  := STRING                                      # ignored by check and build
 ```
 
 Module-level statements other than these are `SE205 module-level-statement`. Mutable globals
-are `SE206 mutable-global`.
+are `SE206 mutable-global`. An object binding `app = C(...)` is not a global: every use of the
+name inside a function constructs a fresh instance through a synthesized factory, and
+`@app.m(...)` decorators on module functions (m a `@registrar` method of C) register inside
+that factory (D41). An exception class may carry one `__init__` whose body is exactly
+`super().__init__(<str expr>)`; constructor calls route through a lifted message function (D42).
 
 ### 3.2 Statements
 
@@ -235,7 +243,28 @@ Rules apply to the outermost non-Copy segment: `grid[i][j] = 5` needs `Mut` on `
   `v = d.get(k)`).
 - Narrowing is invalidated by any reassignment of `x` and, for non-Copy `x`, by any `Mut`
   borrow of `x`.
-- No other unions exist in Tier 0 (`A | B` → `SE201`).
+
+### 6.1 General unions (`A | B`, D24)
+
+`int | str`, `Union[int, str]` and longer sums are Tier 0. A union compiles to a Rust
+`enum` (Backend A) / a tagged struct `{i8 tag, ...member slots}` (Backend B).
+
+- Members must be **runtime-distinguishable**: two members with the same runtime kind
+  (`list[int] | list[str]`, two dataclasses) are `SE218 ambiguous-union`. Members with no
+  runtime kind at all (functions, `Shared`, files) are `SE201`.
+- Member order is canonical (sorted by spelling), so `int | str` and `str | int` are the
+  same type. A two-member sum containing `None` collapses to `T | None` (`Optional[T]`).
+- A union value supports **only**: `isinstance()` tag tests, `is None` / `is not None` when
+  `None` is a member, `==`/`!=` against the *same* union type, passing/returning as that
+  union, and reassignment from any member. Anything else is `SE210 unnarrowed-union`.
+- **Narrowing judgment:** `isinstance(x, T)` narrows the name or one-level field place `x`
+  to member `T` in the then-branch (and to the remaining member in the else-branch when
+  exactly one is left), under the same invalidation rules as optionals. `isinstance()` on a
+  non-union value is `SE201`; naming a type that is not a member is `SE214`.
+- A member value widens into the union implicitly at annotated boundaries (assignment,
+  argument, return, container element). A union does **not** widen into a larger union.
+- `int` widens into a `float` member only when the union has no `int` member — CPython
+  keeps the `int`, so avoid `float | ...` unions fed by int literals.
 
 ---
 
@@ -304,8 +333,10 @@ Anything not listed is `SE201`.
 3. **Everything else** — stdlib, site-packages: `SE213 foreign-import` at the import site.
 
 **Module-level code.** Allowed: bin-1/bin-2 imports, `def`s, `Copy`-typed constants with
-literal/constant-foldable initializers, and the entry guard. Everything else →
-`SE205`. Mutable (non-Copy or reassigned) globals → `SE206`.
+literal/constant-foldable initializers, **type aliases** (an unannotated assignment whose
+value is a type expression — `Name = Annotated[int, Field(gt=0)]`, `Name = int | str`,
+`Name = list[int]` — expanded before type-checking, D28), and the entry guard. Everything
+else → `SE205`. Mutable (non-Copy or reassigned) globals → `SE206`.
 
 **Entry point.** `serp build` recognizes
 
@@ -420,6 +451,9 @@ they are frozen once released.
 | SE213 | foreign-import |
 | SE214 | type-mismatch |
 | SE215 | unsatisfied-protocol (Tier 2) |
+| SE216 | not-send (spawn boundary, D9) |
+| SE217 | uninitialized-field (`__init__` definite assignment, D22) |
+| SE218 | ambiguous-union (two members share a runtime kind, D24) |
 
 Diagnostic format: `error[SE001]: use of moved value 'xs'` with a primary source span;
 Phase 2 added secondary "value moved here" labels and `help:` suggestion lines.
@@ -432,8 +466,11 @@ Normative details live in the implementation + test corpus until the Tier-1 spec
 this section records the shipped surface and its rules of thumb.
 
 - **Classes** — `@dataclass` (imported from `serpentine`) with annotated fields and
-  methods; no inheritance (only a `Generic[...]` base), no field defaults, no dunder
-  methods. Instances are non-Copy owned values; dataclass `==`/`repr` follow CPython.
+  methods; **single inheritance** from another `@dataclass` class (flattened at check
+  time per D15 — base fields first, non-overridden methods copied, no subtyping/`super()`;
+  a `Generic[...]` base declares a generic class instead; later Tiers added field
+  defaults and specific dunder methods). Instances are non-Copy owned values; dataclass
+  `==`/`repr` follow CPython.
   `self` must be annotated `Ref[C]` or `Mut[C]` (`Owned` self is Tier 2). Classes that
   contain themselves by value are rejected (SE214); use `Shared`/`Weak`/`list`.
 - **Field places** — the checker is field-sensitive one level deep: `move(x.f)` leaves
@@ -460,7 +497,7 @@ this section records the shipped surface and its rules of thumb.
 
 ## 14. Tier-2 surface (Phase 4) — summary
 
-Shipped in demand order from the Phase-2 corpus study (`archive/corpus-study.md`).
+Shipped in demand order from the Phase-2 corpus study (archived).
 Normative details live in the implementation + test corpus (tests/accept/050–055,
 tests/reject/r029, r036, r051, r052).
 

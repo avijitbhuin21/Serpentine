@@ -12,15 +12,29 @@ port out of range).
 """
 
 import errno as _errno
+import select as _select
 import socket as _socket
 import ssl as _ssl
+import time as _time
 
-__all__ = ["connect", "tls_connect", "listen", "accept", "send", "recv",
-           "shutdown_write", "set_timeout", "local_port", "close", "udp_bind",
-           "udp_send_to", "udp_recv_from", "udp_peer_host", "udp_peer_port"]
+__all__ = ["connect", "tls_connect", "listen", "accept", "send", "send_all",
+           "recv", "shutdown_write", "set_timeout", "local_port", "close",
+           "udp_bind", "udp_send_to", "udp_recv_from", "udp_peer_host",
+           "udp_peer_port", "set_nonblocking", "set_async", "accept_nb", "poll_ready"]
 
 _socks: dict[int, list] = {}
 _next_h: list[int] = [0]
+
+
+def set_async(h: int) -> None:
+    """Async mode (D45) is a native-runtime feature; under CPython the socket stays
+    blocking, so tasks doing network I/O serialize instead of interleaving."""
+    _get(h)
+
+
+def _socket_of(h: int):
+    """The underlying socket object (used by the _serp_asyncio reactor delegate)."""
+    return _get(h)[0]
 
 _ADDRINUSE = {getattr(_errno, n) for n in ("EADDRINUSE", "WSAEADDRINUSE")
               if hasattr(_errno, n)}
@@ -28,6 +42,8 @@ _ADDRINUSE = {getattr(_errno, n) for n in ("EADDRINUSE", "WSAEADDRINUSE")
 
 def _norm(e: BaseException) -> OSError:
     """Map a socket exception to the normalized cross-world OSError."""
+    if isinstance(e, BlockingIOError):
+        return OSError("timed out")
     if isinstance(e, _socket.timeout):
         return OSError("timed out")
     if isinstance(e, ConnectionRefusedError):
@@ -49,6 +65,62 @@ def _push(sock, kind: str) -> int:
     _next_h[0] += 1
     _socks[_next_h[0]] = [sock, kind, None]
     return _next_h[0]
+
+
+def set_nonblocking(h: int) -> None:
+    """Switch a socket (or listener) to non-blocking mode."""
+    rec = _get(h)
+    rec[0].setblocking(False)
+
+
+def accept_nb(h: int) -> int:
+    """Non-blocking accept: a new connection handle, or 0 when none is pending."""
+    rec = _get(h)
+    if rec[1] != "listener":
+        raise ValueError("accept_nb() needs a listener")
+    try:
+        c, _addr = rec[0].accept()
+        c.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        return _push(c, "tcp")
+    except BlockingIOError:
+        return 0
+    except OSError as e:
+        raise _norm(e)
+
+
+def poll_ready(packed: bytes, timeout_ms: int) -> bytes:
+    """Readiness poll over packed i64-LE handles; returns the ready subset (input order)."""
+    hs = []
+    i = 0
+    while i + 8 <= len(packed):
+        hs.append(int.from_bytes(packed[i:i + 8], "little"))
+        i += 8
+    if not hs:
+        _time.sleep(max(timeout_ms, 0) / 1000.0)
+        return b""
+    ready_now = set()
+    waitable = []
+    for h in hs:
+        rec = _socks.get(h)
+        if rec is None:
+            ready_now.add(h)
+            continue
+        if getattr(rec[0], "pending", None) is not None and rec[0].pending() > 0:
+            ready_now.add(h)
+            continue
+        waitable.append((rec[0], h))
+    if not ready_now and waitable:
+        r, _w, _x = _select.select([s for s, _h in waitable], [], [],
+                                   max(timeout_ms, 0) / 1000.0)
+        ready_set = set(id(s) for s in r)
+        for s, h in waitable:
+            if id(s) in ready_set:
+                ready_now.add(h)
+    out = b""
+    for h in hs:
+        if h in ready_now:
+            out += int(h).to_bytes(8, "little")
+    return out
 
 
 def _get(h: int) -> list:
@@ -129,21 +201,55 @@ def accept(h: int) -> int:
     try:
         conn, _addr = rec[0].accept()
         conn.settimeout(None)
+        conn.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
         return _push(conn, "tcp")
     except (OSError, _socket.timeout) as e:
         raise _norm(e)
 
 
 def send(h: int, data: bytes) -> int:
-    """Send all bytes on a TCP stream; returns len(data)."""
+    """Send what the socket accepts right now; returns bytes actually written."""
     rec = _get(h)
     if rec[1] != "tcp":
         raise ValueError("send() needs a TCP stream")
-    try:
-        rec[0].sendall(data)
-        return len(data)
-    except (OSError, _socket.timeout) as e:
-        raise _norm(e)
+    sent = 0
+    while sent < len(data):
+        try:
+            n = rec[0].send(data[sent:])
+        except BlockingIOError:
+            break
+        except (OSError, _socket.timeout) as e:
+            if sent > 0:
+                break
+            raise _norm(e)
+        if n <= 0:
+            break
+        sent += n
+    return sent
+
+
+def send_all(h: int, data: bytes, timeout_ms: int) -> int:
+    """Send every byte, parking on writability when the send buffer is full."""
+    rec = _get(h)
+    if rec[1] != "tcp":
+        raise ValueError("sendall() needs a TCP stream")
+    s = rec[0]
+    sent = 0
+    while sent < len(data):
+        try:
+            n = s.send(data[sent:])
+        except BlockingIOError:
+            wait = timeout_ms / 1000.0 if timeout_ms > 0 else 1.0
+            _r, w, _x = _select.select([], [s], [], wait)
+            if not w and timeout_ms > 0:
+                raise OSError("timed out")
+            continue
+        except (OSError, _socket.timeout) as e:
+            raise _norm(e)
+        if n <= 0:
+            raise OSError("connection reset")
+        sent += n
+    return sent
 
 
 def recv(h: int, maxlen: int) -> bytes:

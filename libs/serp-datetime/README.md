@@ -18,6 +18,19 @@ second resolution; timezones (zoneinfo) come later per the roadmap.
 - `add_days(dt, n)`, `add_seconds(dt, n)`, `diff_seconds(a, b)` —
   timedelta-style arithmetic.
 
+## Stdlib classes
+
+`date`, `datetime` and `timedelta` mirror the stdlib constructors with
+CPython 3.11 validation messages, `isoformat()`, `str`/`repr` parity,
+comparisons and `+`/`-` arithmetic.
+
+- `date.fromisoformat(s)` / `datetime.fromisoformat(s)` — naive values only;
+  the `T` separator is optional (a space works), a trailing `Z` is accepted and
+  ignored, fractional seconds are parsed to microseconds. UTC offsets are
+  **not** supported.
+- `datetime.fromtimestamp(ts)` — a UTC (not local) datetime, a divergence.
+- `datetime.utcnow()` / `utcnow()` — current UTC time.
+
 ## Install
 
 ```

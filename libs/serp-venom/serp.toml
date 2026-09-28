@@ -1,0 +1,13 @@
+[project]
+name = "serp-venom"
+version = "0.4.0"
+
+[build]
+roots = ["src", "../serp-http-server/src", "../serp-socket/src", "../serp-json/src", "../serp-url/src", "../serp-molt/src", "../serp-re/src", "../serp-datetime/src", "../serp-uuid/src", "../serp-base64/src", "../serp-asyncio/src", "../serp-fang/src", "../serp-io/src", "../serp-zlib/src", "../serp-time/src"]
+
+[dependencies]
+serp-http-server = "0.1.0"
+serp-socket = "0.1.0"
+serp-json = "0.3.0"
+serp-url = "0.1.0"
+serp-asyncio = "0.1.0"

@@ -131,5 +131,5 @@ binary — lives at [`examples/json_parser.py`](../examples/json_parser.py).
 No inheritance, no closures beyond `sorted` keys, no generators/`yield` (but
 `iter()`/`next()` over lists work), no `async`, no mutable globals, no foreign imports
 in native builds ([interop.md](interop.md)). The subset grows by demand order from
-real-code corpus studies — see `../archive/corpus-study.md` and `../spec.md` for the normative
+real-code corpus studies — see `../spec.md` for the normative
 surface.

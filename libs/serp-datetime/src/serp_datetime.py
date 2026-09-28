@@ -178,6 +178,64 @@ def parse_iso(s: str) -> Dt:
     return make(year, month, day, hour, minute, second)
 
 
+def _digits(s: str) -> bool:
+    """True when a string is non-empty and all ASCII digits."""
+    if len(s) == 0:
+        return False
+    for c in s:
+        if c < "0" or c > "9":
+            return False
+    return True
+
+
+def _parse_iso_parts(s: str) -> list[int]:
+    """[year, month, day, hour, minute, second, microsecond] from ISO 8601 text."""
+    body: str = s
+    n: int = len(body)
+    if n > 0 and (body.endswith("Z") or body.endswith("z")):
+        body = body[:n - 1]
+    date_part: str = body
+    time_part: str = ""
+    if len(body) > 10:
+        date_part = body[:10]
+        time_part = body[11:]
+    dsegs: list[str] = date_part.split("-")
+    if len(dsegs) != 3 or len(dsegs[0]) != 4 or not _digits(dsegs[0]) \
+            or not _digits(dsegs[1]) or not _digits(dsegs[2]):
+        raise ValueError(f"Invalid isoformat string: {s!r}")
+    hh: int = 0
+    mi: int = 0
+    ss: int = 0
+    us: int = 0
+    if len(time_part) > 0:
+        if time_part.find("+") >= 0 or time_part.find("-") >= 0:
+            raise ValueError(f"Invalid isoformat string: {s!r}")
+        rest: str = time_part
+        frac: str = ""
+        at: int = rest.find(".")
+        if at >= 0:
+            frac = rest[at + 1:]
+            rest = rest[:at]
+        tsegs: list[str] = rest.split(":")
+        if len(tsegs) < 2 or len(tsegs) > 3 or not _digits(tsegs[0]) \
+                or not _digits(tsegs[1]):
+            raise ValueError(f"Invalid isoformat string: {s!r}")
+        hh = int(tsegs[0])
+        mi = int(tsegs[1])
+        if len(tsegs) == 3:
+            if not _digits(tsegs[2]):
+                raise ValueError(f"Invalid isoformat string: {s!r}")
+            ss = int(tsegs[2])
+        if len(frac) > 0:
+            if not _digits(frac) or len(frac) > 6:
+                raise ValueError(f"Invalid isoformat string: {s!r}")
+            padded: str = frac
+            while len(padded) < 6:
+                padded = padded + "0"
+            us = int(padded)
+    return [int(dsegs[0]), int(dsegs[1]), int(dsegs[2]), hh, mi, ss, us]
+
+
 MINYEAR: int = 1
 MAXYEAR: int = 9999
 _EPOCH_ORDINAL: int = 719163
@@ -292,6 +350,14 @@ class date:
     def __repr__(self: Ref[date]) -> str:
         return f"datetime.date({self.year}, {self.month}, {self.day})"
 
+    @staticmethod
+    def fromisoformat(text: str) -> date:
+        """Parse an ISO 8601 date (`YYYY-MM-DD`)."""
+        if len(text) != 10:
+            raise ValueError(f"Invalid isoformat string: {text!r}")
+        p: list[int] = _parse_iso_parts(text)
+        return date(p[0], p[1], p[2])
+
     def isoformat(self: Ref[date]) -> str:
         return f"{_pad(self.year, 4)}-{_pad(self.month, 2)}-{_pad(self.day, 2)}"
 
@@ -368,6 +434,17 @@ class datetime:
     @staticmethod
     def utcnow() -> datetime:
         return _dt_from_us(int(time() * 1000000.0))
+
+    @staticmethod
+    def fromisoformat(text: str) -> datetime:
+        """Parse ISO 8601 text (`YYYY-MM-DD[THH:MM[:SS[.ffffff]]]`, trailing `Z` ignored)."""
+        p: list[int] = _parse_iso_parts(text)
+        return datetime(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+
+    @staticmethod
+    def fromtimestamp(ts: float) -> datetime:
+        """The naive UTC datetime for a Unix timestamp (stdlib uses local time)."""
+        return _dt_from_us(int(ts * 1000000.0))
 
     def date(self: Ref[datetime]) -> date:
         return date(self.year, self.month, self.day)

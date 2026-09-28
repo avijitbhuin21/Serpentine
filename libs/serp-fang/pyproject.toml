@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-fang"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fang — Serpentine's httpx-style sync HTTP(S) client: Client/Response/stream, redirects, cookies, auth, forms, JSON, multipart, gzip, streamed downloads (pure Serpentine over serp-socket TLS, dual-runs under CPython)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["serpentine-shim", "serp-socket", "serp-url", "serp-base64", "serp-json", "serp-io"]
+dependencies = ["serpentine-shim", "serp-socket", "serp-url", "serp-base64", "serp-json", "serp-io", "serp-zlib", "serp-time", "serp-uuid"]
 
 [project.urls]
 Homepage = "https://github.com/avijitbhuin21/Serpentine"

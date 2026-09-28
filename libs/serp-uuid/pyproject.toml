@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-uuid"
-version = "0.1.0"
+version = "0.2.0"
 description = "Serpentine uuid4 from OS randomness (runtime-backed; stdlib uuid delegate under CPython)"
 readme = "README.md"
 license = { text = "MIT" }

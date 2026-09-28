@@ -210,6 +210,27 @@ def ensure_runtime(verbose: bool = False) -> tuple[Path, list[str], Path]:
         return _ensure_runtime_at(_fallback_cache_root() / key, rustc, verbose)
 
 
+def _win_runtime_syslibs() -> list[str]:
+    """Windows system .libs the runtime's #[link] attributes require.
+
+    The prebuilt runtime ships no native-static-libs list, and merging the
+    runtime bitcode into the program object drops the rlib's link metadata, so
+    the names are recovered from the runtime sources themselves."""
+    import re
+    names: list[str] = []
+    for src in RT_SOURCES:
+        try:
+            text = src.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for m in re.finditer(r'#\[link\(name\s*=\s*"([^"]+)"', text):
+            lib = f"{m.group(1)}.lib"
+            if lib not in names:
+                names.append(lib)
+    skip = {"dl.lib"}
+    return [n for n in names if n not in skip]
+
+
 def _runtime_hit(cache: Path) -> tuple[Path, list[str], Path] | None:
     is_win = sys.platform == "win32"
     lib = cache / ("libserp_rt.rlib" if is_win else "libserp_rt.a")
@@ -309,17 +330,17 @@ def _win_fastlink_setup(cache: Path, rustc: str) -> dict | None:
 
 
 def _win_fastlink(obj: Path, out: Path, debuginfo: bool, lib: Path,
-                  runtime_merged: bool) -> bool:
+                  runtime_merged: bool, native: list[str] | None = None) -> bool:
     """Try the direct link.exe path; returns False to fall back to rustc."""
     rustc = _rustc()
     cache = lib.parent
     info = _win_fastlink_setup(cache, rustc)
     if info is None:
         return False
-    cmd = [info["linker"], "/NOLOGO"] + info["stub_objs"] + [str(obj)]
+    cmd = [info["linker"], "/NOLOGO", "/STACK:16777216"] + info["stub_objs"] + [str(obj)]
     if not runtime_merged:
         cmd.append(str(lib))
-    cmd += info["rlibs"] + info["libs"]
+    cmd += info["rlibs"] + info["libs"] + list(native or [])
     cmd += [f"/LIBPATH:{p}" for p in info["libpaths"]]
     cmd += ["/NXCOMPAT", f"/OUT:{out}"]
     if debuginfo:
@@ -345,7 +366,12 @@ def emit_object(ir_text: str, out_obj: Path, opt: int) -> bool:
     mod = llvm.parse_assembly(ir_text)
     mod.verify()
     merged = False
-    if opt > 0:
+    # std::thread code in the runtime bitcode carries module-level inline asm,
+    # which llvmlite's MC layer cannot emit — thread-using programs link the
+    # runtime as a plain library instead (user code still gets full O3).
+    wants_lto = opt > 0 and "rt_thread_spawn" not in ir_text \
+        and "rt_task_spawn" not in ir_text and "rt_thread_new" not in ir_text
+    if wants_lto:
         try:
             _, _, bc = ensure_runtime(verbose=True)
             rt_mod = llvm.parse_bitcode(bc.read_bytes())
@@ -383,7 +409,8 @@ def link(obj: Path, out: Path, debug: bool, runtime_merged: bool = False,
     """Link the emitted object against the cached runtime into a native binary."""
     lib, native, _bc = ensure_runtime(verbose=True)
     if sys.platform == "win32":
-        if _win_fastlink(obj, out, debuginfo, lib, runtime_merged):
+        native = list(native) + [n for n in _win_runtime_syslibs() if n not in native]
+        if _win_fastlink(obj, out, debuginfo, lib, runtime_merged, native):
             return
         rustc = _rustc()
         with tempfile.TemporaryDirectory(prefix="serp_link_") as td:
@@ -392,9 +419,15 @@ def link(obj: Path, out: Path, debug: bool, runtime_merged: bool = False,
             stub.write_text(stub_src, encoding="utf-8")
             cmd = [rustc, "--edition", "2021", "-C", "opt-level=0",
                    "-C", f"link-arg={obj}",
+                   "-C", "link-arg=/STACK:16777216",
                    "-o", str(out), str(stub)]
             if not runtime_merged:
                 cmd[5:5] = ["--extern", f"serp_rt={lib}"]
+            else:
+                # merging the runtime bitcode into prog.obj drops the rlib's
+                # #[link] metadata, so the system libs it needs must be explicit
+                for nl in native:
+                    cmd[5:5] = ["-C", f"link-arg={nl}"]
             if debuginfo:
                 cmd[3:3] = ["-C", "debuginfo=2"]
             _run(cmd, "final link (rustc stub)")
