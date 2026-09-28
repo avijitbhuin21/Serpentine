@@ -21,7 +21,7 @@ jobs:
 
       - name: Build the prebuilt runtime asset
         run: |
-          python -m pip install ./compiler
+          python -m pip install ./shim ./compiler
           python tools/build_rt_asset.py
 
       - name: Upload runtime asset to the GitHub release
