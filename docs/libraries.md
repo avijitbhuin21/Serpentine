@@ -74,6 +74,11 @@
 
 ## Sync status
 
+**PyPI (2026-09-28):** `serpentine-lang` 0.7.0 + `serpentine-shim` 0.9.0 live. Every lib except
+`serp-cli` (name taken by an unrelated project — needs a new dist name) is tagged `serp-<name>-v<ver>`;
+live so far: `serp-base64`, `serp-csv`, `serp-hashlib`. The rest hit PyPI's new-project rate limit
+(`429 Too many new projects created`) and publish via throttled reruns of their `release-lib.yml` runs.
+
 Last verified: **2026-09-07** (serp-scales 0.2.0 now depends on serp-json 0.3.0 + serp-datetime 0.2.0, declared in both `serp.toml` and `pyproject.toml`; earlier: serp-subprocess, serp-threading, serp-queue, serp-scales, serp-coil added; serp-threading depends on serpentine-shim ≥ 0.7.0; serp-coil→serp-math is declared in both `serp.toml` and `pyproject.toml`). All declared dependency pins match repo versions;
 serp-datetime→serp-time, serp-pathlib→serp-os and serp-fang→serp-time/serp-uuid/serp-zlib
 are now declared in both `serp.toml` and `pyproject.toml` (previously undeclared/stale).
