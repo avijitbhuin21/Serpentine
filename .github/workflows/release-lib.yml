@@ -1,7 +1,8 @@
 name: Release library
 
 # Scoped library releases: pushing a tag like `serp-json-v0.1.0` builds
-# libs/serp-json and publishes it to PyPI via trusted publishing. The main
+# libs/serp-json and publishes it to PyPI with the PYPI_API_TOKEN secret
+# (account-scoped, so a first upload creates the project). The main
 # `v*` tags (release.yml) keep publishing the compiler + shim.
 
 on:
@@ -24,10 +25,7 @@ jobs:
   build-publish:
     needs: meta
     runs-on: ubuntu-latest
-    environment:
-      name: pypi-libs-${{ needs.meta.outputs.short }}
     permissions:
-      id-token: write
       contents: read
     env:
       LIB: ${{ needs.meta.outputs.lib }}
@@ -51,7 +49,8 @@ jobs:
           python -m build --outdir dist "libs/$LIB"
           python -m twine check dist/*
 
-      - name: Publish to PyPI (trusted publishing)
+      - name: Publish to PyPI (account-scoped API token)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
