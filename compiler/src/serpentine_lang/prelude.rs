@@ -3409,7 +3409,7 @@ fn serp_sock_poll_ready(packed: &SBytes, timeout_ms: i64) -> SRes<SBytes> {
             None => flags[k] = true,
             Some(arc) => {
                 let rec = sock_lock(arc);
-                let buffered = matches!(&rec.kind, SockKind::Tls(c) if !c.dec.is_empty());
+                let buffered = matches!(&rec.kind, SockKind::Tls(c) if tls_buffered(c));
                 if buffered {
                     flags[k] = true;
                 } else if let Some(fd) = sock_raw(&rec) {
@@ -3853,6 +3853,7 @@ struct TlsApi {
     ssl_get_error: unsafe extern "C" fn(*const std::ffi::c_void, i32) -> i32,
     ssl_get_verify_result: unsafe extern "C" fn(*const std::ffi::c_void) -> i64,
     ssl_shutdown: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    ssl_pending: unsafe extern "C" fn(*const std::ffi::c_void) -> i32,
 }
 
 #[cfg(unix)]
@@ -3912,6 +3913,7 @@ fn tls_api() -> SRes<&'static TlsApi> {
                 ssl_get_error: std::mem::transmute(sym(b"SSL_get_error\0")?),
                 ssl_get_verify_result: std::mem::transmute(sym(b"SSL_get_verify_result\0")?),
                 ssl_shutdown: std::mem::transmute(sym(b"SSL_shutdown\0")?),
+                ssl_pending: std::mem::transmute(sym(b"SSL_pending\0")?),
             });
         }
         Ok(cell.as_ref().unwrap())
@@ -3924,6 +3926,21 @@ struct TlsConn {
     ctx: *mut std::ffi::c_void,
     ssl: *mut std::ffi::c_void,
     eof: bool,
+}
+
+/// Whether a TLS connection already holds decrypted bytes a read can return without I/O.
+#[cfg(unix)]
+fn tls_buffered(c: &TlsConn) -> bool {
+    match tls_api() {
+        Ok(api) => unsafe { (api.ssl_pending)(c.ssl) > 0 },
+        Err(_) => false,
+    }
+}
+
+/// Whether a TLS connection already holds decrypted bytes a read can return without I/O.
+#[cfg(windows)]
+fn tls_buffered(c: &TlsConn) -> bool {
+    !c.dec.is_empty()
 }
 
 // Exclusive access is guaranteed by the per-socket Mutex (SockRef).
@@ -5124,7 +5141,7 @@ fn aio_select(lp: &mut AioLoop, block: bool) {
                     let rec = sock_lock(arc);
                     let want_write = lp.fd_waits[k].write;
                     let buffered = !want_write
-                        && matches!(&rec.kind, SockKind::Tls(c) if !c.dec.is_empty());
+                        && matches!(&rec.kind, SockKind::Tls(c) if tls_buffered(c));
                     if buffered {
                         instant[k] = true;
                     } else if let Some(fd) = sock_raw(&rec) {
