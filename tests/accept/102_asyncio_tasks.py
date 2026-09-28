@@ -26,7 +26,7 @@ async def ticker(label: str, count: int) -> None:
 
 
 async def amain() -> None:
-    t1: asyncio.Task[int] = asyncio.create_task(worker("a", 0.05, 1))
+    t1: asyncio.Task[int] = asyncio.create_task(worker("a", 0.25, 1))
     t2: asyncio.Task[int] = asyncio.create_task(worker("b", 0.01, 2))
     print("created", t1.done(), t2.done())
     r1: int = await t1
@@ -34,7 +34,7 @@ async def amain() -> None:
     r2: int = await t2
     print("t2 ->", r2)
 
-    rs: list[int] = await asyncio.gather(worker("c", 0.08, 3), worker("d", 0.02, 4))
+    rs: list[int] = await asyncio.gather(worker("c", 0.3, 3), worker("d", 0.02, 4))
     print("gather", rs)
 
     await asyncio.gather(ticker("x", 3), ticker("y", 2))
