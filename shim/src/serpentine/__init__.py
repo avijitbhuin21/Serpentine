@@ -198,10 +198,11 @@ def _auto_dataclass(cls, **kwargs) -> None:
     for base in cls.__mro__[1:]:
         if base is object:
             break
-        fn = getattr(base.__dict__.get("__init_subclass__"), "__func__", None)
-        if fn is not None and fn is not _auto_dataclass:
-            fn(cls, **kwargs)
-            break
+        hook = base.__dict__.get("__init_subclass__")
+        if hook is None or getattr(hook, "__func__", None) is _auto_dataclass:
+            continue
+        hook.__get__(None, cls)(**kwargs)
+        break
     frozen = any(getattr(base, "__dataclass_params__", None) is not None
                  and base.__dataclass_params__.frozen for base in cls.__mro__[1:])
     dataclass(cls, frozen=True) if frozen else dataclass(cls)

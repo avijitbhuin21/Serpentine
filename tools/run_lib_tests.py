@@ -62,6 +62,7 @@ def main() -> int:
             print(f"ok   {rel} (check)")
             continue
         outputs = {}
+        errs = {}
         build_failed = False
         for backend in ("rust", "llvm"):
             suffix = ".exe" if sys.platform == "win32" else ""
@@ -76,6 +77,7 @@ def main() -> int:
                 break
             nat = run([str(exe)], test.parent)
             outputs[backend] = (nat.stdout.replace(b"\r\n", b"\n"), nat.returncode)
+            errs[backend] = nat.stderr.decode(errors="replace").strip()
         if build_failed:
             continue
         py = run([sys.executable, str(test)], test.parent,
@@ -102,6 +104,8 @@ def main() -> int:
             print(f"  cpython: {py_out[0][:400]!r}")
             for b in bad:
                 print(f"  {b:7}: {outputs[b][0][:400]!r} (exit {outputs[b][1]})")
+                if errs.get(b):
+                    print(f"  {b:7} stderr: {errs[b][-1500:]}")
             continue
         print(f"ok   {rel} (cpython + rust + llvm identical, {len(py_out[0])} bytes)")
 
