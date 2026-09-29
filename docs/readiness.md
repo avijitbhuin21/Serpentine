@@ -17,7 +17,7 @@
 | **L3 — Production service** | Internet-facing, many users, on-call | ❌ Not yet (open P1s in security, ops and ecosystem) |
 
 **Why not L3 yet:**
-1. The libraries aren't fully on PyPI yet (PyPI's new-project rate limit), and the prebuilt runtime assets for 0.7.0 still need a rerun.
+1. Two libraries (`serp-io`, `serp-cli`) still need new PyPI names, and the 0.7.0 prebuilt runtime assets were only just rebuilt.
 2. There's no fuzzing or sanitizer coverage of the `unsafe` runtime. Its hand-written
    network, regex and compression parsers face untrusted input.
 3. There are no database clients besides SQLite.
@@ -33,7 +33,7 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 
 - [x] **P0** Commit + push the Phase-7 work — landed 2026-09-28 (`fdd7161`), Molt/Venom/Coil/Scales/asyncio/threading/queue/subprocess + accept 070–102.
 - [x] **P0** Master CI is green on all three OSes (2026-09-28, run 36398975310). Fixed along the way: shim `__init_subclass__` forwarding broke `Generic` on CPython 3.12; Unix TLS build referenced a Windows-only `dec` buffer (now `tls_buffered`/`SSL_pending`); accept 102 timer gaps widened. The old `serp-base64` Linux abort no longer reproduces.
-- [~] **P0** `release-lib.yml` works: it publishes with the `PYPI_API_TOKEN` secret (3 libs live). The remaining 33 hit PyPI's `429 Too many new projects created` limit and need throttled reruns after the window resets.
+- [x] **P0** `release-lib.yml` works: trusted publishing first (via PyPI pending publishers, which bypassed the `429 Too many new projects created` limit the token route hit), `PYPI_API_TOKEN` fallback.
 - [ ] **P0** CI runs *every* lib suite, not just the "Wave 1 libs" named in the `ci.yml` step.
       Molt/Venom/Scales/Coil/asyncio need to be gated too.
 - [ ] **P1** Remove stray artifacts, gitignore them, and confirm they were never committed:
@@ -53,7 +53,7 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 - [~] **P0** Prebuilt runtime (dist-rt) 0.7.0 assets: the `v0.7.0` runtime-assets jobs failed on a PyPI index race (fixed in `release.yml` for future releases); rerun `gh run rerun 36400503901 --failed` once pip sees shim 0.9.0. `__version__` was stale at 0.5.0 (drives asset naming) — now synced.
 - [ ] **P0** The PyPI name `serp-cli` is taken by an unrelated project (date-style versions
       2026.4.5.0 and later). Our argparse lib needs a new dist name before it can publish.
-- [~] **P1** Publish the `serp-*` libraries to PyPI: all 36 are tagged, and 3 are live (`serp-base64`, `serp-csv`, `serp-hashlib`). The rest are waiting on PyPI's new-project rate limit.
+- [~] **P1** Publish the `serp-*` libraries to PyPI: 35 of 37 live (2026-09-29). `serp-io` (too similar to an existing name) and `serp-cli` (taken) need new dist names; `serp-fang` then needs a patch release for its `serp-io` dependency.
 - [ ] **P1** Add a `CHANGELOG.md`. There's none; release notes live only in commit messages.
 - [ ] **P1** Stability and versioning policy. Everything is `0.x` with no compatibility
       promise for the language surface, SE codes or runtime ABI.
