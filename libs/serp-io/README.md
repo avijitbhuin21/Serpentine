@@ -3,6 +3,14 @@
 File helpers for Serpentine, on top of the language's built-in text/binary
 file IO. Pure Serpentine ([P]) — the same source dual-runs under CPython.
 
+Published on PyPI as **`serpentine-io`** (the `serp-io` name is rejected by PyPI as too
+similar to an existing project); the import name is still `serp_io`:
+
+```
+serp add serpentine-io
+pip install serpentine-io
+```
+
 ```python
 from serp_io import read_bytes, write_bytes, read_lines, reader
 

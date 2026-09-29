@@ -1,6 +1,6 @@
 [project]
 name = "serp-fang"
-version = "0.3.0"
+version = "0.3.1"
 
 [build]
 roots = ["src", "../serp-url/src", "../serp-base64/src", "../serp-json/src", "../serp-io/src", "../serp-zlib/src"]
@@ -10,7 +10,7 @@ serp-socket = "0.1.0"
 serp-url = "0.1.0"
 serp-base64 = "0.1.0"
 serp-json = "0.2.0"
-serp-io = "0.1.0"
+serpentine-io = "0.1.0"
 serp-zlib = "0.1.0"
 serp-time = "0.1.0"
 serp-uuid = "0.1.0"

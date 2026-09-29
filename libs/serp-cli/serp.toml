@@ -1,5 +1,5 @@
 [project]
-name = "serp-cli"
+name = "serpentine-argparse"
 version = "0.2.0"
 
 [build]

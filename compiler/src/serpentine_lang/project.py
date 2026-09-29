@@ -71,6 +71,29 @@ def normalize_dist_name(name: str) -> str:
     return name.lower().replace("-", "_").replace(".", "_")
 
 
+def dist_import_roots(site_packages: Path, dist: str) -> set[str]:
+    """Top-level import names an installed dist provides (top_level.txt, else RECORD), plus the name-derived guess."""
+    want = normalize_dist_name(dist)
+    roots = {want}
+    for info in site_packages.glob("*.dist-info"):
+        if normalize_dist_name(info.name[: -len(".dist-info")].rsplit("-", 1)[0]) != want:
+            continue
+        top = info / "top_level.txt"
+        if top.is_file():
+            roots |= {ln.strip() for ln in top.read_text(encoding="utf-8").splitlines() if ln.strip()}
+            continue
+        record = info / "RECORD"
+        if record.is_file():
+            for line in record.read_text(encoding="utf-8").splitlines():
+                first = line.split(",", 1)[0].split("/", 1)[0]
+                if first.endswith(".py"):
+                    roots.add(first[:-3])
+                elif first and not first.endswith((".dist-info", ".data")) and "/" in line.split(",", 1)[0]:
+                    roots.add(first)
+    roots.discard("__pycache__")
+    return roots
+
+
 def lock_dist_names(project_dir: Path) -> list[str]:
     """Read the distribution names pinned in serp.lock (direct + transitive)."""
     lock_path = project_dir / "serp.lock"
@@ -121,9 +144,10 @@ class ImportContext:
                 return cand.resolve()
         if self.manifest and self.site_packages:
             top = mod_name.split(".")[0]
-            dep_roots = {normalize_dist_name(d) for d in self.manifest.dependencies}
-            dep_roots |= {normalize_dist_name(d)
-                          for d in lock_dist_names(self.manifest.project_dir)}
+            dists = list(self.manifest.dependencies) + lock_dist_names(self.manifest.project_dir)
+            dep_roots: set[str] = set()
+            for d in dists:
+                dep_roots |= dist_import_roots(self.site_packages, d)
             if top in dep_roots:
                 cand = self.site_packages / rel
                 if cand.is_file():

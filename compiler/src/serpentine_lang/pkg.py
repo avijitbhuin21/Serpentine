@@ -18,7 +18,8 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-from .project import Manifest, find_manifest, load_manifest, normalize_dist_name
+from .project import (Manifest, dist_import_roots, find_manifest, load_manifest,
+                      normalize_dist_name, venv_site_packages)
 
 PYPI_JSON = "https://pypi.org/pypi/{name}/json"
 PYPI_VERSION_JSON = "https://pypi.org/pypi/{name}/{version}/json"
@@ -152,7 +153,7 @@ def _resolve_closure(root_name: str, root_spec: str) -> dict[str, dict]:
         for dep_name, dep_spec in _parse_dep_specs(info.get("requires_dist")):
             if _is_shim(dep_name):
                 continue
-            if not normalize_dist_name(dep_name).startswith("serp_"):
+            if not normalize_dist_name(dep_name).startswith(("serp_", "serpentine_")):
                 foreign.append(dep_name)
                 continue
             requires.append((dep_name, dep_spec))
@@ -321,8 +322,11 @@ def cmd_add(args: argparse.Namespace) -> int:
         return 1
     extra = [p["name"] for p in closure.values() if not p["direct"]]
     via = f" (+ {', '.join(sorted(extra))})" if extra else ""
-    print(f"serp: added {canonical}=={pinned}{via} (import root "
-          f"'{normalize_dist_name(canonical)}'); pinned in serp.toml + serp.lock")
+    sp = venv_site_packages(manifest.project_dir)
+    roots = sorted(dist_import_roots(sp, canonical) - {normalize_dist_name(canonical)}) if sp else []
+    shown = ", ".join(f"'{r}'" for r in roots) or f"'{normalize_dist_name(canonical)}'"
+    print(f"serp: added {canonical}=={pinned}{via} (import root {shown}); "
+          f"pinned in serp.toml + serp.lock")
     return 0
 
 

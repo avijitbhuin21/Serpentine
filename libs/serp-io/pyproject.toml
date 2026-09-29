@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "serp-io"
+name = "serpentine-io"
 version = "0.1.0"
 description = "Serpentine file helpers: read/write text+bytes, line reading, file copy, and a buffered ByteReader (pure Serpentine, dual-runs under CPython)"
 readme = "README.md"

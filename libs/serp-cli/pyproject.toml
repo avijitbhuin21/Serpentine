@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "serp-cli"
+name = "serpentine-argparse"
 version = "0.2.0"
 description = "Serpentine argparse-lite: flags, options, positionals, subcommands and help text in the Serpentine subset"
 readme = "README.md"

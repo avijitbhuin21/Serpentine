@@ -32,7 +32,7 @@
 - [x] `serp-statistics` [P] 0.1.0 — ✅ `statistics` (mean/median/stdev/quantiles/fmean; no mode/NormalDist)
 - [x] `serp-base64` [P] 0.1.0 — ✅ `base64` (b64/b32/b16 + urlsafe/altchars/validate)
 - [x] `serp-csv` [P] 0.2.0 — ✅ `csv` (reader/writer/DictReader; no restkey)
-- [x] `serp-cli` [P] 0.2.0 — ✅ `argparse` (ArgumentParser/add_argument; D11 `args["dest"]` indexing)
+- [x] `serp-cli` [P] 0.2.0 — ✅ `argparse` (ArgumentParser/add_argument; D11 `args["dest"]` indexing) — PyPI dist **`serpentine-argparse`**, import `serp_cli`
 - [x] `serp-pathlib` [P] 0.2.0 — ✅ `pathlib` (`Path` with `/` operator, fs ops, read/write helpers)
 - [x] `serp-os` [R] 0.1.0 — ✅ `os` subset (env vars, cwd, mkdir/rmdir/remove/listdir)
 - [x] `serp-datetime` [P] 0.3.0 — ✅ `datetime` (date/datetime/timedelta, `fromisoformat`, validation, repr parity; no tz)
@@ -45,7 +45,7 @@
 
 ## Wave 3 — Files, compression, persistence — SHIPPED
 
-- [x] `serp-io` [P] 0.1.0 — ✅ `io` (StringIO/BytesIO) + file helpers and ByteReader
+- [x] `serp-io` [P] 0.1.0 — ✅ `io` (StringIO/BytesIO) + file helpers and ByteReader — PyPI dist **`serpentine-io`**, import `serp_io`
 - [x] `serp-zlib` [R] 0.1.0 — ✅ `zlib` (+ gzip helpers; self-contained DEFLATE, wbits routing)
 - [x] `serp-zipfile` [P] 0.2.0 — ✅ `zipfile` (ZipFile r/w/a, stored+DEFLATED; no zip64/encryption)
 - [x] `serp-sqlite` [R] 0.2.0 — ✅ `sqlite3` subset (Connection/Cursor, `?` params, PyVal rows; autocommit only)

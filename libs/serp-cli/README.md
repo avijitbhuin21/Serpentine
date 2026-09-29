@@ -21,7 +21,10 @@ res = cli.parse(argv)           # ParseResult
 
 ## Install
 
+Published on PyPI as **`serpentine-argparse`** (the `serp-cli` name belongs to an unrelated
+project); the import name is still `serp_cli`:
+
 ```
-serp add serp-cli
-pip install serp-cli
+serp add serpentine-argparse
+pip install serpentine-argparse
 ```
