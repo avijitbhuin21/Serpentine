@@ -54,7 +54,7 @@
 
 - [x] `serp-socket` [R+P] 0.1.0 — ✅ `socket` (TCP/UDP, timeouts, exception types, normalized errors)
 - [x] `serp-url` [P] 0.1.0 — ✅ `urllib.parse` (urlparse/urljoin/quote/urlencode/parse_qs)
-- [x] `serp-fang` **Fang** [P] 0.2.0 — ✅ `httpx` sync client (native TLS, redirects, cookies, streaming, multipart)
+- [x] `serp-fang` **Fang** [P] 0.3.1 — ✅ `httpx` sync client (native TLS, redirects, cookies, streaming, multipart)
 - [x] `serp-http-server` [P] 0.1.0 — ✅ `http.server` (HTTPServer + handler objects; single-threaded) — threading now unblocked (B3 cleared)
 - [x] `serp-venom` **Venom** [P+L] 0.3.0 — ✅ `fastapi` (module-level `app = FastAPI()`, `@app.get/post/put/delete/patch(path, status_code=)` with parameter injection by name/type — path/query scalars, `T | None`, serp_molt model bodies, raw `Owned[Request]` — JSON-serialized returns incl. models/`list[Model]`, FastAPI's 422 envelope, `HTTPException(status_code=, detail=)`, `JSONResponse`/`PlainTextResponse`/`HTMLResponse`/`RedirectResponse` with `headers=`, `TestClient(app)` with `json=`/`params=`/`headers=`, `serp_uvicorn.run`; `Depends(fn)` (nested), `APIRouter(prefix=)` + module-level `app.include_router`/`add_api_route`; threaded keep-alive + event-loop servers) — drop-in since 2026-09-07 via D41 (module-level object bindings + `@registrar`) and D42 (exception `__init__`); **axum parity** (1.05x at w1/c16, 0.92–1.03x at w3/c64, 2026-08-30) — **roadmap: [libraries/venom.md](libraries/venom.md)** (still open: middleware/BackgroundTasks/streaming/WebSockets)
 
@@ -74,11 +74,13 @@
 
 ## Sync status
 
-**PyPI (2026-09-29):** `serpentine-lang` 0.7.0 + `serpentine-shim` 0.9.0 live, and **35 of 37 libs live**.
-Not published: `serp-cli` (name taken by an unrelated project) and `serp-io` (PyPI rejects it as too
-similar to an existing project) — both need a new dist name; `serp-fang` depends on `serp-io`, so a
-fang patch release follows the rename. New libs publish via a PyPI *pending publisher*
-(owner `avijitbhuin21`, repo `Serpentine`, workflow `release-lib.yml`, env blank) + tag push.
+**PyPI (2026-09-29):** `serpentine-lang` 0.7.1 + `serpentine-shim` 0.9.0 live, and **all 37 libs live**.
+Two libs publish under different dist names than their folder/import names: `libs/serp-io` →
+**`serpentine-io`** (PyPI rejected `serp-io` as too similar to an existing project) and `libs/serp-cli` →
+**`serpentine-argparse`** (`serp-cli` belongs to an unrelated project); imports stay `serp_io`/`serp_cli`
+(compiler 0.7.1 reads import roots from `*.dist-info` metadata). `serp-fang` 0.3.1 depends on `serpentine-io`.
+New libs publish via a PyPI *pending publisher* (owner `avijitbhuin21`, repo `Serpentine`, workflow
+`release-lib.yml`, env blank) + tag push — one pending publisher at a time (identical configs are rejected).
 
 Last verified: **2026-09-07** (serp-scales 0.2.0 now depends on serp-json 0.3.0 + serp-datetime 0.2.0, declared in both `serp.toml` and `pyproject.toml`; earlier: serp-subprocess, serp-threading, serp-queue, serp-scales, serp-coil added; serp-threading depends on serpentine-shim ≥ 0.7.0; serp-coil→serp-math is declared in both `serp.toml` and `pyproject.toml`). All declared dependency pins match repo versions;
 serp-datetime→serp-time, serp-pathlib→serp-os and serp-fang→serp-time/serp-uuid/serp-zlib

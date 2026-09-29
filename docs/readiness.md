@@ -51,9 +51,8 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 - [x] `serpentine-lang` on PyPI via trusted publishing (tag-push `release.yml`), latest `v0.6.0`.
 - [x] **P0** `serpentine-lang` 0.7.0 + `serpentine-shim` 0.9.0 released to PyPI (tag `v0.7.0`, 2026-09-28).
 - [~] **P0** Prebuilt runtime (dist-rt) 0.7.0 assets: the `v0.7.0` runtime-assets jobs failed on a PyPI index race (fixed in `release.yml` for future releases); rerun `gh run rerun 36400503901 --failed` once pip sees shim 0.9.0. `__version__` was stale at 0.5.0 (drives asset naming) — now synced.
-- [ ] **P0** The PyPI name `serp-cli` is taken by an unrelated project (date-style versions
-      2026.4.5.0 and later). Our argparse lib needs a new dist name before it can publish.
-- [~] **P1** Publish the `serp-*` libraries to PyPI: 35 of 37 live (2026-09-29). `serp-io` (too similar to an existing name) and `serp-cli` (taken) need new dist names; `serp-fang` then needs a patch release for its `serp-io` dependency.
+- [x] **P0** The PyPI name `serp-cli` is taken by an unrelated project — resolved: published as `serpentine-argparse` (import name `serp_cli`).
+- [x] **P1** Publish the `serp-*` libraries to PyPI: all 37 live (2026-09-29); `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse` (import names unchanged), `serp-fang` 0.3.1 depends on `serpentine-io`.
 - [ ] **P1** Add a `CHANGELOG.md`. There's none; release notes live only in commit messages.
 - [ ] **P1** Stability and versioning policy. Everything is `0.x` with no compatibility
       promise for the language surface, SE codes or runtime ABI.
