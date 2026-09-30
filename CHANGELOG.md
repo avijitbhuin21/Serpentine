@@ -7,6 +7,19 @@ versions.
 
 ## [Unreleased]
 
+### Fixed
+- Backend A: a local first assigned inside a `try` body and used after a diverging handler
+  (`except: continue|break|return`) no longer fails rustc with E0381. Scalar and Optional locals
+  assigned inside a `try` get a zero initializer.
+
+### Added
+- Accept 105 (`finally` runs exactly once around loops; handler `break`/`continue` with `finally`
+  in `while` and nested loops) and 106 (try-assigned int/float/bool/Optional locals).
+
+### Notes
+- `return` inside a `try` with `finally` is rejected at compile time (SE201, reject r044) by
+  design, as is `break`/`continue` out of a `try` *body*. Neither can silently skip a `finally`.
+
 ## [0.7.2] — 2026-09-30
 
 ### Fixed
@@ -22,8 +35,7 @@ versions.
   (fixed 2026-08-30). It crashes a pre-fix compiler on every run.
 
 ### Known issues
-- Backend A: `try: x = f()` / `except: continue` followed by a use of `x` fails rustc with E0381
-  (possibly-uninitialized). Workaround: initialise `x` before the `try`.
+- Backend A: E0381 on locals assigned in `try` and used after `except: continue`. Fixed in Unreleased.
 
 ## [0.7.1] — 2026-09-29
 - Dependency import roots are resolved from `*.dist-info` metadata, so dists whose names differ

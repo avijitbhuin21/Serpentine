@@ -13,7 +13,7 @@
 | Level | Meaning | Status |
 |---|---|---|
 | **L1 — Experimental** | Hobby projects, demos, benchmarks | ✅ Passed |
-| **L2 — Internal tools** | CLIs, batch jobs, internal services where a crash costs little | ⚠️ **Reached locally 2026-09-30, not yet landed.** The fixes are uncommitted and CI hasn't run them on Linux/macOS (§1) |
+| **L2 — Internal tools** | CLIs, batch jobs, internal services where a crash costs little | ✅ **Reached 2026-09-30**: landed in `df1af15`, CI green on 3 OSes, released as 0.7.2 |
 | **L3 — Production service** | Internet-facing, many users, on-call | ❌ Not yet (open P1s in security, ops and ecosystem) |
 
 **Why not L3 yet:**
@@ -33,8 +33,8 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 
 - [x] **P0** Commit + push the Phase-7 work — landed 2026-09-28 (`fdd7161`), Molt/Venom/Coil/Scales/asyncio/threading/queue/subprocess + accept 070–102.
 - [x] **P0** Master CI is green on all three OSes (2026-09-28, run 36398975310). Fixed along the way: shim `__init_subclass__` forwarding broke `Generic` on CPython 3.12; Unix TLS build referenced a Windows-only `dec` buffer (now `tls_buffered`/`SSL_pending`); accept 102 timer gaps widened. The old `serp-base64` Linux abort no longer reproduces.
-- [ ] **P0** Commit + push the 2026-09-30 L2 work and get CI green on all three OSes. It includes the rustgen/llvmgen `break`/`continue`/`finally` fixes, accept 103/104, Molt `test_schema_repeat`, CHANGELOG, SECURITY.md and the README. Locally (Windows) accept, reject, differential, rustc-agreement and LLVM suites are all green; libs are 66/67 (the fang CPython flake below). The rustgen/llvmgen changes haven't been seen on Linux or macOS yet.
-- [ ] **P1** Release compiler **0.7.2**. The `finally`-skipped-on-`break`/`continue` bug is a silent miscompile in the published 0.7.1.
+- [x] **P0** Committed + pushed the 2026-09-30 L2 work (`df1af15`): CI green on all three OSes (run 36750423875).
+- [x] **P1** Released compiler **0.7.2** (tag `v0.7.2`), which fixes the silent `finally` skip on `break`/`continue`.
 - [x] **P0** `release-lib.yml` works: trusted publishing first (via PyPI pending publishers, which bypassed the `429 Too many new projects created` limit the token route hit), `PYPI_API_TOKEN` fallback.
 - [x] **P0** CI runs *every* lib suite. Verified 2026-09-30: `tools/run_lib_tests.py` auto-discovers all `libs/*/tests/*.py` (37 libs, no skip list), and CI was green on 2026-09-29 (run 36556498753); the `ci.yml` step label was renamed on 2026-09-30.
 - [x] **P1** Stray artifacts: all gitignored (`*.har`, `*.exe`, `tmp_serp_*`), none ever committed (`git log --all`). The local copies and the `.rustic/tmp/pw-pypi-profile/` Chrome profile (logged-in PyPI session) were deleted on 2026-09-30. The server-side PyPI session expires on its own; to be sure, revoke it under pypi.org → Account settings → Sessions.
@@ -92,8 +92,8 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 - [x] Library dual-run suite (`tools/run_lib_tests.py`) runs across CPython, Rust and LLVM.
 - [x] **P0** Backend-B `IfExp` defect (non-Copy `str` ternary with a call arm crashed): fixed 2026-08-30 in `llvmgen._ifexp`, and Molt uses the original ternary again. Regression guard added 2026-09-30: `libs/serp-molt/tests/test_schema_repeat.py`, which crashes a pre-fix compiler 10/10 times. Shape coverage is in accept 103.
 - [x] **P1** Backend-A `continue`-inside-`except` bug: it was **still open** (rustc E0695) and is fixed 2026-09-30 with labeled loops. The same accept test (104) exposed a **silent miscompile in both backends**: `break`/`continue` leaving a `try` skipped the `finally`. Also fixed.
-- [ ] **P1** Backend A: `try: x = f()` / `except: continue|return`, then using `x`, fails rustc with E0381 (the handler is an `if let`, so it isn't treated as diverging). Checker/oracle disagreement; workaround is to pre-initialise `x`.
-- [ ] **P1** `return` inside `try` with `finally` probably skips the `finally` too (same mechanism as the break/continue bug above). Not yet tested.
+- [x] **P1** Backend-A E0381 (a local assigned in a `try` body, used after a diverging handler): fixed 2026-09-30. Scalar and Optional try-assigned locals get a zero initializer; covered by accept 106. Non-Copy locals in the same shape still need pre-initialization, but the failure is a rustc error, never a miscompile.
+- [x] **P1** `return` inside `try`/`finally`: verified 2026-09-30 that it is **rejected at compile time** (SE201, reject r044), as is `break`/`continue` out of a `try` body. No silent `finally` skip is possible. Accept 105 covers the allowed shapes.
 - [ ] **P1** Compiler fuzzing: grammar/typed-AST fuzz that diffs CPython against both
       backends, and checks the checker never crashes on arbitrary input.
 - [ ] **P1** Scale test: compile time and memory on a 10k–50k LOC program. Whole-program

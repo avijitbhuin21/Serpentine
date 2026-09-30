@@ -441,10 +441,15 @@ class RustGen:
         loop_bound = self._loop_bound_names(fn)
         self.loop_bound = loop_bound
         param_names = {p.name for p in sig.params}
+        try_assigned = self._try_assigned_names(fn.body)
         for name, t in self.facts.locals.items():
             if name in param_names or name in loop_bound:
                 continue
-            self._line(f"let mut v_{name}: {rust_type(t)};")
+            init = self._zero_init(t) if name in try_assigned else None
+            if init is not None:
+                self._line(f"let mut v_{name}: {rust_type(t)} = {init};")
+            else:
+                self._line(f"let mut v_{name}: {rust_type(t)};")
         body = fn.body
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
                 and isinstance(body[0].value.value, str):
@@ -574,6 +579,45 @@ class RustGen:
             self._line(f"break '{label};")
         else:
             self._line(f"return Err({err_code});")
+
+    def _try_assigned_names(self, body: list[ast.stmt]) -> set[str]:
+        """Names assigned anywhere inside a try body (rustc cannot prove them initialized after it)."""
+        out: set[str] = set()
+
+        def collect(nodes: list[ast.stmt], in_try: bool) -> None:
+            for n in nodes:
+                if in_try and isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                    for t in targets:
+                        if isinstance(t, ast.Name):
+                            out.add(t.id)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(n, ast.Try):
+                    collect(n.body, True)
+                    for h in n.handlers:
+                        collect(h.body, in_try)
+                    collect(n.orelse, in_try)
+                    collect(n.finalbody, in_try)
+                    continue
+                for field in ("body", "orelse"):
+                    collect(getattr(n, field, None) or [], in_try)
+
+        collect(body, False)
+        return out
+
+    @staticmethod
+    def _zero_init(t: Type) -> str | None:
+        """A Rust initializer for Copy scalars and Optionals; None when the type has no trivial default."""
+        if isinstance(t, TInt):
+            return "0"
+        if isinstance(t, TFloat):
+            return "0.0"
+        if isinstance(t, TBool):
+            return "false"
+        if isinstance(t, TOptional):
+            return "None"
+        return None
 
     def _emit_loop_jump(self, kw: str) -> None:
         """Emit break/continue: run pending finally bodies, label the jump when it crosses a try block."""
