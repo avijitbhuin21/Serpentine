@@ -1914,14 +1914,34 @@ class LLVMGen:
             self._emit_raise(s)
             return
         if isinstance(s, ast.Break):
+            self._emit_pending_finals()
+            if self.b.block.is_terminated:
+                return
             self._drain_for_jump()
             self.b.branch(self.loop_stack[-1][1])
             return
         if isinstance(s, ast.Continue):
+            self._emit_pending_finals()
+            if self.b.block.is_terminated:
+                return
             self._drain_for_jump()
             self.b.branch(self.loop_stack[-1][0])
             return
         raise LLVMUnsupported(f"statement {type(s).__name__}")
+
+    def _emit_pending_finals(self) -> None:
+        """Run the finally bodies of every try a break/continue leaves, innermost first."""
+        depth = self.loop_stack[-1][2] if len(self.loop_stack[-1]) > 2 else len(self.try_ctx)
+        saved = self.try_ctx
+        for i in range(len(saved) - 1, depth - 1, -1):
+            fin = saved[i].get("final")
+            if not fin:
+                continue
+            self.try_ctx = saved[:i]
+            self._emit_block(fin)
+            if self.b.block.is_terminated:
+                break
+        self.try_ctx = saved
 
     def _drain_for_jump(self) -> None:
         """break/continue/return: release this statement's borrows (none expected)."""
@@ -2132,7 +2152,7 @@ class LLVMGen:
         self._drain(mark_t, mark_b)
         self.b.cbranch(cond, body, exit_b)
         self.b.position_at_end(body)
-        self.loop_stack.append((head, exit_b))
+        self.loop_stack.append((head, exit_b, len(self.try_ctx)))
         self._emit_block(s.body)
         self.loop_stack.pop()
         if not self.b.block.is_terminated:
@@ -2216,7 +2236,7 @@ class LLVMGen:
 
         catch = self.fn.append_basic_block("try.catch")
         join = self.fn.append_basic_block("try.join")
-        self.try_ctx.append({"block": catch})
+        self.try_ctx.append({"block": catch, "final": s.finalbody})
         self._emit_block(s.body)
         self.try_ctx.pop()
         if not self.b.block.is_terminated:
@@ -2259,7 +2279,7 @@ class LLVMGen:
                     self._clone_into(self.b, TExc(), exc, bind["ptr"])
                     if bind["flag"] is not None:
                         self.b.store(ir.Constant(I1, 1), bind["flag"])
-                self.try_ctx.append({"block": hcatch})
+                self.try_ctx.append({"block": hcatch, "final": s.finalbody})
                 self.cur_exc.append(exc)
                 self._emit_block(h.body)
                 self.cur_exc.pop()
@@ -2481,7 +2501,7 @@ class LLVMGen:
         self.b.cbranch(cond(self.b, i), body, exitc)
         self.b.position_at_end(body)
         bind_elem(i)
-        self.loop_stack.append((incr, exitc))
+        self.loop_stack.append((incr, exitc, len(self.try_ctx)))
         emit_body()
         self.loop_stack.pop()
         if not self.b.block.is_terminated:

@@ -1,12 +1,22 @@
 # Serpentine
 
+[![CI](https://github.com/avijitbhuin21/Serpentine/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/avijitbhuin21/Serpentine/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/serpentine-lang)](https://pypi.org/project/serpentine-lang/)
+
 > Python source code, written under an ownership-and-borrowing discipline, ahead-of-time
 > compiled to native machine code with **no garbage collector** — while the exact same file
 > remains valid, runnable CPython. One codebase, two execution modes.
 
-**Status:** v0.5 — full compiler shipped: LLVM-direct native builds (default backend) with a
+> [!WARNING]
+> **Status: experimental.** Fine for hobby projects, demos, benchmarks and internal tools. Not yet for
+> internet-facing production services: the runtime hasn't been fuzzed or sanitizer-tested, and
+> there is no compatibility promise across `0.x` versions. See
+> [docs/readiness.md](docs/readiness.md), [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
+
+**Status:** v0.7 — full compiler shipped: LLVM-direct native builds (default backend) with a
 rustc oracle pass on release builds, project tooling (`serp init` / `add` / `run`), packages,
-LSP, and a 59-program dual-run corpus, byte-identical on Windows/Linux/macOS.
+LSP, 37 `serp-*` libraries on PyPI, and a 104-program dual-run corpus, byte-identical on
+Windows/Linux/macOS.
 
 ## Quick start
 

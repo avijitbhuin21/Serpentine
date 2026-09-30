@@ -139,6 +139,9 @@ class RustGen:
         self.out: list[str] = []
         self.indent = 0
         self.try_ctx: list[tuple[str, str]] = []   # (label, exc_var) of enclosing try blocks
+        self.try_finals: list[list[ast.stmt]] = []
+        self.loop_stack: list[tuple[str | None, int]] = []
+        self.loop_counter = 0
 
     def _q(self, code: str) -> str:
         """Propagate a fallible expression: `?` normally, break-to-handler inside try."""
@@ -499,11 +502,8 @@ class RustGen:
                                    self._t(stmt.value), self.sig.ret)
                 self._line(f"return Ok({val});")
             return
-        if isinstance(stmt, ast.Break):
-            self._line("break;")
-            return
-        if isinstance(stmt, ast.Continue):
-            self._line("continue;")
+        if isinstance(stmt, (ast.Break, ast.Continue)):
+            self._emit_loop_jump("break" if isinstance(stmt, ast.Break) else "continue")
             return
         if isinstance(stmt, ast.If):
             self._emit_if(stmt)
@@ -575,6 +575,51 @@ class RustGen:
         else:
             self._line(f"return Err({err_code});")
 
+    def _emit_loop_jump(self, kw: str) -> None:
+        """Emit break/continue: run pending finally bodies, label the jump when it crosses a try block."""
+        label, depth = self.loop_stack[-1] if self.loop_stack else (None, len(self.try_ctx))
+        saved_ctx, saved_fin = self.try_ctx, self.try_finals
+        for i in range(len(saved_fin) - 1, depth - 1, -1):
+            if saved_fin[i]:
+                self.try_ctx, self.try_finals = saved_ctx[:i], saved_fin[:i]
+                self._emit_block(saved_fin[i])
+        self.try_ctx, self.try_finals = saved_ctx, saved_fin
+        if label is not None and len(self.try_ctx) > depth:
+            self._line(f"{kw} '{label};")
+        else:
+            self._line(f"{kw};")
+
+    def _loop_prefix(self, body: list[ast.stmt]) -> str:
+        """Open a loop scope; returns a `'lpN: ` label prefix when a jump inside a try needs it."""
+        label = None
+        if self._jump_in_try(body, False):
+            self.loop_counter += 1
+            label = f"lp{self.loop_counter}"
+        self.loop_stack.append((label, len(self.try_ctx)))
+        return f"'{label}: " if label else ""
+
+    def _jump_in_try(self, nodes: list[ast.stmt], in_try: bool) -> bool:
+        """True when a break/continue of the current loop sits inside a nested try/with."""
+        for n in nodes:
+            if isinstance(n, (ast.Break, ast.Continue)):
+                if in_try:
+                    return True
+                continue
+            if isinstance(n, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef,
+                              ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            inner = in_try or isinstance(n, (ast.Try, ast.With, ast.AsyncWith))
+            kids: list[ast.stmt] = []
+            for field in ("body", "orelse", "finalbody"):
+                kids += getattr(n, field, None) or []
+            for h in getattr(n, "handlers", None) or []:
+                kids += h.body
+            for c in getattr(n, "cases", None) or []:
+                kids += c.body
+            if kids and self._jump_in_try(kids, inner):
+                return True
+        return False
+
     def _emit_try(self, stmt: ast.Try) -> None:
         self.try_counter += 1
         n = self.try_counter
@@ -584,7 +629,9 @@ class RustGen:
         self._line(f"'try{n}: {{")
         self.indent += 1
         self.try_ctx.append((f"try{n}", exc))
+        self.try_finals.append(stmt.finalbody)
         self._emit_block(stmt.body)
+        self.try_finals.pop()
         self.try_ctx.pop()
         self.indent -= 1
         self._line("}")
@@ -605,9 +652,11 @@ class RustGen:
                 if h.name:
                     self._line(f"v_{h.name} = __cur{n}.clone();")
                 self.try_ctx.append((f"hnd{n}", rexc))
+                self.try_finals.append(stmt.finalbody)
                 self.cur_exc.append(f"__cur{n}")
                 self._emit_block(h.body)
                 self.cur_exc.pop()
+                self.try_finals.pop()
                 self.try_ctx.pop()
                 self.indent -= 1
             self._line("}")
@@ -820,14 +869,16 @@ class RustGen:
 
     def _emit_while(self, stmt: ast.While) -> None:
         if isinstance(stmt.test, ast.Constant) and stmt.test.value is True:
-            self._line("loop {")
+            head = "loop {"
         else:
             cond = self._expr(stmt.test, "val")
             if isinstance(self._t(stmt.test), TPyVal):
                 cond = f"pyval_truthy(&({cond}))"
-            self._line(f"while {cond} {{")
+            head = f"while {cond} {{"
+        self._line(self._loop_prefix(stmt.body) + head)
         self.indent += 1
         self._emit_block(stmt.body)
+        self.loop_stack.pop()
         self.indent -= 1
         self._line("}")
 
@@ -925,13 +976,14 @@ class RustGen:
         targets = [stmt.target] if isinstance(stmt.target, ast.Name) else list(stmt.target.elts)
         names = [t.id for t in targets if isinstance(t, ast.Name)]
         header, cast_lines, new_refs = self._for_header(stmt.iter, kind, names)
-        self._line(f"{header} {{")
+        self._line(f"{self._loop_prefix(stmt.body)}{header} {{")
         self.indent += 1
         for cl in cast_lines:
             self._line(cl)
         saved = set(self.ref_bound)
         self.ref_bound |= new_refs
         self._emit_block(stmt.body)
+        self.loop_stack.pop()
         self.ref_bound = saved
         self.indent -= 1
         self._line("}")
@@ -965,7 +1017,9 @@ class RustGen:
                    f'{{ break \'{lbl}; }} {prop} }}')
         self.indent -= 1
         self._line("}")
+        self.loop_stack.append((lbl, len(self.try_ctx)))
         self._emit_block(wh.body[1:])
+        self.loop_stack.pop()
         self.indent -= 1
         self._line("}")
 
@@ -1640,9 +1694,13 @@ class RustGen:
             saved_scope[a.arg] = self.scope_types.get(a.arg)
             self.scope_types[a.arg] = pt
         saved_ctx, self.try_ctx = self.try_ctx, []
+        saved_fin, self.try_finals = self.try_finals, []
+        saved_loops, self.loop_stack = self.loop_stack, []
         body = self._coerce(self._expr(node.body, "val", expect=ft.ret),
                             self._t(node.body), ft.ret)
         self.try_ctx = saved_ctx
+        self.try_finals = saved_fin
+        self.loop_stack = saved_loops
         for arg_name, prev in saved_scope.items():
             if prev is None:
                 self.scope_types.pop(arg_name, None)

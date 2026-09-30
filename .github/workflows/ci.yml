@@ -53,7 +53,7 @@ jobs:
           python -m pip install llvmlite
           python tools/run_llvm_differential.py
 
-      - name: Library differential suite (Wave 1 libs, CPython vs both backends)
+      - name: Library differential suite (every libs/*/tests, CPython vs both backends)
         run: python tools/run_lib_tests.py
 
   package:

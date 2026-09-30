@@ -6,18 +6,18 @@
 > Each item names its evidence or the doc that owns it. [libraries.md](libraries.md) tracks
 > library *features*; this doc tracks whether the project as a whole is safe to depend on.
 >
-> Last assessed: **2026-09-28**.
+> Last assessed: **2026-09-30**.
 
 ## Verdict
 
 | Level | Meaning | Status |
 |---|---|---|
-| **L1 — Experimental** | Hobby projects, demos, benchmarks | ✅ **Here today** |
-| **L2 — Internal tools** | CLIs, batch jobs, internal services where a crash costs little | ⚠️ Reachable once the P0s are cleared |
+| **L1 — Experimental** | Hobby projects, demos, benchmarks | ✅ Passed |
+| **L2 — Internal tools** | CLIs, batch jobs, internal services where a crash costs little | ⚠️ **Reached locally 2026-09-30, not yet landed.** The fixes are uncommitted and CI hasn't run them on Linux/macOS (§1) |
 | **L3 — Production service** | Internet-facing, many users, on-call | ❌ Not yet (open P1s in security, ops and ecosystem) |
 
 **Why not L3 yet:**
-1. Two libraries (`serp-io`, `serp-cli`) still need new PyPI names, and the 0.7.0 prebuilt runtime assets were only just rebuilt.
+1. There's no versioning/stability promise: everything is `0.x`. (Distribution, CHANGELOG and SECURITY.md are done.)
 2. There's no fuzzing or sanitizer coverage of the `unsafe` runtime. Its hand-written
    network, regex and compression parsers face untrusted input.
 3. There are no database clients besides SQLite.
@@ -33,27 +33,27 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 
 - [x] **P0** Commit + push the Phase-7 work — landed 2026-09-28 (`fdd7161`), Molt/Venom/Coil/Scales/asyncio/threading/queue/subprocess + accept 070–102.
 - [x] **P0** Master CI is green on all three OSes (2026-09-28, run 36398975310). Fixed along the way: shim `__init_subclass__` forwarding broke `Generic` on CPython 3.12; Unix TLS build referenced a Windows-only `dec` buffer (now `tls_buffered`/`SSL_pending`); accept 102 timer gaps widened. The old `serp-base64` Linux abort no longer reproduces.
+- [ ] **P0** Commit + push the 2026-09-30 L2 work and get CI green on all three OSes. It includes the rustgen/llvmgen `break`/`continue`/`finally` fixes, accept 103/104, Molt `test_schema_repeat`, CHANGELOG, SECURITY.md and the README. Locally (Windows) accept, reject, differential, rustc-agreement and LLVM suites are all green; libs are 66/67 (the fang CPython flake below). The rustgen/llvmgen changes haven't been seen on Linux or macOS yet.
+- [ ] **P1** Release compiler **0.7.2**. The `finally`-skipped-on-`break`/`continue` bug is a silent miscompile in the published 0.7.1.
 - [x] **P0** `release-lib.yml` works: trusted publishing first (via PyPI pending publishers, which bypassed the `429 Too many new projects created` limit the token route hit), `PYPI_API_TOKEN` fallback.
-- [ ] **P0** CI runs *every* lib suite, not just the "Wave 1 libs" named in the `ci.yml` step.
-      Molt/Venom/Scales/Coil/asyncio need to be gated too.
-- [ ] **P1** Remove stray artifacts, gitignore them, and confirm they were never committed:
-      `pypi.org.har` (a browser capture that **may contain PyPI session cookies**),
-      `tmp_serp_sqlite_test.db`, `tests/accept/064_kwargs.exe`, `tests/accept/tmp_serp_*`,
-      `libs/serp-io/tests/tmp_serp_io_*`.
+- [x] **P0** CI runs *every* lib suite. Verified 2026-09-30: `tools/run_lib_tests.py` auto-discovers all `libs/*/tests/*.py` (37 libs, no skip list), and CI was green on 2026-09-29 (run 36556498753); the `ci.yml` step label was renamed on 2026-09-30.
+- [x] **P1** Stray artifacts: all gitignored (`*.har`, `*.exe`, `tmp_serp_*`), none ever committed (`git log --all`). The local copies and the `.rustic/tmp/pw-pypi-profile/` Chrome profile (logged-in PyPI session) were deleted on 2026-09-30. The server-side PyPI session expires on its own; to be sure, revoke it under pypi.org → Account settings → Sessions.
 - [ ] **P1** Harness is stable under load. There are known byte-diff and `0xC0000005`
-      flakes when benchmarks run in parallel (see memory venom-axum-parity).
+      flakes when benchmarks run in parallel (see memory venom-axum-parity). Also, as of 2026-09-30, `libs/serp-fang/tests/test_async_fang.py`
+      fails **under CPython** about 3 times in 4 on the local Windows box (`OSError: connection reset` on the loopback POST, in the pure-Python
+      `_serp_socket` facade); the native builds pass. CI passed it on 2026-09-29.
 - [~] **P2** Local dev matches the CI Python pin: CI uses 3.12, the local venv is 3.11.9.
 - [x] Three-OS CI matrix (ubuntu/macos/windows) runs differential, reject, rustc-agreement,
       LLVM and LSP smoke.
 
 ## 2. Releases & distribution
 
-- [x] `serpentine-lang` on PyPI via trusted publishing (tag-push `release.yml`), latest `v0.6.0`.
-- [x] **P0** `serpentine-lang` 0.7.0 + `serpentine-shim` 0.9.0 released to PyPI (tag `v0.7.0`, 2026-09-28).
-- [~] **P0** Prebuilt runtime (dist-rt) 0.7.0 assets: the `v0.7.0` runtime-assets jobs failed on a PyPI index race (fixed in `release.yml` for future releases); rerun `gh run rerun 36400503901 --failed` once pip sees shim 0.9.0. `__version__` was stale at 0.5.0 (drives asset naming) — now synced.
+- [x] `serpentine-lang` on PyPI via trusted publishing (tag-push `release.yml`), latest `v0.7.1`.
+- [x] **P0** `serpentine-lang` 0.7.0 + `serpentine-shim` 0.9.0 released to PyPI (tag `v0.7.0`, 2026-09-28); 0.7.1 (dist-info import roots for renamed dists) followed on 2026-09-29.
+- [x] **P0** Prebuilt runtime (dist-rt) assets: `serp-rt-0.7.0-*` and `serp-rt-0.7.1-*` are attached to their GitHub releases for linux-x86_64, macos-arm64 and windows-x86_64 (all runtime-assets jobs green, verified 2026-09-30).
 - [x] **P0** The PyPI name `serp-cli` is taken by an unrelated project — resolved: published as `serpentine-argparse` (import name `serp_cli`).
 - [x] **P1** Publish the `serp-*` libraries to PyPI: all 37 live (2026-09-29); `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse` (import names unchanged), `serp-fang` 0.3.1 depends on `serpentine-io`.
-- [ ] **P1** Add a `CHANGELOG.md`. There's none; release notes live only in commit messages.
+- [x] **P1** `CHANGELOG.md` added 2026-09-30: per-version summaries from 0.4.0, plus an Unreleased section.
 - [ ] **P1** Stability and versioning policy. Everything is `0.x` with no compatibility
       promise for the language surface, SE codes or runtime ABI.
 - [~] **P2** Prebuilt runtime platforms. Covered: linux-x86_64, macos-arm64, windows-x86_64.
@@ -86,14 +86,14 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 
 ## 4. Compiler correctness & robustness
 
-- [x] Differential corpus: accept 001–102 byte-identical across CPython, Backend A and
+- [x] Differential corpus: accept 001–104 byte-identical across CPython, Backend A and
       Backend B (debug + release) on 3 OSes.
 - [x] Reject corpus with exact SE codes; rustc-agreement harness at 0 disagreements.
 - [x] Library dual-run suite (`tools/run_lib_tests.py`) runs across CPython, Rust and LLVM.
-- [ ] **P0** Fix the open Backend-B `IfExp` defect: a non-Copy `str` ternary with a call arm
-      crashes. Molt works around it; Backend A is clean ([libraries.md](libraries.md) Molt line).
-- [?] **P1** Confirm the Backend-A `continue`-inside-`except` bug from Wave 4 is fixed and
-      covered by an accept test.
+- [x] **P0** Backend-B `IfExp` defect (non-Copy `str` ternary with a call arm crashed): fixed 2026-08-30 in `llvmgen._ifexp`, and Molt uses the original ternary again. Regression guard added 2026-09-30: `libs/serp-molt/tests/test_schema_repeat.py`, which crashes a pre-fix compiler 10/10 times. Shape coverage is in accept 103.
+- [x] **P1** Backend-A `continue`-inside-`except` bug: it was **still open** (rustc E0695) and is fixed 2026-09-30 with labeled loops. The same accept test (104) exposed a **silent miscompile in both backends**: `break`/`continue` leaving a `try` skipped the `finally`. Also fixed.
+- [ ] **P1** Backend A: `try: x = f()` / `except: continue|return`, then using `x`, fails rustc with E0381 (the handler is an `if let`, so it isn't treated as diverging). Checker/oracle disagreement; workaround is to pre-initialise `x`.
+- [ ] **P1** `return` inside `try` with `finally` probably skips the `finally` too (same mechanism as the break/continue bug above). Not yet tested.
 - [ ] **P1** Compiler fuzzing: grammar/typed-AST fuzz that diffs CPython against both
       backends, and checks the checker never crashes on arbitrary input.
 - [ ] **P1** Scale test: compile time and memory on a 10k–50k LOC program. Whole-program
@@ -117,7 +117,7 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
       limits, read timeouts and slowloris protection in Venom and http-server.
 - [?] **P1** TLS (schannel/OpenSSL): verify certificate + hostname validation, and
       rejection of expired/self-signed certs by default in Fang.
-- [ ] **P1** `SECURITY.md` with a vulnerability-disclosure contact and a supported-versions policy.
+- [~] **P1** `SECURITY.md` added 2026-09-30 (GitHub private vulnerability reporting, latest-only support). Still to do: enable private vulnerability reporting in the repo settings, and optionally add an email contact.
 - [ ] **P1** `Shared` reference cycles leak (D3). Needs guidance or detection for long-running
       servers.
 - [ ] **P2** Dependency audit of the runtime's Rust crates (`cargo audit`) in CI.
@@ -174,7 +174,7 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 ## 10. Project governance
 
 - [x] `LICENSE`, `README.md`, public GitHub repo.
-- [ ] **P1** A CI badge and "status: experimental" note in `README.md` until L3 is reached.
+- [x] **P1** CI + PyPI badges and a "status: experimental" warning in `README.md` (2026-09-30).
 - [ ] **P2** `CONTRIBUTING.md`, issue/PR templates, code of conduct.
 - [ ] **P2** Bus factor: design docs let a second maintainer onboard (spec, DECISIONS,
       memory-style gotcha notes as docs).
@@ -183,10 +183,24 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 
 ## Suggested order
 
-1. **Get to green.** Clear every **P0** in sections 1, 2 and 4: commit, fix CI, release shim +
-   dist-rt, fix the IfExp bug. That makes it L2-ready.
-2. **Harden.** Section 5 (fuzzing, sanitizers, limits, SECURITY.md) plus the crash diagnostics
-   and soak test from section 6.
+0. **Land L2 (immediate, short).** Commit + push the 2026-09-30 work, get CI green on all three
+   OSes (§1), tag `v0.7.2` (silent-miscompile fix), then delete the stray artifacts and revoke the
+   PyPI browser session.
+1. **Close the `finally` family (short, before hardening).** Test `return` inside `try`/`finally`.
+   It probably has the same silent skip that `break`/`continue` had, and silent wrong output is
+   worse than a crash. Then fix the Backend-A E0381 try-init disagreement (§4).
+2. **Harden (next major session)**, in this order, so each step makes the next one cheaper:
+   1. Crash diagnostics: native runtime errors report the `.py` file/line (§6). Every finding
+      from the later steps is then debuggable.
+   2. Deterministic limits: a `serp-re` step limit (ReDoS), decompression-bomb caps, and HTTP
+      header/body/timeout limits in Venom/http-server (§5).
+   3. TLS verification check in Fang: certificate, hostname, expired and self-signed (§5).
+   4. Fuzz the untrusted-input parsers (HTTP, JSON, TOML, CSV, URL, regex, DEFLATE, zip, base64)
+      and the compiler (differential fuzz of CPython vs both backends). Accept 104 found a silent
+      miscompile with a single hand-written test, which is strong evidence that fuzzing will find more.
+   5. Sanitizers: the corpora under Miri (Backend A) and ASan/UBSan (Backend B), plus `cargo audit`.
+   6. Soak test (24h, RSS/handle growth), graceful shutdown, and `Shared` cycle-leak guidance (§5–6).
 3. **Fill production gaps.** Postgres/Redis clients, timezones, hmac/JWT, metrics, and Venom
    middleware.
-4. **Adoption.** Section 8 DX, section 9 platforms, section 10 governance, then the announcement.
+4. **Adoption.** Section 8 DX, section 9 platforms, section 10 governance, the versioning policy, then
+   the announcement.
