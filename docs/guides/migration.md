@@ -53,7 +53,7 @@ their own class.
 ## 5. Iterate with the checker, not against it
 
 `serp check` (or `serp lsp` in your editor) after each step. Every error carries a stable
-code, the span, and a suggested fix; the [ownership guide](ownership.md) explains the
+code, the span, and a suggested fix; the [ownership guide](../language/ownership.md) explains the
 model behind them. When the checker finally says OK, `python tool.py` and the
 `serp build` binary are guaranteed to agree — so port first, then debug logic under
 CPython with the whole ecosystem, and ship the binary last.

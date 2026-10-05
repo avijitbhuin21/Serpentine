@@ -2,10 +2,12 @@
 
 > Living snapshot of what the language, compiler, and tooling support **today**.
 > The normative definition is [spec.md](spec.md); resolved design questions are in
-> [decisions.md](decisions.md); the library ecosystem is tracked in [libraries.md](libraries.md).
+> [DECISIONS.md](DECISIONS.md); the library ecosystem is tracked in [libraries.md](libraries.md);
+> production readiness in [readiness.md](readiness.md).
 
-**As of:** v0.5+ (2026-07-23). Suites: 75/75 accept differential (both backends),
-70/70 reject, 31/31 library dual-run, rustc-agreement 0 disagreements.
+**As of:** v0.7.2 + `master` (2026-10-05). Suites: 106/106 accept differential (CPython vs
+both backends, 3 OSes), 102/102 reject with exact SE codes, 70 library dual-run tests over 37
+libs, rustc agreement 0 disagreements ([guides/testing.md](guides/testing.md)).
 
 ## Language
 
@@ -111,8 +113,13 @@ remain future work.
 - **Backend A (`--backend rust`):** structured Rust codegen, kept forever as the
   rustc-as-oracle reference.
 - No GC: refcounted `Rc<str>` strings, drop insertion, static native binaries (~136 KB fib).
-- Runtime-error parity with CPython messages (exit 1); byte-identical dual-run corpus on
-  Windows/Linux/macOS.
+- Runtime-error parity with CPython messages (exit 1), plus a CPython-style traceback
+  (`.py` file, line, function per frame) recorded on the error path only; byte-identical
+  dual-run corpus on Windows/Linux/macOS.
+- Every program and runtime thread runs on a 256 MiB reserved stack, so recursion depth is
+  the same on every OS. Linux/macOS binaries ignore SIGPIPE.
+- Safety limits in the bundled libs: regex step/depth caps (ReDoS), a 256 MiB decompression
+  cap, a 16 MiB HTTP body cap (413) ([language/divergences.md](language/divergences.md)).
 - Benchmarks ([guides/benchmarks.md](guides/benchmarks.md)): fib ~36x, floats ~143x vs CPython.
 
 ## Tooling
@@ -123,11 +130,13 @@ remain future work.
 - `serp lsp` — dependency-free stdio LSP (full-sync diagnostics).
 - `serpentine-lang` + `serpentine-shim` on PyPI; prebuilt runtime dist; tag-push trusted
   publishing ([guides/publishing.md](guides/publishing.md)).
+- Verification tooling: differential corpora, parser and compiler fuzzers, Miri/ASan runs,
+  traceback/TLS checks and a soak test ([guides/testing.md](guides/testing.md)).
 
 ## Libraries
-30+ `serp-*` libraries in `libs/` (Waves 1–4 shipped; Wave 5 has Molt and **Scales**, the
-pandas-style `DataFrame`/`Series` flagship) — json, math, random, os, datetime,
-pathlib, io, zipfile, sqlite, socket, url, http-server, fang (httpx façade with native TLS),
-and more. Many are true CPython stdlib **drop-ins** (facade + `_core` rtlib pattern) —
-including, since the PyVal push, `json`, `tomllib`, `sqlite3`, and `csv.DictReader`;
-per-library drop-in status and blockers live in the tracker, [libraries.md](libraries.md).
+37 `serp-*` libraries in `libs/`, all on PyPI (Waves 1–6): stdlib drop-ins (json, re, csv,
+datetime, pathlib, io, zipfile, sqlite3, socket, subprocess, threading, queue, asyncio, logging,
+argparse, …) plus flagships **Molt** (pydantic), **Venom** (FastAPI), **Fang** (httpx with native
+TLS), **Coil** (numpy) and **Scales** (pandas). Most are true CPython **drop-ins** (facade +
+`_core` rtlib pattern). Per-library status and blockers live in the tracker,
+[libraries.md](libraries.md).

@@ -15,7 +15,7 @@
 
 **Status:** v0.7 — full compiler shipped: LLVM-direct native builds (default backend) with a
 rustc oracle pass on release builds, project tooling (`serp init` / `add` / `run`), packages,
-LSP, 37 `serp-*` libraries on PyPI, and a 104-program dual-run corpus, byte-identical on
+LSP, 37 `serp-*` libraries on PyPI, and a 106-program dual-run corpus, byte-identical on
 Windows/Linux/macOS.
 
 ## Quick start

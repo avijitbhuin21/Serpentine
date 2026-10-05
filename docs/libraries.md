@@ -37,7 +37,7 @@
 - [x] `serp-os` [R] 0.1.0 — ✅ `os` subset (env vars, cwd, mkdir/rmdir/remove/listdir)
 - [x] `serp-datetime` [P] 0.3.0 — ✅ `datetime` (date/datetime/timedelta, `fromisoformat`, validation, repr parity; no tz)
 - [x] `serp-hashlib` [R] 0.1.0 — ✅ `hashlib` (sha256/sha1/md5 objects; no blake2)
-- [x] `serp-re` [P] 0.2.0 — ✅ `re` (backtracking VM, groups, lazy/counted, flags; 30530/30533 differential)
+- [x] `serp-re` [P] 0.2.0 — ✅ `re` (backtracking VM, groups, lazy/counted, flags; 30530/30533 differential; ReDoS guard: 1M steps / 10k depth per attempt → `re.error`, on `master`)
 - [x] `serp-tomllib` [P] 0.2.0 — ✅ `tomllib` subset (PyVal dict; no dates/inline tables/multi-line)
 - [x] `serp-uuid` [R] 0.2.0 — ✅ `uuid` (uuid4 + `UUID(str)` in all four spellings → hex/urn/version/variant)
 - [x] `serp-secrets` [R] 0.1.0 — ✅ `secrets` (token_*/randbelow/randbits/compare_digest; randbits ≤ 63)
@@ -46,8 +46,8 @@
 ## Wave 3 — Files, compression, persistence — SHIPPED
 
 - [x] `serp-io` [P] 0.1.0 — ✅ `io` (StringIO/BytesIO) + file helpers and ByteReader — PyPI dist **`serpentine-io`**, import `serp_io`
-- [x] `serp-zlib` [R] 0.1.0 — ✅ `zlib` (+ gzip helpers; self-contained DEFLATE, wbits routing)
-- [x] `serp-zipfile` [P] 0.2.0 — ✅ `zipfile` (ZipFile r/w/a, stored+DEFLATED; no zip64/encryption)
+- [x] `serp-zlib` [R] 0.1.0 — ✅ `zlib` (+ gzip helpers; self-contained DEFLATE, wbits routing; 256 MiB output cap and CPython trailing-data/multi-member semantics, on `master`)
+- [x] `serp-zipfile` [P] 0.2.0 — ✅ `zipfile` (ZipFile r/w/a, stored+DEFLATED; no zip64/encryption; inherits the 256 MiB inflate cap)
 - [x] `serp-sqlite` [R] 0.2.0 — ✅ `sqlite3` subset (Connection/Cursor, `?` params, PyVal rows; autocommit only)
 
 ## Wave 4 — Networking — SHIPPED (incl. Venom, 2026-07-23)
@@ -55,8 +55,8 @@
 - [x] `serp-socket` [R+P] 0.1.0 — ✅ `socket` (TCP/UDP, timeouts, exception types, normalized errors)
 - [x] `serp-url` [P] 0.1.0 — ✅ `urllib.parse` (urlparse/urljoin/quote/urlencode/parse_qs)
 - [x] `serp-fang` **Fang** [P] 0.3.1 — ✅ `httpx` sync client (native TLS, redirects, cookies, streaming, multipart)
-- [x] `serp-http-server` [P] 0.1.0 — ✅ `http.server` (HTTPServer + handler objects; single-threaded) — threading now unblocked (B3 cleared)
-- [x] `serp-venom` **Venom** [P+L] 0.3.0 — ✅ `fastapi` (module-level `app = FastAPI()`, `@app.get/post/put/delete/patch(path, status_code=)` with parameter injection by name/type — path/query scalars, `T | None`, serp_molt model bodies, raw `Owned[Request]` — JSON-serialized returns incl. models/`list[Model]`, FastAPI's 422 envelope, `HTTPException(status_code=, detail=)`, `JSONResponse`/`PlainTextResponse`/`HTMLResponse`/`RedirectResponse` with `headers=`, `TestClient(app)` with `json=`/`params=`/`headers=`, `serp_uvicorn.run`; `Depends(fn)` (nested), `APIRouter(prefix=)` + module-level `app.include_router`/`add_api_route`; threaded keep-alive + event-loop servers) — drop-in since 2026-09-07 via D41 (module-level object bindings + `@registrar`) and D42 (exception `__init__`); **axum parity** (1.05x at w1/c16, 0.92–1.03x at w3/c64, 2026-08-30) — **roadmap: [libraries/venom.md](libraries/venom.md)** (still open: middleware/BackgroundTasks/streaming/WebSockets)
+- [x] `serp-http-server` [P] 0.1.0 — ✅ `http.server` (HTTPServer + handler objects; single-threaded; 64 KiB heads, 16 MiB `MAX_BODY` → 413, on `master`)
+- [x] `serp-venom` **Venom** [P+L] 0.4.0 — ✅ `fastapi` (module-level `app = FastAPI()`, `@app.get/post/put/delete/patch(path, status_code=)` with parameter injection by name/type — path/query scalars, `T | None`, serp_molt model bodies, raw `Owned[Request]` — JSON-serialized returns incl. models/`list[Model]`, FastAPI's 422 envelope, `HTTPException(status_code=, detail=)`, `JSONResponse`/`PlainTextResponse`/`HTMLResponse`/`RedirectResponse` with `headers=`, `TestClient(app)` with `json=`/`params=`/`headers=`, `serp_uvicorn.run`; `Depends(fn)` (nested), `APIRouter(prefix=)` + module-level `app.include_router`/`add_api_route`; threaded keep-alive + event-loop servers) — drop-in since 2026-09-07 via D41 (module-level object bindings + `@registrar`) and D42 (exception `__init__`); **axum parity** (1.05x at w1/c16, 0.92–1.03x at w3/c64, 2026-08-30) — **roadmap: [libraries/venom.md](libraries/venom.md)** (still open: middleware/BackgroundTasks/streaming/WebSockets)
 
 ## Wave 5 — Data & modeling flagships
 
@@ -74,20 +74,20 @@
 
 ## Sync status
 
-**PyPI (2026-09-29):** `serpentine-lang` 0.7.1 + `serpentine-shim` 0.9.0 live, and **all 37 libs live**.
+**PyPI:** `serpentine-lang` 0.7.2 + `serpentine-shim` 0.9.0, and all 37 libs at the versions above.
+The hardening changes to serp-re, serp-zlib, serp-http-server and serp-venom are on `master` and
+need lib releases (and compiler 0.7.3 for the runtime side).
 Two libs publish under different dist names than their folder/import names: `libs/serp-io` →
-**`serpentine-io`** (PyPI rejected `serp-io` as too similar to an existing project) and `libs/serp-cli` →
-**`serpentine-argparse`** (`serp-cli` belongs to an unrelated project); imports stay `serp_io`/`serp_cli`
-(compiler 0.7.1 reads import roots from `*.dist-info` metadata). `serp-fang` 0.3.1 depends on `serpentine-io`.
+**`serpentine-io`** and `libs/serp-cli` → **`serpentine-argparse`** (the `serp-*` names were
+rejected or taken). Imports stay `serp_io`/`serp_cli`, because the compiler reads import roots from
+`*.dist-info` metadata. `serp-fang` depends on `serpentine-io`.
 New libs publish via a PyPI *pending publisher* (owner `avijitbhuin21`, repo `Serpentine`, workflow
-`release-lib.yml`, env blank) + tag push — one pending publisher at a time (identical configs are rejected).
+`release-lib.yml`, env blank) + tag push `serp-<name>-vX.Y.Z`, one pending publisher at a time.
 
-Last verified: **2026-09-07** (serp-scales 0.2.0 now depends on serp-json 0.3.0 + serp-datetime 0.2.0, declared in both `serp.toml` and `pyproject.toml`; earlier: serp-subprocess, serp-threading, serp-queue, serp-scales, serp-coil added; serp-threading depends on serpentine-shim ≥ 0.7.0; serp-coil→serp-math is declared in both `serp.toml` and `pyproject.toml`). All declared dependency pins match repo versions;
-serp-datetime→serp-time, serp-pathlib→serp-os and serp-fang→serp-time/serp-uuid/serp-zlib
-are now declared in both `serp.toml` and `pyproject.toml` (previously undeclared/stale).
-Shim (`serpentine-shim`): 0.9.0 in-repo (adds D43 tuple-key splatting for multi-parameter `__getitem__`/`__setitem__`; 0.8.0 added `registrar`, D41; 0.5.0 on PyPI — release owed). Test-only cross-lib imports (not package deps):
-serp-log/serp-sqlite tests use serp-os; serp-http-server tests use serp-socket;
-serp-venom's `test_molt_body.py` uses serp-molt (+ its serp-re/datetime/uuid/time roots).
+**Dependency pins:** every declared lib→lib dependency is listed in both `serp.toml` and
+`pyproject.toml` and matches the repo versions (last verified 2026-09-07). Test-only cross-lib
+imports, which aren't package deps: serp-log/serp-sqlite tests use serp-os; serp-http-server tests
+use serp-socket; serp-venom's `test_molt_body.py` uses serp-molt (+ its re/datetime/uuid/time roots).
 
 ## Blockers — ALL CLEARED (2026-07-23)
 

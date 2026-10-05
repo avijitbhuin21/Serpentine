@@ -124,12 +124,12 @@ def word_lengths(text: str) -> dict[str, int]:
 | `serp lsp` | LSP server for editor diagnostics |
 
 A complete worked example — a JSON parser developed under CPython and deployed as a native
-binary — lives at [`examples/json_parser.py`](../examples/json_parser.py).
+binary — lives at [`examples/json_parser.py`](../../examples/json_parser.py).
 
 ## What's deliberately missing
 
 No inheritance, no closures beyond `sorted` keys, no generators/`yield` (but
 `iter()`/`next()` over lists work), no `async`, no mutable globals, no foreign imports
-in native builds ([interop.md](interop.md)). The subset grows by demand order from
+in native builds ([interop.md](../guides/interop.md)). The subset grows by demand order from
 real-code corpus studies — see `../spec.md` for the normative
 surface.
