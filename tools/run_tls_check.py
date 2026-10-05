@@ -36,6 +36,9 @@ def main() -> int:
         return 1
     r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=180)
     got = verdicts(r.stdout)
+    if len(got) < len(EXPECT):
+        print(f"probe exit code {r.returncode}; stdout tail: {r.stdout[-800:]!r}")
+        print("probe stderr tail:\n" + r.stderr[-3000:])
     bad = 0
     for case, want in EXPECT.items():
         have = got.get(case, "<missing>")
