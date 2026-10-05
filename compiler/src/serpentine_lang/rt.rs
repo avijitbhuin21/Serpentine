@@ -74,6 +74,28 @@ pub unsafe extern "C" fn rt_tb_push(fp: *const u8, fl: i64, line: i64, np: *cons
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rt_main_trampoline(entry: *const u8) -> i32 {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        signal(13, 1);
+    }
+    let f = entry as usize;
+    let t = std::thread::Builder::new().name("main".into()).stack_size(SERP_STACK)
+        .spawn(move || {
+            let e: extern "C" fn() = std::mem::transmute(f);
+            e();
+        })
+        .expect("spawn main thread");
+    if t.join().is_err() {
+        return 101;
+    }
+    0
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rt_err_reraise(e: *const SErrC) {
     set_pending(SerpErr::new((*e).kind.as_str(), (*e).msg.as_str().to_string()));
 }

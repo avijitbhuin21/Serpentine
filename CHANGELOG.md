@@ -22,6 +22,12 @@ versions.
   `run_tls_check.py` (badssl.com; informational in CI), `run_miri.py`, `run_asan.py` and
   `run_soak.py` (local/nightly).
 
+### Fixed (found by the TLS check in CI)
+- Linux/macOS LLVM builds link with a C `main` that bypassed Rust's start-up, so SIGPIPE was
+  never ignored. Any HTTPS request whose peer closed first **killed the process with signal 13**
+  on Linux (badssl check: 0/6). The C `main` now goes through `rt_main_trampoline`, which
+  ignores SIGPIPE and runs the program on the same 256 MiB entry thread as on Windows.
+
 ### Fixed (found by the fuzzers)
 - `bytes.fromhex` ignored only spaces; it now ignores all ASCII whitespace, like CPython.
 - `zlib.decompress` read the Adler-32 from the last 4 bytes; it now reads it right after the

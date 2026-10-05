@@ -121,7 +121,8 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
       - Slowloris is only partly handled: the timeout is per `recv`, not per request.
 - [x] **P1** TLS (2026-09-30): `tools/run_tls_check.py` against badssl.com.
       - schannel: 6/6. Expired, self-signed, wrong-host and untrusted-root are refused with `OSError("certificate verify failed")`; the good site and `verify=False` return 200.
-      - The OpenSSL path (Linux/macOS) runs in CI as an informational step.
+      - macOS (OpenSSL) in CI: 6/6.
+      - **Linux in CI was 0/6**: the native binary died of SIGPIPE because the C-`main` link path skipped Rust's start-up. Fixed with `rt_main_trampoline` (ignores SIGPIPE, 256 MiB entry thread).
 - [~] **P1** `SECURITY.md` added 2026-09-30 (GitHub private vulnerability reporting, latest-only support). Still to do: enable private vulnerability reporting in the repo settings, and optionally add an email contact.
 - [~] **P1** `Shared` reference cycles leak (D3). Guidance is written ([language/ownership.md](language/ownership.md) §7.1: `Weak` back-edges, owned per-request graphs, soak-check before deploying). There's still no runtime cycle detection.
 - [x] **P2** Dependency audit: the runtime links **zero third-party crates** (only the in-tree `serp_rt`; the native dependencies are OS schannel, a dynamically loaded OpenSSL, and system SQLite), so `cargo audit` has nothing to scan (verified 2026-09-30).

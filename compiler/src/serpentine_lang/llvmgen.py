@@ -101,6 +101,7 @@ RT_SIGS = {
     "rt_err_repr": (VOID, [SERRP, SSTRP]),
     "rt_abort_pending": (VOID, []),
     "rt_tb_push": (VOID, [I8P, I64, I64, I8P, I64]),
+    "rt_main_trampoline": (I32, [I8P]),
     "rt_str_new": (VOID, [I8P, I64, SSTRP]),
     "rt_str_clone": (VOID, [SSTRP, SSTRP]),
     "rt_str_drop": (VOID, [SSTRP]),
@@ -1511,8 +1512,8 @@ class LLVMGen:
         if self.define_c_main:
             mn = ir.Function(self.module, ir.FunctionType(I32, []), name="main")
             mb = ir.IRBuilder(mn.append_basic_block("entry"))
-            mb.call(se, [])
-            mb.ret(ir.Constant(I32, 0))
+            rc = mb.call(self._rt("rt_main_trampoline"), [mb.bitcast(se, I8P)])
+            mb.ret(rc)
         return self.module
 
     def _closure_fnty(self, ft: TFunc) -> ir.FunctionType:
