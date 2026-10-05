@@ -56,6 +56,19 @@ jobs:
       - name: Library differential suite (every libs/*/tests, CPython vs both backends)
         run: python tools/run_lib_tests.py
 
+      - name: Native crash tracebacks match CPython frames (both backends)
+        run: python tools/run_traceback_check.py
+
+      - name: Differential parser fuzz (fixed seed, CPython vs native)
+        run: python tools/run_fuzz.py --per-kind 300 --seed 20260930
+
+      - name: Differential compiler fuzz (random programs, CPython vs both backends)
+        run: python tools/run_compiler_fuzz.py --seed 1 --count 8
+
+      - name: TLS certificate verification against badssl.com (network; informational)
+        continue-on-error: true
+        run: python tools/run_tls_check.py
+
   package:
     runs-on: ubuntu-latest
     steps:

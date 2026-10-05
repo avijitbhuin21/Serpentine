@@ -146,10 +146,19 @@ class RustGen:
     def _q(self, code: str) -> str:
         """Propagate a fallible expression: `?` normally, break-to-handler inside try."""
         if not self.try_ctx:
-            return f"{code}?"
+            return f"serp_tr({code}, {self._tb_args()})?"
         label, exc_var = self.try_ctx[-1]
         return (f"(match {code} {{ Ok(__v) => __v, "
-                f"Err(__e) => {{ {exc_var} = Some(__e); break '{label}; }} }})")
+                f"Err(__e) => {{ serp_tb_push({self._tb_args()}); {exc_var} = Some(__e); break '{label}; }} }})")
+
+    def _tb_args(self) -> str:
+        """Rust args (file, line, function) naming the current .py source location for tracebacks."""
+        mod = getattr(self, "mod", None)
+        path = str(getattr(mod, "path", "<unknown>")) if mod is not None else "<unknown>"
+        sig = getattr(self, "sig", None)
+        func = getattr(sig, "name", "<module>") if sig is not None else "<module>"
+        lit = lambda s: '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return f"{lit(path)}, {getattr(self, 'cur_line', 0)}, {lit(func)}"
 
     def generate(self) -> str:
         """Emit the complete Rust program (prelude + structs + modules + entry)."""
@@ -180,10 +189,13 @@ class RustGen:
         if entry.entry_call is None:
             raise CodegenError("no entry point: expected `if __name__ == \"__main__\":` guard")
         self._line("fn main() {")
-        self._line(f"    if let Err(__e) = f_{entry.entry_call}() {{")
-        self._line("        serp_abort(__e);")
-        self._line("    }")
-        self._line("    serp_threads_join_all();")
+        self._line("    let __main = std::thread::Builder::new().name(\"main\".into()).stack_size(SERP_STACK).spawn(|| {")
+        self._line(f"        if let Err(__e) = f_{entry.entry_call}() {{")
+        self._line("            serp_abort(__e);")
+        self._line("        }")
+        self._line("        serp_threads_join_all();")
+        self._line("    }).expect(\"spawn main thread\");")
+        self._line("    if __main.join().is_err() { std::process::exit(101); }")
         self._line("}")
         return "\n".join(self.out)
 
@@ -488,6 +500,8 @@ class RustGen:
         self.ref_bound = saved_ref
 
     def _emit_stmt(self, stmt: ast.stmt) -> None:
+        if getattr(stmt, "lineno", None):
+            self.cur_line = stmt.lineno
         if isinstance(stmt, ast.Pass):
             return
         if isinstance(stmt, ast.Expr):
@@ -573,6 +587,7 @@ class RustGen:
 
     def _propagate_stmt(self, err_code: str) -> None:
         """Raise an error value: break to the enclosing handler or return Err."""
+        self._line(f"serp_tb_push({self._tb_args()});")
         if self.try_ctx:
             label, exc_var = self.try_ctx[-1]
             self._line(f"{exc_var} = Some({err_code});")
@@ -693,6 +708,7 @@ class RustGen:
                 first = False
                 self.indent += 1
                 self._line(f"{exc} = None;")
+                self._line("serp_tb_clear();")
                 if h.name:
                     self._line(f"v_{h.name} = __cur{n}.clone();")
                 self.try_ctx.append((f"hnd{n}", rexc))

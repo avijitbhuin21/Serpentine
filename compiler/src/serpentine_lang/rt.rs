@@ -64,7 +64,13 @@ pub unsafe extern "C" fn rt_raise_static(kp: *const u8, kl: i64, mp: *const u8, 
 #[no_mangle]
 pub unsafe extern "C" fn rt_err_take(out: *mut SErrC) {
     let e = take_pending();
+    serp_tb_clear();
     out.write(SErrC { kind: sstr(&e.kind), msg: sstr(&e.msg) });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_tb_push(fp: *const u8, fl: i64, line: i64, np: *const u8, nl: i64) {
+    serp_tb_push(bytes(fp, fl), line, bytes(np, nl));
 }
 
 #[no_mangle]
@@ -1793,7 +1799,7 @@ pub unsafe extern "C" fn rt_box_err() -> *mut u8 {
 pub unsafe extern "C" fn rt_thread_spawn(f: extern "C" fn(*mut u8) -> *mut u8,
                                          env: *mut u8) -> *mut u8 {
     let env = SendPtr(env);
-    let h = std::thread::spawn(move || {
+    let h = serp_thread_spawn(move || {
         let env = env;
         SendPtr(f(env.0))
     });

@@ -1,0 +1,6 @@
+[project]
+name = "serp-fuzz"
+version = "0.0.0"
+
+[build]
+roots = [".", "../../libs/serp-json/src", "../../libs/serp-tomllib/src", "../../libs/serp-url/src", "../../libs/serp-base64/src", "../../libs/serp-re/src", "../../libs/serp-zlib/src", "../../libs/serp-csv/src", "../../libs/serp-datetime/src", "../../libs/serp-io/src"]

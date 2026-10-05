@@ -36,8 +36,11 @@ leak). These are runtime/codegen obligations covered by the differential suite.
 
 ## Output & errors
 
-- **Unhandled runtime error** — same class, same message, exit status 1 on both sides;
-  traceback *frames* are best-effort native.
+- **Unhandled runtime error** — same class, same message, exit status 1 on both sides.
+  Native binaries print a `Traceback (most recent call last):` with the same `.py` file,
+  line and function for every Serpentine frame (checked by `tools/run_traceback_check.py`).
+  They omit CPython's `<module>` frame and source-line excerpts, and collapse repeated frames
+  of the same function.
 - **stdout line endings & encoding** — native always writes UTF-8 with `\n`; CPython uses
   OS text mode (`\r\n` and cp1252 pipes on Windows). The differential harness normalizes
   line endings and pins CPython to `PYTHONIOENCODING=utf-8`; on Linux/macOS the defaults
@@ -57,6 +60,23 @@ leak). These are runtime/codegen obligations covered by the differential suite.
   ties-to-even.)
 - **Huge JSON-style integer literals** parsed with `int(s)` overflow natively (see the
   64-bit rule) where CPython returns a big int.
+
+## Safety limits (hardening, 2026-09-30)
+
+These apply in **both** worlds (the CPython facades enforce the same caps) wherever CPython
+itself would hang, exhaust memory or crash:
+
+- **`serp-re`**: each match attempt may run at most `STEP_LIMIT` (1,000,000) VM steps and
+  recurse at most `MAX_DEPTH` (10,000) levels. Catastrophic backtracking or very deep
+  quantified matches raise `serp_re.error(...)` where CPython `re` would hang. The CPython
+  facade can still hit `RecursionError` earlier (around 1,000 frames).
+- **`serp-zlib` / `serp-zipfile`**: decompression output is capped at 256 MiB, raising
+  `ValueError("decompressed data exceeds limit (256 MiB)")` (bomb guard).
+- **`serp-http-server` / Venom**: request bodies over `MAX_BODY` (16 MiB) are refused with
+  `413 Payload Too Large` before being read; request heads are capped at 64 KiB.
+- **Stacks**: the program entry and every runtime-spawned thread run on a 256 MiB reserved
+  stack (address space, committed lazily), so deep recursion behaves the same on Windows
+  (1 MiB default) as on Linux/macOS.
 
 ## Policy
 

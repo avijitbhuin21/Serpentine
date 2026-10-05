@@ -100,6 +100,7 @@ RT_SIGS = {
     "rt_err_msg": (VOID, [SERRP, SSTRP]),
     "rt_err_repr": (VOID, [SERRP, SSTRP]),
     "rt_abort_pending": (VOID, []),
+    "rt_tb_push": (VOID, [I8P, I64, I64, I8P, I64]),
     "rt_str_new": (VOID, [I8P, I64, SSTRP]),
     "rt_str_clone": (VOID, [SSTRP, SSTRP]),
     "rt_str_drop": (VOID, [SSTRP]),
@@ -1802,6 +1803,23 @@ class LLVMGen:
             else:
                 b.store(b.sub(b.load(bp), ir.Constant(I64, 1)), bp)
 
+    def _tb_push(self, b: ir.IRBuilder) -> None:
+        """Record the current .py (file, line, function) on the pending error's traceback."""
+        mod = getattr(self, "mod", None)
+        path = str(getattr(mod, "path", "<unknown>")) if mod is not None else "<unknown>"
+        sig = getattr(self, "sig", None)
+        func = getattr(sig, "name", "<module>") if sig is not None else "<module>"
+        fp, fl = self._cstr(path)
+        np_, nl = self._cstr(func)
+        b.call(self._rt("rt_tb_push"), [fp, ir.Constant(I64, fl),
+                                        ir.Constant(I64, getattr(self, "cur_line", 0)),
+                                        np_, ir.Constant(I64, nl)])
+
+    def _err_edge(self) -> None:
+        """Take the error edge from the current block, recording a traceback frame first."""
+        self._tb_push(self.b)
+        self.b.branch(self._err_target())
+
     def _check_err(self, errbit) -> None:
         """Branch to the current error target when errbit is set."""
         bad = self.fn.append_basic_block("err")
@@ -1809,7 +1827,7 @@ class LLVMGen:
         self.b.cbranch(errbit, bad, ok)
         self.b.position_at_end(bad)
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
         self.b.position_at_end(ok)
 
     def _check_err_i8(self, status) -> None:
@@ -1822,14 +1840,14 @@ class LLVMGen:
         self.b.call(self._rt("rt_raise_static"),
                     [kp, ir.Constant(I64, kl), mp, ir.Constant(I64, ml)])
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
         cont = self.fn.append_basic_block("cont")
         self.b.position_at_end(cont)
 
     def _cond_raise_static(self, cond, kind: str, msg: str) -> None:
         ok = self.fn.append_basic_block("ok")
         if not self.active_borrows:
-            key = (kind, msg, self._err_target().name)
+            key = (kind, msg, self._err_target().name, getattr(self, "cur_line", 0))
             bad = self.raise_blocks.get(key)
             if bad is None:
                 bad = self.fn.append_basic_block("raise")
@@ -1838,6 +1856,7 @@ class LLVMGen:
                 mp, ml = self._cstr(msg)
                 b.call(self._rt("rt_raise_static"),
                        [kp, ir.Constant(I64, kl), mp, ir.Constant(I64, ml)])
+                self._tb_push(b)
                 b.branch(self._err_target())
                 self.raise_blocks[key] = bad
             self.b.cbranch(cond, bad, ok)
@@ -1851,7 +1870,7 @@ class LLVMGen:
         self.b.call(self._rt("rt_raise_static"),
                     [kp, ir.Constant(I64, kl), mp, ir.Constant(I64, ml)])
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
         self.b.position_at_end(ok)
 
     def _drain(self, mark_t: int, mark_b: int) -> None:
@@ -1871,6 +1890,8 @@ class LLVMGen:
         self.bindings = saved
 
     def _emit_stmt(self, s: ast.stmt) -> None:
+        if getattr(s, "lineno", None):
+            self.cur_line = s.lineno
         mark_t = len(self.stmt_temps)
         mark_b = len(self.active_borrows)
         self._stmt_inner(s)
@@ -2182,7 +2203,7 @@ class LLVMGen:
             cur = self.cur_exc[-1]
             self.b.call(self._rt("rt_err_reraise"), [cur])
             self._release_borrows(self.b)
-            self.b.branch(self._err_target())
+            self._err_edge()
             dead = self.fn.append_basic_block("dead")
             self.b.position_at_end(dead)
             return
@@ -2221,7 +2242,7 @@ class LLVMGen:
         del self.stmt_temps[:]
         self._release_borrows(self.b)
         del self.active_borrows[:]
-        self.b.branch(self._err_target())
+        self._err_edge()
         dead = self.fn.append_basic_block("dead")
         self.b.position_at_end(dead)
 
@@ -2306,7 +2327,7 @@ class LLVMGen:
             self.b.call(self._rt("rt_err_reraise"), [slot])
             self._drop(self.b, TExc(), V(TExc(), ptr=slot))
             self._release_borrows(self.b)
-            self.b.branch(self._err_target())
+            self._err_edge()
             self.b.position_at_end(cont)
 
     # ---------- loops (for + comprehensions) ----------
@@ -3132,7 +3153,7 @@ class LLVMGen:
         self.b.call(self._rt("rt_str_drop"), [ktmp])
         self.b.call(self._rt("rt_str_drop"), [msg])
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
 
     def _dict_lookup(self, dictptr, t: TDict, key: V):
         """Value pointer for key; raises KeyError when missing."""
@@ -4063,7 +4084,7 @@ class LLVMGen:
         self.b.call(self._rt("rt_str_drop"), [ktmp])
         self.b.call(self._rt("rt_str_drop"), [msg])
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
         self.b.position_at_end(ok)
         return V(TEnum(*key), ssa=found)
 
@@ -4577,7 +4598,7 @@ class LLVMGen:
         self.b.call(self._rt("rt_str_drop"), [ktmp])
         self.b.call(self._rt("rt_str_drop"), [msg])
         self._release_borrows(self.b)
-        self.b.branch(self._err_target())
+        self._err_edge()
 
     def _dict_method(self, node, rt, t: TDict, method: str, args) -> V:
         if method == "get":

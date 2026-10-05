@@ -21,6 +21,7 @@ from _serp_socket import send_all as _send_all
 from _serp_socket import set_timeout as _set_timeout
 
 MAX_HEAD: int = 65536
+MAX_BODY: int = 16777216
 
 
 def _send(conn: int, data: bytes) -> int:
@@ -173,6 +174,21 @@ class BaseHTTPRequestHandler:
             self.conn = -1
 
 
+def _too_large(conn: int) -> BaseHTTPRequestHandler:
+    """Reply 413 to a request whose declared body exceeds MAX_BODY, then drop the connection."""
+    try:
+        x: int = _send(conn, b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\n"
+                             b"connection: close\r\n\r\n")
+    except OSError as e:
+        pass
+    _close(conn)
+    empty: list[str] = []
+    hdrs: _Headers = _Headers(move(empty))
+    rf: _RFile = _RFile(b"")
+    wf: _WFile = _WFile(-1)
+    return BaseHTTPRequestHandler(-1, "", "", "", move(hdrs), move(rf), move(wf))
+
+
 def _bad_request(conn: int) -> BaseHTTPRequestHandler:
     try:
         x: int = _send(conn, b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n"
@@ -236,6 +252,8 @@ class HTTPServer:
                 if hname.lower() == "content-length" and _digits_ok(hval):
                     clen = int(hval)
             i += 1
+        if clen > MAX_BODY:
+            return _too_large(conn)
         body: bytearray = bytearray(rest)
         while len(body) < clen:
             chunk: bytes = _recv(conn, 4096)

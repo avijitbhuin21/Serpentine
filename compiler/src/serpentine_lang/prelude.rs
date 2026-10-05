@@ -41,9 +41,16 @@ type SRes<T> = Result<T, SerpErr>;
 
 pub struct SJoin<T>(pub RefCell<Option<std::thread::JoinHandle<SRes<T>>>>);
 
+const SERP_STACK: usize = 256 << 20;
+
+fn serp_thread_spawn<T, F>(f: F) -> std::thread::JoinHandle<T>
+where T: Send + 'static, F: FnOnce() -> T + Send + 'static {
+    std::thread::Builder::new().stack_size(SERP_STACK).spawn(f).expect("failed to spawn thread")
+}
+
 fn serp_spawn<T, F>(f: F) -> SJoin<T>
 where T: Send + 'static, F: FnOnce() -> SRes<T> + Send + 'static {
-    SJoin(RefCell::new(Some(std::thread::spawn(f))))
+    SJoin(RefCell::new(Some(serp_thread_spawn(f))))
 }
 
 fn serp_join<T>(h: &SJoin<T>) -> SRes<T> {
@@ -117,8 +124,52 @@ fn serp_err<T>(kind: &str, msg: String) -> SRes<T> {
 }
 
 fn serp_abort(e: SerpErr) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let frames = serp_tb_take();
+    if !frames.is_empty() {
+        let mut out = String::from("Traceback (most recent call last):\n");
+        for (file, line, func) in frames.iter().rev() {
+            out.push_str(&format!("  File \"{}\", line {}, in {}\n", file, line, func));
+        }
+        eprint!("{}", out);
+    }
     eprintln!("{}", e.display());
     process::exit(1);
+}
+
+std::thread_local! {
+    static SERP_TB: RefCell<Vec<(String, i64, String)>> = RefCell::new(Vec::new());
+}
+
+fn serp_tb_push(file: &str, line: i64, func: &str) {
+    SERP_TB.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(last) = t.last_mut() {
+            if last.2 == func && last.0 == file {
+                return;
+            }
+        }
+        if t.len() < 200 {
+            t.push((file.to_string(), line, func.to_string()));
+        }
+    });
+}
+
+fn serp_tb_clear() {
+    SERP_TB.with(|t| t.borrow_mut().clear());
+}
+
+fn serp_tb_take() -> Vec<(String, i64, String)> {
+    SERP_TB.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
+
+#[inline]
+fn serp_tr<T>(r: SRes<T>, file: &str, line: i64, func: &str) -> SRes<T> {
+    if r.is_err() {
+        serp_tb_push(file, line, func);
+    }
+    r
 }
 
 // ---------- integer arithmetic with CPython semantics ----------
@@ -560,7 +611,9 @@ fn py_len_str(s: &str) -> i64 {
     if s.is_ascii() { return s.len() as i64; }
     s.chars().count() as i64
 }
-fn py_split_ws(s: &str) -> Vec<SStr> { s.split_whitespace().map(sstr).collect() }
+fn py_is_space(c: char) -> bool { c.is_whitespace() || ('\x1c'..='\x1f').contains(&c) }
+fn py_trim(s: &str) -> &str { s.trim_matches(py_is_space) }
+fn py_split_ws(s: &str) -> Vec<SStr> { s.split(py_is_space).filter(|p| !p.is_empty()).map(sstr).collect() }
 fn py_split(s: &str, sep: &str) -> SRes<Vec<SStr>> {
     if sep.is_empty() { return serp_err("ValueError", "empty separator".into()); }
     Ok(s.split(sep).map(sstr).collect())
@@ -569,9 +622,9 @@ fn py_join(sep: &str, v: &Vec<SStr>) -> SStr {
     let parts: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
     sstring(parts.join(sep))
 }
-fn py_strip(s: &str) -> SStr { sstr(s.trim()) }
-fn py_lstrip(s: &str) -> SStr { sstr(s.trim_start()) }
-fn py_rstrip(s: &str) -> SStr { sstr(s.trim_end()) }
+fn py_strip(s: &str) -> SStr { sstr(py_trim(s)) }
+fn py_lstrip(s: &str) -> SStr { sstr(s.trim_start_matches(py_is_space)) }
+fn py_rstrip(s: &str) -> SStr { sstr(s.trim_end_matches(py_is_space)) }
 fn py_upper(s: &str) -> SStr { sstring(s.to_uppercase()) }
 fn py_lower(s: &str) -> SStr { sstring(s.to_lowercase()) }
 fn py_startswith(s: &str, p: &str) -> bool { s.starts_with(p) }
@@ -671,7 +724,7 @@ fn serp_next<T: Clone>(it: &mut std::slice::Iter<'_, T>) -> SRes<T> {
 // ---------- conversions ----------
 
 fn py_int_from_str(s: &str) -> SRes<i64> {
-    let t = s.trim();
+    let t = py_trim(s);
     t.parse::<i64>().map_err(|_| SerpErr::new("ValueError",
         format!("invalid literal for int() with base 10: {}", s.to_string().py_repr())))
 }
@@ -685,7 +738,7 @@ fn py_int_from_f(f: f64) -> SRes<i64> {
     Ok(t as i64)
 }
 fn py_float_from_str(s: &str) -> SRes<f64> {
-    let t = s.trim();
+    let t = py_trim(s);
     t.parse::<f64>().map_err(|_| SerpErr::new("ValueError",
         format!("could not convert string to float: {}", s.to_string().py_repr())))
 }
@@ -938,7 +991,7 @@ fn pyb_hex(a: &SBytes) -> SStr {
 fn pyb_fromhex(s: &str) -> SRes<SBytes> {
     let mut v = Vec::new(); let mut hi: Option<u8> = None;
     for (i, c) in s.chars().enumerate() {
-        if c == ' ' {
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0b' || c == '\x0c' {
             if hi.is_some() {
                 return serp_err("ValueError",
                     format!("non-hexadecimal number found in fromhex() arg at position {}", i));
@@ -2235,7 +2288,30 @@ fn zhuff_decode(br: &mut ZBitR, h: &ZHuff) -> Result<u16, ()> {
     Err(())
 }
 
+const ZMAX_OUT: usize = 256 << 20;
+
+std::thread_local! {
+    static ZLIB_TOO_BIG: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ()> {
+    inflate_raw_end(data).map(|(v, _)| v)
+}
+
+fn inflate_raw_end(data: &[u8]) -> Result<(Vec<u8>, usize), ()> {
+    ZLIB_TOO_BIG.with(|f| f.set(false));
+    inflate_raw_inner(data)
+}
+
+fn zlib_over(out: &Vec<u8>) -> Result<(), ()> {
+    if out.len() > ZMAX_OUT {
+        ZLIB_TOO_BIG.with(|f| f.set(true));
+        return Err(());
+    }
+    Ok(())
+}
+
+fn inflate_raw_inner(data: &[u8]) -> Result<(Vec<u8>, usize), ()> {
     let mut br = ZBitR::new(data);
     let mut out: Vec<u8> = Vec::new();
     loop {
@@ -2258,6 +2334,7 @@ fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ()> {
                 }
                 out.extend_from_slice(&data[br.pos..br.pos + len]);
                 br.pos += len;
+                zlib_over(&out)?;
             }
             1 | 2 => {
                 let (lit, dist);
@@ -2330,6 +2407,9 @@ fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ()> {
                     let sym = zhuff_decode(&mut br, &lit)?;
                     if sym < 256 {
                         out.push(sym as u8);
+                        if out.len() & 0xffff == 0 {
+                            zlib_over(&out)?;
+                        }
                     } else if sym == 256 {
                         break;
                     } else {
@@ -2353,6 +2433,7 @@ fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ()> {
                             let b = out[start + k];
                             out.push(b);
                         }
+                        zlib_over(&out)?;
                     }
                 }
             }
@@ -2362,10 +2443,16 @@ fn inflate_raw(data: &[u8]) -> Result<Vec<u8>, ()> {
             break;
         }
     }
-    Ok(out)
+    let end = br.pos - (br.bit / 8) as usize;
+    Ok((out, end))
 }
 
-fn zlib_bad() -> SerpErr { SerpErr::new("ValueError", "invalid compressed data".into()) }
+fn zlib_bad() -> SerpErr {
+    if ZLIB_TOO_BIG.with(|f| f.get()) {
+        return SerpErr::new("ValueError", "decompressed data exceeds limit (256 MiB)".into());
+    }
+    SerpErr::new("ValueError", "invalid compressed data".into())
+}
 
 fn serp_zlib_inflate(b: &SBytes) -> SRes<SBytes> {
     match inflate_raw(&b.v) {
@@ -2382,21 +2469,23 @@ fn serp_zlib_decompress(b: &SBytes) -> SRes<SBytes> {
     if ((d[0] as u32) * 256 + d[1] as u32) % 31 != 0 || d[1] & 0x20 != 0 {
         return Err(zlib_bad());
     }
-    let body = match inflate_raw(&d[2..d.len() - 4]) {
+    let (body, end) = match inflate_raw_end(&d[2..]) {
         Ok(v) => v,
         Err(()) => return Err(zlib_bad()),
     };
-    let want = u32::from_be_bytes([d[d.len() - 4], d[d.len() - 3],
-                                   d[d.len() - 2], d[d.len() - 1]]);
+    let at = 2 + end;
+    if at + 4 > d.len() {
+        return Err(zlib_bad());
+    }
+    let want = u32::from_be_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
     if adler32_of(&body) != want {
         return Err(zlib_bad());
     }
     Ok(sbytes(body))
 }
 
-fn serp_zlib_gzip_decompress(b: &SBytes) -> SRes<SBytes> {
-    let d = &b.v;
-    if d.len() < 18 || d[0] != 0x1f || d[1] != 0x8b || d[2] != 8 {
+fn gzip_member(d: &[u8], out: &mut Vec<u8>) -> Result<usize, SerpErr> {
+    if d.len() < 10 || d[0] != 0x1f || d[1] != 0x8b || d[2] != 8 {
         return Err(zlib_bad());
     }
     let flg = d[3];
@@ -2419,21 +2508,43 @@ fn serp_zlib_gzip_decompress(b: &SBytes) -> SRes<SBytes> {
     if flg & 0x02 != 0 {
         i += 2;
     }
-    if i + 8 > d.len() {
+    if i > d.len() {
         return Err(zlib_bad());
     }
-    let body = match inflate_raw(&d[i..d.len() - 8]) {
+    let (body, end) = match inflate_raw_end(&d[i..]) {
         Ok(v) => v,
         Err(()) => return Err(zlib_bad()),
     };
-    let want_crc = u32::from_le_bytes([d[d.len() - 8], d[d.len() - 7],
-                                       d[d.len() - 6], d[d.len() - 5]]);
-    let want_len = u32::from_le_bytes([d[d.len() - 4], d[d.len() - 3],
-                                       d[d.len() - 2], d[d.len() - 1]]);
+    let at = i + end;
+    if at + 8 > d.len() {
+        return Err(zlib_bad());
+    }
+    let want_crc = u32::from_le_bytes([d[at], d[at + 1], d[at + 2], d[at + 3]]);
+    let want_len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]);
     if crc32_of(&body) != want_crc || body.len() as u32 != want_len {
         return Err(zlib_bad());
     }
-    Ok(sbytes(body))
+    if out.len() + body.len() > ZMAX_OUT {
+        ZLIB_TOO_BIG.with(|f| f.set(true));
+        return Err(zlib_bad());
+    }
+    out.extend_from_slice(&body);
+    Ok(at + 8)
+}
+
+fn serp_zlib_gzip_decompress(b: &SBytes) -> SRes<SBytes> {
+    let d = &b.v;
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        while pos < d.len() && d[pos] == 0 && pos > 0 {
+            pos += 1;
+        }
+        if pos >= d.len() {
+            return Ok(sbytes(out));
+        }
+        pos += gzip_member(&d[pos..], &mut out)?;
+    }
 }
 
 // ---------- rtlib: serp_sqlite (system SQLite loaded dynamically; no crates,
@@ -4673,7 +4784,7 @@ fn serp_sp_pid(h: i64) -> SRes<i64> {
 }
 
 fn sp_drain_thread(src: Box<dyn std::io::Read + Send>) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
+    serp_thread_spawn(move || {
         use std::io::Read;
         let mut src = src;
         let mut buf = Vec::new();
@@ -4923,7 +5034,7 @@ fn serp_thread_start(t: &SThread) -> SRes<()> {
     }
     let rec = t.clone();
     let mut guard = lock_ok(&t.handle);
-    let h = std::thread::spawn(move || {
+    let h = serp_thread_spawn(move || {
         TH_IDENT.with(|c| c.set(ident));
         TH_NAME.with(|n| *n.borrow_mut() = lock_ok(&rec.name).clone());
         let mut cancelled = false;
@@ -5329,7 +5440,7 @@ fn aio_task_spawn(body: AioBody) -> usize {
     let rec = lp.tasks.get(&tid).map(|t| t.rec.clone()).expect("task rec");
     lp.ready.push_back(tid);
     drop(lp);
-    std::thread::spawn(move || {
+    serp_thread_spawn(move || {
         AIO_TID.with(|c| c.set(tid));
         aio_wait_go(&rec);
         body();

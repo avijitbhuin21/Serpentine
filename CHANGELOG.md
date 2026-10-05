@@ -7,6 +7,30 @@ versions.
 
 ## [Unreleased]
 
+### Security / hardening
+- Native crashes print a CPython-style traceback (`.py` file, line, function per frame) in
+  both backends; frames are recorded on the error path only.
+- `serp-re`: ReDoS guard of 1M VM steps and 10k recursion levels per match attempt; raises
+  `serp_re.error` instead of hanging or overflowing the stack.
+- `serp-zlib` / `serp-zipfile`: 256 MiB decompression-output cap (bomb guard).
+- `serp-http-server` / Venom: request bodies over 16 MiB get `413 Payload Too Large` before
+  being read.
+- The program entry and all runtime threads run on 256 MiB reserved stacks, so Windows
+  matches Linux/macOS recursion depth.
+- New tooling (in CI unless noted): `run_traceback_check.py`, `run_fuzz.py` (differential
+  parser fuzzer), `run_compiler_fuzz.py` (random-program differential fuzzer),
+  `run_tls_check.py` (badssl.com; informational in CI), `run_miri.py`, `run_asan.py` and
+  `run_soak.py` (local/nightly).
+
+### Fixed (found by the fuzzers)
+- `bytes.fromhex` ignored only spaces; it now ignores all ASCII whitespace, like CPython.
+- `zlib.decompress` read the Adler-32 from the last 4 bytes; it now reads it right after the
+  DEFLATE stream and ignores trailing data, like CPython.
+- `gzip_decompress` now decodes concatenated members and skips NUL padding, like CPython.
+- `str.strip`/`lstrip`/`rstrip`/`split()`, `int()` and `float()` now treat `\x1c`–`\x1f` as
+  whitespace, like CPython. The TOML parser behaved differently natively on control
+  characters because of this.
+
 ### Fixed
 - Backend A: a local first assigned inside a `try` body and used after a diverging handler
   (`except: continue|break|return`) no longer fails rustc with E0381. Scalar and Optional locals

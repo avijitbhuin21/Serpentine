@@ -25,12 +25,20 @@ RT_SOURCES = [PKG / "prelude.rs", PKG / "rt.rs"]
 STUB_RS = """\
 extern crate serp_rt;
 extern "C" { fn serp_entry(); }
-fn main() { unsafe { serp_entry(); } }
+fn main() {
+    let t = std::thread::Builder::new().name("main".into()).stack_size(256 << 20)
+        .spawn(|| unsafe { serp_entry() }).expect("spawn main thread");
+    if t.join().is_err() { std::process::exit(101); }
+}
 """
 
 STUB_RS_BARE = """\
 extern "C" { fn serp_entry(); }
-fn main() { unsafe { serp_entry(); } }
+fn main() {
+    let t = std::thread::Builder::new().name("main".into()).stack_size(256 << 20)
+        .spawn(|| unsafe { serp_entry() }).expect("spawn main thread");
+    if t.join().is_err() { std::process::exit(101); }
+}
 """
 
 
@@ -77,6 +85,8 @@ def runtime_key(rustc: str) -> str:
     h = hashlib.sha256()
     for src in RT_SOURCES:
         h.update(src.read_bytes())
+    h.update(STUB_RS.encode())
+    h.update(STUB_RS_BARE.encode())
     ver = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout
     h.update(ver.encode())
     h.update(sys.platform.encode())

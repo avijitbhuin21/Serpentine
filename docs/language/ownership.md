@@ -95,6 +95,27 @@ Reads/writes go through a runtime borrow check (a conflict raises a catchable
 `RuntimeError`), and cycles leak unless broken with `Weak` (../decisions.md D3). Prefer
 ownership; reach for `Shared` when the shape of the data demands it.
 
+### 7.1 Reference cycles in long-running processes
+
+`Shared` is reference-counted with no cycle collector, so a cycle of strong handles is
+never freed. A one-shot CLI doesn't care. A server that builds a cycle per request leaks on
+every request until it runs out of memory. Rules that keep servers flat:
+
+- **One direction strong, the other `Weak`.** Parent→child is `Shared`, child→parent is
+  `Weak` (`downgrade(parent)`); walk up with `upgrade(w)`, which returns `None` once the parent
+  is gone. Doubly linked lists: `next` strong, `prev` weak. Observers and callbacks: the
+  subject holds `Weak` handles to observers.
+- **Per-request graphs should be owned, not shared.** Build request-local trees with
+  plain ownership (`list[Node]` plus integer indices for edges); they drop deterministically
+  when the handler returns.
+- **Long-lived caches own their entries.** Key a `dict` by id and hand out ids or copies,
+  rather than letting entries point back at the cache.
+- **Break cycles explicitly on teardown** when a strong cycle is unavoidable: set one edge to
+  `None` before dropping the last outside handle.
+- **Check for leaks under load.** `python tools/run_soak.py` drives a native Venom server
+  and fails if RSS or the handle count keeps growing after warm-up. Run it (or the same idea
+  against your own app) before deploying a service that uses `Shared`.
+
 ## 8. Files and `with`
 
 An open file is an owned value; dropping it closes it. `with open(path) as f:` makes the

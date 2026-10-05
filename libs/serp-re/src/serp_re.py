@@ -17,6 +17,10 @@ with 2+ groups raises (use finditer), groups() is a PyVal list (not a
 tuple), split() fills unmatched group parts with '' (not None), sub() repl
 is a string template (no callables), no inline flags, {m,n} capped at 1000,
 deep quantified matches recurse (very long inputs can exhaust the stack).
+ReDoS guard (divergence): each match attempt may run at most STEP_LIMIT VM
+steps and recurse at most MAX_DEPTH levels; catastrophic backtracking or
+very deep quantified matches raise error(...) instead of hanging or
+overflowing the stack.
 """
 from __future__ import annotations
 from serpentine import Ref, Mut, Owned, PyVal, dataclass, move
@@ -28,6 +32,8 @@ MULTILINE: int = 8
 S: int = 16
 DOTALL: int = 16
 NOFLAG: int = 0
+STEP_LIMIT: int = 1000000
+MAX_DEPTH: int = 10000
 
 DIGITS: str = "0123456789"
 LOWER: str = "abcdefghijklmnopqrstuvwxyz"
@@ -456,12 +462,17 @@ def _in_class(c: str, chars: str, ic: bool) -> bool:
 
 def _vm(prog: Ref[list[Inst]], text: str, pc: int, pos: int, anchor: int,
         caps: Mut[list[int]], marks: Mut[list[int]], ic: bool, dotall: bool,
-        ml: bool) -> int:
+        ml: bool, budget: Mut[list[int]], depth: int) -> int:
     """Recursive backtracking VM: end position of a match from (pc, pos), or -1."""
+    if depth > MAX_DEPTH:
+        raise error("regex recursion limit exceeded (input too long for this pattern)")
     p: int = pc
     at: int = pos
     n: int = len(text)
     while True:
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise error("regex step limit exceeded (catastrophic backtracking)")
         op: str = prog[p].op
         if op == "char":
             if at < n and _ch_eq(text[at], prog[p].ch, ic):
@@ -482,7 +493,7 @@ def _vm(prog: Ref[list[Inst]], text: str, pc: int, pos: int, anchor: int,
                 continue
             return -1
         if op == "split":
-            r: int = _vm(prog, text, p + prog[p].a, at, anchor, caps, marks, ic, dotall, ml)
+            r: int = _vm(prog, text, p + prog[p].a, at, anchor, caps, marks, ic, dotall, ml, budget, depth + 1)
             if r >= 0:
                 return r
             p = p + prog[p].b
@@ -494,7 +505,7 @@ def _vm(prog: Ref[list[Inst]], text: str, pc: int, pos: int, anchor: int,
             idx: int = prog[p].a
             old: int = caps[idx]
             caps[idx] = at
-            r2: int = _vm(prog, text, p + 1, at, anchor, caps, marks, ic, dotall, ml)
+            r2: int = _vm(prog, text, p + 1, at, anchor, caps, marks, ic, dotall, ml, budget, depth + 1)
             if r2 < 0:
                 caps[idx] = old
             return r2
@@ -502,7 +513,7 @@ def _vm(prog: Ref[list[Inst]], text: str, pc: int, pos: int, anchor: int,
             midx: int = prog[p].a
             mold: int = marks[midx]
             marks[midx] = at
-            r3: int = _vm(prog, text, p + 1, at, anchor, caps, marks, ic, dotall, ml)
+            r3: int = _vm(prog, text, p + 1, at, anchor, caps, marks, ic, dotall, ml, budget, depth + 1)
             if r3 < 0:
                 marks[midx] = mold
             return r3
@@ -568,7 +579,8 @@ def _run(prog: Ref[list[Inst]], text: str, pos: int, ngroups: int, nstars: int,
     ic: bool = (flags // 2) % 2 == 1
     ml: bool = (flags // 8) % 2 == 1
     dotall: bool = (flags // 16) % 2 == 1
-    end: int = _vm(prog, text, 0, pos, pos, caps, marks, ic, dotall, ml)
+    budget: list[int] = [STEP_LIMIT]
+    end: int = _vm(prog, text, 0, pos, pos, caps, marks, ic, dotall, ml, budget, 0)
     caps[0] = pos
     caps[1] = end
     return caps

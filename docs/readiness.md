@@ -18,8 +18,8 @@
 
 **Why not L3 yet:**
 1. There's no versioning/stability promise: everything is `0.x`. (Distribution, CHANGELOG and SECURITY.md are done.)
-2. There's no fuzzing or sanitizer coverage of the `unsafe` runtime. Its hand-written
-   network, regex and compression parsers face untrusted input.
+2. Hardening first pass is done (fuzzing, Miri/ASan, limits, tracebacks, TLS check, soak), but
+   there's no 24h Linux soak yet, no graceful SIGTERM drain, and Backend-B objects aren't sanitized.
 3. There are no database clients besides SQLite.
 4. There are no timezones, no metrics or tracing, and no debugger story.
 5. Performance and soak testing has only been done on one Windows box.
@@ -94,8 +94,7 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 - [x] **P1** Backend-A `continue`-inside-`except` bug: it was **still open** (rustc E0695) and is fixed 2026-09-30 with labeled loops. The same accept test (104) exposed a **silent miscompile in both backends**: `break`/`continue` leaving a `try` skipped the `finally`. Also fixed.
 - [x] **P1** Backend-A E0381 (a local assigned in a `try` body, used after a diverging handler): fixed 2026-09-30. Scalar and Optional try-assigned locals get a zero initializer; covered by accept 106. Non-Copy locals in the same shape still need pre-initialization, but the failure is a rustc error, never a miscompile.
 - [x] **P1** `return` inside `try`/`finally`: verified 2026-09-30 that it is **rejected at compile time** (SE201, reject r044), as is `break`/`continue` out of a `try` body. No silent `finally` skip is possible. Accept 105 covers the allowed shapes.
-- [ ] **P1** Compiler fuzzing: grammar/typed-AST fuzz that diffs CPython against both
-      backends, and checks the checker never crashes on arbitrary input.
+- [x] **P1** Compiler fuzzing (2026-09-30): `tools/run_compiler_fuzz.py` generates random well-typed programs and diffs CPython against both backends; 30/30 identical, and an 8-program smoke run is in CI. The checker-never-crashes-on-arbitrary-input variant is still open.
 - [ ] **P1** Scale test: compile time and memory on a 10k–50k LOC program. Whole-program
       compilation has never been measured past the libs.
 - [ ] **P2** Incremental / cached compilation for large projects.
@@ -106,21 +105,26 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 - [x] Ownership model rules out use-after-free and data races *in user code* (borrowck +
       rustc oracle).
 - [x] `serp add` verifies wheel sha256; `serp.lock` pins exact versions.
-- [ ] **P1** Audit the `unsafe` FFI runtime: `rt.rs` exports hundreds of `unsafe extern "C"`
-      functions over raw pointers. Run the corpora under Miri (Backend A) and ASan/UBSan
-      (Backend B).
-- [ ] **P1** Fuzz every hand-written parser that sees untrusted input: HTTP request parsing
-      (Venom/http-server), JSON, TOML, CSV, URL, regex compiler, DEFLATE inflate, zipfile,
-      base64, TLS glue.
-- [ ] **P1** ReDoS: the `serp-re` backtracking VM has no step limit or timeout.
-- [ ] **P1** Resource limits: decompression-bomb caps (zlib/zipfile); HTTP header/body size
-      limits, read timeouts and slowloris protection in Venom and http-server.
-- [?] **P1** TLS (schannel/OpenSSL): verify certificate + hostname validation, and
-      rejection of expired/self-signed certs by default in Fang.
+- [~] **P1** Audit the `unsafe` runtime (2026-09-30):
+      - **Miri** (`tools/run_miri.py`) runs Backend-A output for 19 FFI-free accept programs: all clean, no UB, stdout identical to CPython.
+      - **AddressSanitizer** (`tools/run_asan.py`, nightly `-Zsanitizer=address`) runs all 101 single-file accept programs: clean.
+      - Still open: ASan/UBSan on Backend B's LLVM objects, and Miri can't reach the FFI parts (sockets, TLS, SQLite).
+- [x] **P1** Fuzz the untrusted-input parsers (2026-09-30): `tools/run_fuzz.py` covers JSON, TOML, URL, base64, regex, raw/zlib/gzip inflate and CSV.
+      - 72k mutated cases over 4 seeds, CPython vs native: 0 divergences and 0 crashes after fixes. The only remaining difference is 2 known int64-vs-bignum cases.
+      - Real bugs it found and fixed: `bytes.fromhex` whitespace; zlib Adler-32 placement and trailing data; gzip multi-member/padding; `str.strip`/`split`/`int()` treating `\x1c`–`\x1f` as whitespace like CPython.
+      - A fixed-seed run is in CI. HTTP request parsing is covered by the limit tests rather than the fuzzer.
+- [x] **P1** ReDoS: `serp-re` caps each match attempt at 1M VM steps and 10k recursion levels, raising `serp_re.error` in both worlds (`libs/serp-re/tests/test_redos.py`).
+- [x] **P1** Resource limits (2026-09-30):
+      - zlib/gzip/zipfile output is capped at 256 MiB (`libs/serp-zlib/tests/test_bomb.py`, a real 289 MB bomb).
+      - HTTP bodies over 16 MiB get 413 before being read in http-server and in all three Venom readers (`test_limits.py`).
+      - Heads are capped at 64 KiB, with 10 s socket read timeouts.
+      - Slowloris is only partly handled: the timeout is per `recv`, not per request.
+- [x] **P1** TLS (2026-09-30): `tools/run_tls_check.py` against badssl.com.
+      - schannel: 6/6. Expired, self-signed, wrong-host and untrusted-root are refused with `OSError("certificate verify failed")`; the good site and `verify=False` return 200.
+      - The OpenSSL path (Linux/macOS) runs in CI as an informational step.
 - [~] **P1** `SECURITY.md` added 2026-09-30 (GitHub private vulnerability reporting, latest-only support). Still to do: enable private vulnerability reporting in the repo settings, and optionally add an email contact.
-- [ ] **P1** `Shared` reference cycles leak (D3). Needs guidance or detection for long-running
-      servers.
-- [ ] **P2** Dependency audit of the runtime's Rust crates (`cargo audit`) in CI.
+- [~] **P1** `Shared` reference cycles leak (D3). Guidance is written ([language/ownership.md](language/ownership.md) §7.1: `Weak` back-edges, owned per-request graphs, soak-check before deploying). There's still no runtime cycle detection.
+- [x] **P2** Dependency audit: the runtime links **zero third-party crates** (only the in-tree `serp_rt`; the native dependencies are OS schannel, a dynamically loaded OpenSSL, and system SQLite), so `cargo audit` has nothing to scan (verified 2026-09-30).
 
 ## 6. Running services in production (Venom stack)
 
@@ -130,16 +134,16 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
       runs on one i7 Windows box.
 - [ ] **P1** Re-benchmark on Linux server hardware, and against multiple load generators on
       separate hosts.
-- [ ] **P1** Soak test: 24h+ at steady load, checking RSS growth, fd/handle leaks and latency
-      drift.
-- [?] **P1** Graceful shutdown (SIGTERM/Ctrl-C drains in-flight requests), health checks, and
-      restart behavior under a process manager or container.
+- [~] **P1** Soak test. Bounded run done 2026-09-30 with `tools/run_soak.py` (native Venom, 3 workers, 8 keep-alive clients, 600 s, Windows):
+      10,433,661 requests (~17.3k rps); after warm-up RSS 5.7→5.7 MiB and handles 73→73. PASS.
+      A 24h+ run on Linux server hardware (with latency-drift tracking) is still to do.
+- [~] **P1** Shutdown and restart (2026-09-30): killing the server releases the listening port immediately, so a process manager can restart it at once (checked by `run_soak.py`).
+      **Not implemented:** graceful drain on SIGTERM/Ctrl-C (there's no signal handling, so in-flight requests are dropped), and a built-in health endpoint.
 - [ ] **P1** Venom middleware, `BackgroundTasks`, streaming responses, WebSockets, CORS
       ([libraries/venom.md](libraries/venom.md)).
 - [ ] **P1** Observability. `serp-log` exists, but there are no metrics (Prometheus) or
       tracing (OpenTelemetry) libs.
-- [?] **P1** Crash diagnostics: do native runtime errors report the `.py` file/line and a
-      traceback, or only the message? Make it the former.
+- [x] **P1** Crash diagnostics (2026-09-30): uncaught native errors print a CPython-style traceback (`.py` file, line and function per frame). It's recorded on the error path only, in both backends, and `tools/run_traceback_check.py` in CI checks the frames match CPython's.
 - [ ] **P2** Debugger support: DWARF/PDB line mapping back to the `.py` source for gdb/lldb/VS.
 - [ ] **P2** Profiling guide (perf/VTune/ETW on generated binaries).
 - [ ] **P2** HTTP/2; container image + deployment guide.
@@ -186,20 +190,13 @@ and Backend B on all three OSes, and the rustc-agreement harness reports 0 disag
 0. **Land L2 (immediate, short).** Commit + push the 2026-09-30 work, get CI green on all three
    OSes (§1), tag `v0.7.2` (silent-miscompile fix), then delete the stray artifacts and revoke the
    PyPI browser session.
-1. **Close the `finally` family (short, before hardening).** Test `return` inside `try`/`finally`.
-   It probably has the same silent skip that `break`/`continue` had, and silent wrong output is
-   worse than a crash. Then fix the Backend-A E0381 try-init disagreement (§4).
-2. **Harden (next major session)**, in this order, so each step makes the next one cheaper:
-   1. Crash diagnostics: native runtime errors report the `.py` file/line (§6). Every finding
-      from the later steps is then debuggable.
-   2. Deterministic limits: a `serp-re` step limit (ReDoS), decompression-bomb caps, and HTTP
-      header/body/timeout limits in Venom/http-server (§5).
-   3. TLS verification check in Fang: certificate, hostname, expired and self-signed (§5).
-   4. Fuzz the untrusted-input parsers (HTTP, JSON, TOML, CSV, URL, regex, DEFLATE, zip, base64)
-      and the compiler (differential fuzz of CPython vs both backends). Accept 104 found a silent
-      miscompile with a single hand-written test, which is strong evidence that fuzzing will find more.
-   5. Sanitizers: the corpora under Miri (Backend A) and ASan/UBSan (Backend B), plus `cargo audit`.
-   6. Soak test (24h, RSS/handle growth), graceful shutdown, and `Shared` cycle-leak guidance (§5–6).
+1. **Close the `finally` family — DONE 2026-09-30.** `return` in `try`/`finally` is rejected at
+   compile time (SE201), and the E0381 try-init disagreement is fixed (accept 105/106).
+2. **Harden — DONE 2026-09-30** (first pass): crash tracebacks, ReDoS/bomb/body limits, 256 MiB
+   stacks, a TLS check, parser + compiler differential fuzzers (which found and fixed 4 real
+   divergences), Miri 19/19 and ASan 101/101 clean, and a 10-minute soak PASS.
+   Still open for L3: a 24h Linux soak, graceful SIGTERM drain, Backend-B sanitizers, and making
+   the checker never crash on arbitrary input.
 3. **Fill production gaps.** Postgres/Redis clients, timezones, hmac/JWT, metrics, and Venom
    middleware.
 4. **Adoption.** Section 8 DX, section 9 platforms, section 10 governance, the versioning policy, then

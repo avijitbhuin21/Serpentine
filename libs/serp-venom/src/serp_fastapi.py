@@ -17,7 +17,7 @@ handlers `-> Response`); `HTTPException` carries its status/detail in the messag
 from __future__ import annotations
 
 from serpentine import Callable, Mut, Owned, PyVal, Ref, block_on, dataclass, move, registrar
-from serp_http_server import (BaseHTTPRequestHandler, HTTPServer, _Headers,
+from serp_http_server import (BaseHTTPRequestHandler, HTTPServer, MAX_BODY, _Headers,
                               _digits_ok, _read_head)
 from _serp_socket import accept as _accept
 from _serp_socket import accept_nb as _accept_nb
@@ -815,6 +815,8 @@ def _parse_request(conn: int) -> _Parsed:
             if hname == "content-length" and _digits_ok(hval):
                 clen = int(hval)
         i += 1
+    if clen > MAX_BODY:
+        return _Parsed(False, "413", "", {}, "", False)
     acc: bytearray = bytearray(rest)
     while len(acc) < clen:
         chunk: bytes = _recv(conn, 4096)
@@ -852,11 +854,22 @@ def _write_response(conn: int, resp: Ref[Response], keep: bool) -> None:
         _close(conn)
 
 
+def _reject(conn: int, why: str) -> None:
+    """Close a connection whose request failed to parse, replying 413 when the body was oversize."""
+    if why == "413":
+        try:
+            n: int = _send_all(conn, b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\n"
+                                     b"connection: close\r\n\r\n", 0)
+        except OSError as e:
+            pass
+    _close(conn)
+
+
 def _handle_conn(app: Ref[FastAPI], conn: int) -> bool:
     """Serve one request on an open connection; True if it should be kept alive."""
     p: _Parsed = _parse_request(conn)
     if not p.ok:
-        _close(conn)
+        _reject(conn, p.method)
         return False
     resp: Response = app._handle(p.method, p.target, move(p.headers), p.body)
     _write_response(conn, resp, p.keep)
@@ -868,7 +881,7 @@ async def _handle_conn_async(app: Ref[FastAPI], conn: int) -> int:
     Returns -1 (peer gone, nothing served), 0 (served, connection closed) or 1 (served, keep)."""
     p: _Parsed = _parse_request(conn)
     if not p.ok:
-        _close(conn)
+        _reject(conn, p.method)
         return -1
     resp: Response = await app._handle_async(p.method, p.target, move(p.headers), p.body)
     _write_response(conn, resp, p.keep)
@@ -1022,6 +1035,8 @@ def _serve_buffered(app: Ref[FastAPI], conn: int, raw: Ref[bytes]) -> tuple[int,
     if v is not None:
         if _digits_ok(v):
             clen = int(v)
+    if clen > MAX_BODY:
+        return (-1, False)
     total: int = sep + 4 + clen
     if len(raw) < total:
         return (0, True)

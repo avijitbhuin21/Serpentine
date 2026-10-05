@@ -1,6 +1,7 @@
 """The serp CLI: check and build subcommands."""
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -134,8 +135,9 @@ def cmd_build(args: argparse.Namespace) -> int:
         print(f"serp: rust source kept at {keep}")
 
     opt = "0" if args.debug else "2"
+    extra = os.environ.get("SERP_RUSTC_FLAGS", "").split()
     proc = subprocess.run(
-        [rustc, "--edition", "2021", "-C", f"opt-level={opt}", "-o", str(out), str(rs_file)],
+        [rustc, "--edition", "2021", "-C", f"opt-level={opt}", *extra, "-o", str(out), str(rs_file)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if proc.returncode != 0:
