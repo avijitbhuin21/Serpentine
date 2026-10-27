@@ -6,7 +6,7 @@
 > `[ ]` open · `[~]` partial · `[x]` done. Priority: **P1** blocks production services with real
 > users, **P2** is needed for broad adoption. Every done item names its evidence.
 >
-> Last assessed: **2026-10-27** (compiler 0.7.3 prepared, unreleased; L3 pass pushed to `master` (CI green on 3 OSes), every dist built and tested from a clean-venv install; repo public).
+> Last assessed: **2026-10-27** (compiler 0.7.3 + shim 0.9.1 released; CI green on 3 OSes; verified from a clean PyPI install; repo public).
 
 ## Verdict
 
@@ -34,7 +34,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 ### Release & process
 
-- [~] **Release 0.7.3.** Prepared (version bump, CHANGELOG `[0.7.3]`) but not tagged/published; publishing to PyPI is irreversible and waits for the maintainer. The prebuilt `dist-rt` runtime needs refreshing (prelude.rs/rt.rs changed).
+- [x] **Release 0.7.3.** Tagged `v0.7.3` 2026-10-27 (release run 40518539601): `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI, prebuilt runtimes for linux-x86_64/macos-arm64/windows-x86_64 on the GitHub Release; 11 bumped + 4 new libs published. Verified from a clean PyPI install (`serp new` → `serp add serp-venom/serp-molt/serp-hmac` → both backends = CPython). `serp-jwt`, `serp-redis`, `serp-tracing` wait on PyPI's new-project rate limit (429).
 - [x] **Stability & versioning policy**: [stability.md](stability.md) (SemVer rules for `0.x`, per-surface guarantees for programs, SE codes, CLI, `serp.toml`, runtime ABI, shim and libraries; deprecation; road to 1.0).
 - [x] **Enable GitHub private vulnerability reporting.** Repo made public 2026-10-27; `gh api repos/avijitbhuin21/Serpentine/private-vulnerability-reporting` → `{"enabled": true}`. [SECURITY.md](../SECURITY.md) points reporters to it.
 - [x] **Stabilize flaky lib tests:** `test_async_fang`: the test server closed with an unread POST body, so Windows sent RST and the response was lost (1/5 → 20/20 under CPython). `test_asyncio`: equal-deadline sleeps and 10 ms margins (now 32/32 per backend at 8 concurrent runs).
@@ -91,8 +91,8 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 **Source control, CI, releases**
 
 - [x] Three-OS CI (ubuntu/macos/windows): accept/reject corpora, both backend differentials, rustc agreement, LSP smoke, every lib suite, tracebacks, parser + compiler fuzz smoke, TLS check.
-- [x] `serpentine-lang` 0.7.2 + `serpentine-shim` 0.9.0 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
-- [x] All 37 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`).
+- [x] `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
+- [x] 41 of 44 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`); `serp-jwt`/`serp-redis`/`serp-tracing` pending PyPI's new-project limit.
 - [x] `CHANGELOG.md`, `SECURITY.md`, README CI/PyPI badges and an experimental-status warning.
 
 **Language** ([features.md](features.md), [spec.md](spec.md))
