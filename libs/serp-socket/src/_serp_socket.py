@@ -20,7 +20,8 @@ import time as _time
 __all__ = ["connect", "tls_connect", "listen", "accept", "send", "send_all",
            "recv", "shutdown_write", "set_timeout", "local_port", "close",
            "udp_bind", "udp_send_to", "udp_recv_from", "udp_peer_host",
-           "udp_peer_port", "set_nonblocking", "set_async", "accept_nb", "poll_ready"]
+           "udp_peer_port", "set_nonblocking", "set_async", "accept_nb", "poll_ready",
+           "shutdown_install", "shutdown_requested", "shutdown_request"]
 
 _socks: dict[int, list] = {}
 _next_h: list[int] = [0]
@@ -80,6 +81,7 @@ def accept_nb(h: int) -> int:
         raise ValueError("accept_nb() needs a listener")
     try:
         c, _addr = rec[0].accept()
+        c.setblocking(True)
         c.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
         return _push(c, "tcp")
     except BlockingIOError:
@@ -298,6 +300,38 @@ def close(h: int) -> None:
     rec = _get(h)
     rec[0].close()
     del _socks[h]
+
+
+_shutdown: list[bool] = [False]
+
+
+def _on_signal(signum, frame) -> None:
+    """First SIGINT/SIGTERM requests a graceful stop; a second one exits immediately."""
+    if _shutdown[0]:
+        raise SystemExit(130)
+    _shutdown[0] = True
+
+
+def shutdown_install() -> None:
+    """Route SIGINT/SIGTERM (Ctrl-C) to the graceful-shutdown flag."""
+    import signal as _signal
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(_signal, name, None)
+        if sig is not None:
+            try:
+                _signal.signal(sig, _on_signal)
+            except (ValueError, OSError):
+                pass
+
+
+def shutdown_requested() -> bool:
+    """True once a shutdown signal arrived or shutdown_request() was called."""
+    return _shutdown[0]
+
+
+def shutdown_request() -> None:
+    """Ask every serve loop in the process to drain and return."""
+    _shutdown[0] = True
 
 
 def udp_bind(host: str, port: int) -> int:

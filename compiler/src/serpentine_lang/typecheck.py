@@ -155,7 +155,7 @@ OP_DUNDERS = set(BINOP_DUNDER.values()) | set(CMP_DUNDER.values()) | set(EQ_DUND
     {"__neg__", "__invert__", "__getitem__", "__setitem__", "__len__"}
 # Non-operator dunders with dedicated support (Tier-2 protocol forms).
 ALLOWED_DUNDERS = OP_DUNDERS | {"__str__", "__repr__", "__post_init__", "__init__",
-                                "__setattr__",
+                                 "__setattr__", "__abs__",
                                 "__next__", "__iter__",
                                 "__enter__", "__exit__", "__aenter__", "__aexit__"}
 
@@ -1921,6 +1921,8 @@ class TypeChecker:
         self.try_stack: list[dict] = []
         self.handler_depth = 0
         self.captured_frozen: set[str] = set()    # names captured by a lambda (immutable after)
+        self.frozen_noncopy: set[str] = set()     # non-Copy captures: no mutation/move after
+        self.lambda_caps_active: list[set[str]] = []   # non-Copy captures of lambdas being typed
         self.loop_assigned = set()                # names stored anywhere inside a loop
         for n in ast.walk(fn):
             if isinstance(n, (ast.For, ast.While)):
@@ -3524,10 +3526,6 @@ class TypeChecker:
                       "target or parameter it is assigned to", node)
             raise AssertionError
         la = node.args
-        if isinstance(expect.ret, TNone):
-            self._err("SE201", "unsupported-feature",
-                      "a lambda cannot have return type None — use a named function "
-                      "reference instead", node)
         if la.posonlyargs or la.kwonlyargs or la.vararg or la.kwarg or la.defaults:
             self._err("SE201", "unsupported-feature",
                       "lambdas take plain positional parameters only", node)
@@ -3535,6 +3533,8 @@ class TypeChecker:
             self._err("SE214", "type-mismatch",
                       f"lambda takes {len(la.args)} parameters but {expect} expects "
                       f"{len(expect.params)}", node)
+        caps = self._lambda_captures(node)
+        noncopy = {name for name, t in caps if not t.is_copy()}
         saved: dict[str, tuple | None] = {}
         for a, pt in zip(la.args, expect.params):
             if a.annotation is not None:
@@ -3545,8 +3545,9 @@ class TypeChecker:
             self.env[a.arg] = (pt, "local")
         inner_narrow = {k: v for k, v in narrow.items()
                         if k.split(".")[0] not in saved}
+        self.lambda_caps_active.append(noncopy)
         bt = self._type_expr(node.body, inner_narrow, expect=expect.ret)
-        caps = self._lambda_captures(node)
+        self.lambda_caps_active.pop()
         for a in la.args:
             if saved[a.arg] is None:
                 self.env.pop(a.arg, None)
@@ -3558,6 +3559,7 @@ class TypeChecker:
                       node.body)
         for name, _t in caps:
             self.captured_frozen.add(name)
+        self.frozen_noncopy |= noncopy
         self.lambda_caps[id(node)] = caps
         return expect
 
@@ -3579,10 +3581,12 @@ class TypeChecker:
             if n.id in bound or n.id in caps or n.id not in self.env:
                 continue
             t = self.env[n.id][0]
-            if not t.is_copy():
-                self._err("SE003", "implicit-transfer",
-                          f"lambda captures non-Copy '{n.id}' ({t}) — captures are "
-                          f"by-value copies, so only Copy types can be captured", n)
+            if not t.is_copy() and self.loop_depth > 0:
+                self._err("SE005", "move-while-borrowed",
+                          f"lambda inside a loop captures non-Copy '{n.id}' ({t}) — the "
+                          f"capture is a copy, and a later iteration could change the "
+                          f"original before the closure runs; build the closure outside the "
+                          f"loop or capture Copy values", n)
             if n.id in self.loop_assigned:
                 self._err("SE005", "move-while-borrowed",
                           f"lambda captures '{n.id}', which is assigned inside a loop — "
@@ -4063,6 +4067,15 @@ class TypeChecker:
             self._err("SE214", "type-mismatch", "move() takes exactly one argument", node)
         arg = node.args[0]
         self.move_calls.add(id(node))
+        if isinstance(arg, ast.Name):
+            if any(arg.id in active for active in self.lambda_caps_active):
+                self._err("SE004", "conflicting-borrow",
+                          f"a lambda may not move its captured '{arg.id}' — it would be "
+                          f"gone on the second call", node)
+            if arg.id in self.frozen_noncopy:
+                self._err("SE004", "conflicting-borrow",
+                          f"'{arg.id}' was captured by a lambda — moving it afterwards would "
+                          f"diverge from CPython (the closure would still see the object)", node)
         t = self._type_expr(arg, narrow)
         if t.is_copy():
             return t
@@ -4153,6 +4166,15 @@ class TypeChecker:
 
     def _mut_root_check(self, root: str, node: ast.AST) -> None:
         """Reject mutation through a per-iteration Ref loop variable (matches rustc)."""
+        for active in self.lambda_caps_active:
+            if root in active:
+                self._err("SE004", "conflicting-borrow",
+                          f"a lambda may not mutate its captured non-Copy '{root}' — the "
+                          f"capture is a copy, while CPython would mutate the shared object", node)
+        if root in self.frozen_noncopy:
+            self._err("SE004", "conflicting-borrow",
+                      f"'{root}' was captured by a lambda — mutating it afterwards would "
+                      f"diverge from CPython (the closure holds a copy, CPython shares it)", node)
         for scope in self.loop_refs:
             if root in scope:
                 self._err("SE004", "conflicting-borrow",
@@ -4365,6 +4387,11 @@ class TypeChecker:
             return ts[0]
         if name == "abs":
             arity(1)
+            t0 = ts[0].inner if isinstance(ts[0], TShared) else ts[0]
+            if isinstance(t0, TClass):
+                r = self._op_method_call(node, args[0], "__abs__", [], narrow)
+                if r is not None:
+                    return r
             if isinstance(ts[0], TBool) or not isinstance(ts[0], NUMERIC):
                 self._err("SE214", "type-mismatch", f"abs() needs a number, got {ts[0]}", node)
             return ts[0]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-url"
-version = "0.1.0"
+version = "0.1.1"
 description = "Serpentine URL toolkit: url_parse, quote/unquote, quote_plus/unquote_plus, urlencode, parse_query (pure Serpentine, dual-runs under CPython)"
 readme = "README.md"
 license = { text = "MIT" }

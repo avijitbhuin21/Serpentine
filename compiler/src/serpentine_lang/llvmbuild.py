@@ -13,6 +13,7 @@ library; Backend-B objects link against it. Two platform link paths:
 """
 
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,11 @@ def _fallback_cache_root() -> Path:
     return Path(tempfile.gettempdir()) / "serp" / "rt"
 
 
+def _extra_flags() -> list[str]:
+    """Extra rustc flags from SERP_RUSTC_FLAGS (sanitizer builds); part of the runtime cache key."""
+    return os.environ.get("SERP_RUSTC_FLAGS", "").split()
+
+
 def runtime_key(rustc: str) -> str:
     """Cache key: runtime sources + rustc version identify the artifact."""
     h = hashlib.sha256()
@@ -90,6 +96,7 @@ def runtime_key(rustc: str) -> str:
     ver = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout
     h.update(ver.encode())
     h.update(sys.platform.encode())
+    h.update(" ".join(_extra_flags()).encode())
     return h.hexdigest()[:16]
 
 
@@ -204,7 +211,7 @@ def ensure_runtime(verbose: bool = False) -> tuple[Path, list[str], Path]:
             hit = _runtime_hit(root / key)
             if hit is not None:
                 return hit
-    hit = _try_prebuilt(rustc, verbose)
+    hit = _try_prebuilt(rustc, verbose) if not _extra_flags() else None
     if hit is not None:
         return hit
     if rustc is None:
@@ -215,7 +222,9 @@ def ensure_runtime(verbose: bool = False) -> tuple[Path, list[str], Path]:
     try:
         return _ensure_runtime_at(_cache_root() / key, rustc, verbose)
     except LLVMBuildError as exc:
-        if "couldn't read" not in str(exc):
+        # The Microsoft Store Python virtualizes writes under %LOCALAPPDATA%, so rustc
+        # (outside the sandbox) can't see files Python just wrote there.
+        if "couldn't read" not in str(exc) and "couldn't find file" not in str(exc):
             raise
         return _ensure_runtime_at(_fallback_cache_root() / key, rustc, verbose)
 
@@ -271,7 +280,7 @@ def _ensure_runtime_at(cache: Path, rustc: str, verbose: bool) -> tuple[Path, li
     cmd = [rustc, "--edition", "2021", "--crate-type", crate_type,
            "--crate-name", "serp_rt", "-C", "opt-level=3",
            "--print", "native-static-libs",
-           "-o", str(lib), str(combined)]
+           "-o", str(lib), str(combined)] + _extra_flags()
     proc = _run(cmd, "runtime library build (rustc)")
     native = []
     for line in proc.stderr.splitlines():
@@ -280,7 +289,7 @@ def _ensure_runtime_at(cache: Path, rustc: str, verbose: bool) -> tuple[Path, li
     libs_file.write_text(" ".join(native))
     _run([rustc, "--edition", "2021", "--crate-type", "rlib",
           "--crate-name", "serp_rt", "-C", "opt-level=3",
-          "-C", "codegen-units=1", "--emit", f"llvm-bc={bc}", str(combined)],
+          "-C", "codegen-units=1", "--emit", f"llvm-bc={bc}", str(combined)] + _extra_flags(),
          "runtime bitcode build (rustc)")
     return lib, native, bc
 
@@ -420,7 +429,7 @@ def link(obj: Path, out: Path, debug: bool, runtime_merged: bool = False,
     lib, native, _bc = ensure_runtime(verbose=True)
     if sys.platform == "win32":
         native = list(native) + [n for n in _win_runtime_syslibs() if n not in native]
-        if _win_fastlink(obj, out, debuginfo, lib, runtime_merged, native):
+        if not _extra_flags() and _win_fastlink(obj, out, debuginfo, lib, runtime_merged, native):
             return
         rustc = _rustc()
         with tempfile.TemporaryDirectory(prefix="serp_link_") as td:
@@ -430,7 +439,7 @@ def link(obj: Path, out: Path, debug: bool, runtime_merged: bool = False,
             cmd = [rustc, "--edition", "2021", "-C", "opt-level=0",
                    "-C", f"link-arg={obj}",
                    "-C", "link-arg=/STACK:16777216",
-                   "-o", str(out), str(stub)]
+                   "-o", str(out), str(stub)] + _extra_flags()
             if not runtime_merged:
                 cmd[5:5] = ["--extern", f"serp_rt={lib}"]
             else:

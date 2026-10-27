@@ -7,7 +7,7 @@ accumulated buffer (O(n) memory); no name/digest_size attributes or new().
 """
 from __future__ import annotations
 from serpentine import Ref, Mut, dataclass
-from serp_hashlib_core import h_sha256_hex, h_sha1_hex, h_md5_hex
+from serp_hashlib_core import h_sha256_hex, h_sha1_hex, h_md5_hex, h_pbkdf2
 
 
 @dataclass
@@ -77,3 +77,14 @@ def md5(data: bytes | None = None) -> Md5:
     if data is None:
         return Md5(b"")
     return Md5(data)
+
+
+def pbkdf2_hmac(hash_name: str, password: bytes, salt: bytes, iterations: int,
+                dklen: int | None = None) -> bytes:
+    """PBKDF2 with HMAC (hashlib.pbkdf2_hmac); native builds derive the key in the runtime."""
+    n: int = 0
+    if dklen is not None:
+        n = dklen
+        if n < 1:
+            raise ValueError("key length must be greater than 0.")
+    return h_pbkdf2(hash_name, password, salt, iterations, n)

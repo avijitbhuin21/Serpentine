@@ -6,8 +6,8 @@ version = "0.3.1"
 roots = ["src", "../serp-url/src", "../serp-base64/src", "../serp-json/src", "../serp-io/src", "../serp-zlib/src"]
 
 [dependencies]
-serp-socket = "0.1.0"
-serp-url = "0.1.0"
+serp-socket = "0.2.0"
+serp-url = "0.1.1"
 serp-base64 = "0.1.0"
 serp-json = "0.2.0"
 serpentine-io = "0.1.0"

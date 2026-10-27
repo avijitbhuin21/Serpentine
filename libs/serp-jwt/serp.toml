@@ -1,0 +1,12 @@
+[project]
+name = "serp-jwt"
+version = "0.1.0"
+
+[build]
+roots = ["src", "../serp-json/src", "../serp-base64/src", "../serp-hashlib/src"]
+
+[dependencies]
+serp-json = "0.2.0"
+serp-base64 = "0.1.0"
+serp-hashlib = "0.2.0"
+serp-time = "0.1.0"

@@ -11,7 +11,7 @@ class (subtract a timedelta by adding its negation), no strftime/timezones/
 local-time today()/now(). Dt is the original plain UTC helper dataclass.
 """
 from __future__ import annotations
-from serpentine import Mut, Ref, dataclass
+from serpentine import Mut, Ref, Owned, dataclass, move
 from serp_time import time
 
 DAYS_TO_UNIX: int = 719468
@@ -188,17 +188,70 @@ def _digits(s: str) -> bool:
     return True
 
 
+def _parse_offset(text: str, s: str) -> int:
+    """Microseconds of an ISO offset body (`HH`, `HHMM`, `HH:MM`, `HH:MM:SS[.ffffff]`)."""
+    frac: str = ""
+    body: str = text
+    at: int = body.find(".")
+    if at >= 0:
+        frac = body[at + 1:]
+        body = body[:at]
+    hh: str = ""
+    mm: str = "00"
+    ss: str = "00"
+    if body.find(":") >= 0:
+        segs: list[str] = body.split(":")
+        if len(segs) < 2 or len(segs) > 3:
+            raise ValueError(f"Invalid isoformat string: {s!r}")
+        hh = segs[0]
+        mm = segs[1]
+        if len(segs) == 3:
+            ss = segs[2]
+    elif len(body) == 4:
+        hh = body[:2]
+        mm = body[2:]
+    else:
+        hh = body
+    if len(hh) != 2 or len(mm) != 2 or len(ss) != 2 or not _digits(hh) \
+            or not _digits(mm) or not _digits(ss):
+        raise ValueError(f"Invalid isoformat string: {s!r}")
+    us: int = 0
+    if len(frac) > 0:
+        if not _digits(frac) or len(frac) > 6:
+            raise ValueError(f"Invalid isoformat string: {s!r}")
+        padded: str = frac
+        while len(padded) < 6:
+            padded = padded + "0"
+        us = int(padded)
+    return ((int(hh) * 60 + int(mm)) * 60 + int(ss)) * 1000000 + us
+
+
 def _parse_iso_parts(s: str) -> list[int]:
-    """[year, month, day, hour, minute, second, microsecond] from ISO 8601 text."""
+    """[year, month, day, hour, minute, second, microsecond, has_tz, offset_us] from ISO 8601 text."""
     body: str = s
-    n: int = len(body)
-    if n > 0 and (body.endswith("Z") or body.endswith("z")):
-        body = body[:n - 1]
+    has_tz: int = 0
+    off_us: int = 0
     date_part: str = body
     time_part: str = ""
     if len(body) > 10:
         date_part = body[:10]
         time_part = body[11:]
+    nt: int = len(time_part)
+    if nt > 0 and (time_part.endswith("Z") or time_part.endswith("z")):
+        time_part = time_part[:nt - 1]
+        has_tz = 1
+    else:
+        sign_at: int = time_part.find("+")
+        sign: int = 1
+        if sign_at < 0:
+            sign_at = time_part.find("-")
+            sign = -1
+        if sign_at >= 0:
+            off_us = sign * _parse_offset(time_part[sign_at + 1:], s)
+            if off_us <= -86400000000 or off_us >= 86400000000:
+                raise ValueError(f"Invalid isoformat string: {s!r}")
+            time_part = time_part[:sign_at]
+            has_tz = 1
     dsegs: list[str] = date_part.split("-")
     if len(dsegs) != 3 or len(dsegs[0]) != 4 or not _digits(dsegs[0]) \
             or not _digits(dsegs[1]) or not _digits(dsegs[2]):
@@ -233,7 +286,7 @@ def _parse_iso_parts(s: str) -> list[int]:
             while len(padded) < 6:
                 padded = padded + "0"
             us = int(padded)
-    return [int(dsegs[0]), int(dsegs[1]), int(dsegs[2]), hh, mi, ss, us]
+    return [int(dsegs[0]), int(dsegs[1]), int(dsegs[2]), hh, mi, ss, us, has_tz, off_us]
 
 
 MINYEAR: int = 1
@@ -328,6 +381,72 @@ def _td_from_us(us: int) -> timedelta:
     return timedelta(d, rem // 1000000, rem % 1000000)
 
 
+def _fmt_offset(us: int, sep: str) -> str:
+    """Render a UTC offset as ±HH<sep>MM[<sep>SS[.ffffff]] (CPython's tzname/isoformat style)."""
+    sign: str = "+"
+    v: int = us
+    if v < 0:
+        sign = "-"
+        v = -v
+    micro: int = v % 1000000
+    secs: int = v // 1000000
+    s: str = sign + _pad(secs // 3600, 2) + sep + _pad((secs // 60) % 60, 2)
+    if secs % 60 != 0 or micro != 0:
+        s = s + sep + _pad(secs % 60, 2)
+    if micro != 0:
+        s = s + "." + _pad(micro, 6)
+    return s
+
+
+@dataclass
+class timezone:
+    offset: timedelta
+    name: str | None = None
+
+    def __post_init__(self: Mut[timezone]) -> None:
+        us: int = self.offset._total_us()
+        if us <= -86400000000 or us >= 86400000000:
+            raise ValueError("offset must be a timedelta strictly between "
+                             "-timedelta(hours=24) and timedelta(hours=24), "
+                             f"not {self.offset!r}.")
+
+    def utcoffset(self: Ref[timezone], dt: None = None) -> timedelta:
+        return _td_from_us(self.offset._total_us())
+
+    def dst(self: Ref[timezone], dt: None = None) -> None:
+        return None
+
+    def tzname(self: Ref[timezone], dt: None = None) -> str:
+        if self.name is not None:
+            return self.name
+        us: int = self.offset._total_us()
+        if us == 0:
+            return "UTC"
+        return "UTC" + _fmt_offset(us, ":")
+
+    def __str__(self: Ref[timezone]) -> str:
+        return self.tzname()
+
+    def __repr__(self: Ref[timezone]) -> str:
+        if self.name is None:
+            if self.offset._total_us() == 0:
+                return "datetime.timezone.utc"
+            return f"datetime.timezone({self.offset!r})"
+        return f"datetime.timezone({self.offset!r}, {self.name!r})"
+
+    def __eq__(self: Ref[timezone], other: Ref[timezone]) -> bool:
+        return self.offset._total_us() == other.offset._total_us()
+
+
+timezone.utc = timezone(timedelta(0))
+UTC = timezone(timedelta(0))
+
+
+def _tz_clone(t: Ref[timezone]) -> timezone:
+    """An equal, independently owned copy of a timezone."""
+    return timezone(_td_from_us(t.offset._total_us()), t.name)
+
+
 def _check_date_fields(year: int, month: int, day: int) -> None:
     """Validate date fields with CPython 3.11's messages."""
     if year < MINYEAR or year > MAXYEAR:
@@ -410,6 +529,7 @@ class datetime:
     minute: int = 0
     second: int = 0
     microsecond: int = 0
+    tzinfo: timezone | None = None
 
     def __post_init__(self: Mut[datetime]) -> None:
         _check_date_fields(self.year, self.month, self.day)
@@ -429,6 +549,8 @@ class datetime:
             s = s + f", {self.second}"
         if self.microsecond != 0:
             s = s + f", {self.microsecond}"
+        if self.tzinfo is not None:
+            s = s + f", tzinfo={self.tzinfo!r}"
         return s + ")"
 
     @staticmethod
@@ -436,24 +558,54 @@ class datetime:
         return _dt_from_us(int(time() * 1000000.0))
 
     @staticmethod
-    def fromisoformat(text: str) -> datetime:
-        """Parse ISO 8601 text (`YYYY-MM-DD[THH:MM[:SS[.ffffff]]]`, trailing `Z` ignored)."""
-        p: list[int] = _parse_iso_parts(text)
-        return datetime(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+    def now(tz: Owned[timezone | None] = None) -> datetime:
+        """The current time; aware in `tz` when given, else naive UTC (stdlib: local time)."""
+        return _from_utc_us(int(time() * 1000000.0), move(tz))
 
     @staticmethod
-    def fromtimestamp(ts: float) -> datetime:
-        """The naive UTC datetime for a Unix timestamp (stdlib uses local time)."""
-        return _dt_from_us(int(ts * 1000000.0))
+    def fromisoformat(text: str) -> datetime:
+        """Parse ISO 8601 text (`YYYY-MM-DD[THH:MM[:SS[.ffffff]]][Z|±HH:MM[:SS]]`)."""
+        p: list[int] = _parse_iso_parts(text)
+        if p[7] == 0:
+            return datetime(p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+        return datetime(p[0], p[1], p[2], p[3], p[4], p[5], p[6],
+                        tzinfo=timezone(_td_from_us(p[8])))
+
+    @staticmethod
+    def fromtimestamp(ts: float, tz: Owned[timezone | None] = None) -> datetime:
+        """The datetime for a Unix timestamp: aware in `tz` when given, else naive UTC (stdlib: local)."""
+        return _from_utc_us(int(ts * 1000000.0), move(tz))
 
     def date(self: Ref[datetime]) -> date:
         return date(self.year, self.month, self.day)
+
+    def utcoffset(self: Ref[datetime]) -> timedelta | None:
+        if self.tzinfo is None:
+            return None
+        return self.tzinfo.utcoffset()
+
+    def tzname(self: Ref[datetime]) -> str | None:
+        if self.tzinfo is None:
+            return None
+        return self.tzinfo.tzname()
+
+    def _tz(self: Ref[datetime]) -> timezone | None:
+        if self.tzinfo is None:
+            return None
+        return _tz_clone(self.tzinfo)
+
+    def _off_us(self: Ref[datetime]) -> int:
+        if self.tzinfo is None:
+            return 0
+        return self.tzinfo.offset._total_us()
 
     def isoformat(self: Ref[datetime], sep: str = "T") -> str:
         d: str = f"{_pad(self.year, 4)}-{_pad(self.month, 2)}-{_pad(self.day, 2)}"
         t: str = f"{_pad(self.hour, 2)}:{_pad(self.minute, 2)}:{_pad(self.second, 2)}"
         if self.microsecond != 0:
             t = t + "." + _pad(self.microsecond, 6)
+        if self.tzinfo is not None:
+            t = t + _fmt_offset(self._off_us(), ":")
         return d + sep + t
 
     def __str__(self: Ref[datetime]) -> str:
@@ -473,23 +625,69 @@ class datetime:
         return ((days * 86400 + self.hour * 3600 + self.minute * 60
                  + self.second) * 1000000 + self.microsecond)
 
+    def _utc_us(self: Ref[datetime]) -> int:
+        return self._total_us() - self._off_us()
+
+    def timestamp(self: Ref[datetime]) -> float:
+        """Seconds since the epoch; naive values are taken as UTC (stdlib: local time)."""
+        return self._utc_us() / 1000000.0
+
+    def astimezone(self: Ref[datetime], tz: Ref[timezone]) -> datetime:
+        """The same instant expressed in `tz` (naive values are taken as UTC)."""
+        return _from_utc_us(self._utc_us(), _tz_clone(tz))
+
+    def replace(self: Ref[datetime], year: int = -1, month: int = -1, day: int = -1,
+                hour: int = -1, minute: int = -1, second: int = -1,
+                microsecond: int = -1) -> datetime:
+        return datetime(self.year if year < 0 else year,
+                        self.month if month < 0 else month,
+                        self.day if day < 0 else day,
+                        self.hour if hour < 0 else hour,
+                        self.minute if minute < 0 else minute,
+                        self.second if second < 0 else second,
+                        self.microsecond if microsecond < 0 else microsecond,
+                        self._tz())
+
+    def _cmp_key(self: Ref[datetime], other: Ref[datetime]) -> int:
+        if (self.tzinfo is None) != (other.tzinfo is None):
+            raise TypeError("can't compare offset-naive and offset-aware datetimes")
+        return self._utc_us() - other._utc_us()
+
     def __sub__(self: Ref[datetime], other: Ref[datetime]) -> timedelta:
-        return _td_from_us(self._total_us() - other._total_us())
+        if (self.tzinfo is None) != (other.tzinfo is None):
+            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
+        return _td_from_us(self._utc_us() - other._utc_us())
 
     def __add__(self: Ref[datetime], other: Ref[timedelta]) -> datetime:
-        return _dt_from_us(self._total_us() + other._total_us())
+        moved: datetime = _dt_from_us(self._total_us() + other._total_us())
+        moved.tzinfo = self._tz()
+        return moved
+
+    def __eq__(self: Ref[datetime], other: Ref[datetime]) -> bool:
+        if (self.tzinfo is None) != (other.tzinfo is None):
+            return False
+        return self._utc_us() == other._utc_us()
 
     def __lt__(self: Ref[datetime], other: Ref[datetime]) -> bool:
-        return self._total_us() < other._total_us()
+        return self._cmp_key(other) < 0
 
     def __le__(self: Ref[datetime], other: Ref[datetime]) -> bool:
-        return self._total_us() <= other._total_us()
+        return self._cmp_key(other) <= 0
 
     def __gt__(self: Ref[datetime], other: Ref[datetime]) -> bool:
-        return self._total_us() > other._total_us()
+        return self._cmp_key(other) > 0
 
     def __ge__(self: Ref[datetime], other: Ref[datetime]) -> bool:
-        return self._total_us() >= other._total_us()
+        return self._cmp_key(other) >= 0
+
+
+def _from_utc_us(us: int, tz: Owned[timezone | None]) -> datetime:
+    """The datetime for a UTC microsecond instant, shifted into `tz` when one is given."""
+    if tz is None:
+        return _dt_from_us(us)
+    local: datetime = _dt_from_us(us + tz.offset._total_us())
+    local.tzinfo = move(tz)
+    return local
 
 
 def _dt_from_us(us: int) -> datetime:

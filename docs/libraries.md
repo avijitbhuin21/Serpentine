@@ -35,8 +35,11 @@
 - [x] `serp-cli` [P] 0.2.0 — ✅ `argparse` (ArgumentParser/add_argument; D11 `args["dest"]` indexing) — PyPI dist **`serpentine-argparse`**, import `serp_cli`
 - [x] `serp-pathlib` [P] 0.2.0 — ✅ `pathlib` (`Path` with `/` operator, fs ops, read/write helpers)
 - [x] `serp-os` [R] 0.1.0 — ✅ `os` subset (env vars, cwd, mkdir/rmdir/remove/listdir)
-- [x] `serp-datetime` [P] 0.3.0 — ✅ `datetime` (date/datetime/timedelta, `fromisoformat`, validation, repr parity; no tz)
-- [x] `serp-hashlib` [R] 0.1.0 — ✅ `hashlib` (sha256/sha1/md5 objects; no blake2)
+- [x] `serp-datetime` [P] 0.4.0 — ✅ `datetime` (date/datetime/timedelta, `fromisoformat`, validation, repr parity; fixed-offset `timezone`/`timezone.utc`/`UTC` + aware datetimes; no IANA `zoneinfo`)
+- [x] `serp-hashlib` [R] 0.2.0 — ✅ `hashlib` (sha256/sha1/md5 objects, `pbkdf2_hmac` native; no blake2)
+- [x] `serp-hmac` [R] 0.1.0 — ✅ `hmac` (`new`/`digest`/`compare_digest`, name-string `digestmod`)
+- [x] `serp-jwt` [P] 0.1.0 — PyJWT-compatible HS256 (`encode`/`decode`/`get_unverified_header`, exp/nbf/iat/aud/iss, PyJWT error classes)
+- [x] `serp-bcrypt` [R] 0.1.0 — ✅ pyca `bcrypt` (`gensalt`/`hashpw`/`checkpw`, byte-identical hashes; native EksBlowfish)
 - [x] `serp-re` [P] 0.2.0 — ✅ `re` (backtracking VM, groups, lazy/counted, flags; 30530/30533 differential; ReDoS guard: 1M steps / 10k depth per attempt → `re.error`, on `master`)
 - [x] `serp-tomllib` [P] 0.2.0 — ✅ `tomllib` subset (PyVal dict; no dates/inline tables/multi-line)
 - [x] `serp-uuid` [R] 0.2.0 — ✅ `uuid` (uuid4 + `UUID(str)` in all four spellings → hex/urn/version/variant)
@@ -48,14 +51,18 @@
 - [x] `serp-io` [P] 0.1.0 — ✅ `io` (StringIO/BytesIO) + file helpers and ByteReader — PyPI dist **`serpentine-io`**, import `serp_io`
 - [x] `serp-zlib` [R] 0.1.0 — ✅ `zlib` (+ gzip helpers; self-contained DEFLATE, wbits routing; 256 MiB output cap and CPython trailing-data/multi-member semantics, on `master`)
 - [x] `serp-zipfile` [P] 0.2.0 — ✅ `zipfile` (ZipFile r/w/a, stored+DEFLATED; no zip64/encryption; inherits the 256 MiB inflate cap)
-- [x] `serp-sqlite` [R] 0.2.0 — ✅ `sqlite3` subset (Connection/Cursor, `?` params, PyVal rows; autocommit only)
+- [x] `serp-sqlite` [R] 0.3.0 — ✅ `sqlite3` subset (Connection/Cursor, `?` params, PyVal rows; legacy-mode transactions: implicit BEGIN, `commit`/`rollback`, `in_transaction`, `isolation_level`)
+- [x] `serp-redis` [P] 0.1.0 — redis-py-style client over RESP2 (strings/counters/expiry/hashes/lists/sets/publish, AUTH/SELECT; no pool/pipeline/pub-sub)
 
 ## Wave 4 — Networking — SHIPPED (incl. Venom, 2026-07-23)
 
 - [x] `serp-socket` [R+P] 0.1.0 — ✅ `socket` (TCP/UDP, timeouts, exception types, normalized errors)
 - [x] `serp-url` [P] 0.1.0 — ✅ `urllib.parse` (urlparse/urljoin/quote/urlencode/parse_qs)
 - [x] `serp-fang` **Fang** [P] 0.3.1 — ✅ `httpx` sync client (native TLS, redirects, cookies, streaming, multipart)
-- [x] `serp-http-server` [P] 0.1.0 — ✅ `http.server` (HTTPServer + handler objects; single-threaded; 64 KiB heads, 16 MiB `MAX_BODY` → 413, on `master`)
+- [x] `serp-http-server` [P] 0.2.0 — ✅ `http.server` (HTTPServer + handler objects; single-threaded; 64 KiB heads, 16 MiB `MAX_BODY` → 413, 30 s whole-request read deadline)
+- [x] `serp-prometheus` [R] 0.1.0 — prometheus_client-style Counter/Gauge/Histogram/Summary with labels + text exposition (process-global runtime store)
+- [x] `serp-tracing` [P] 0.1.0 — OpenTelemetry-style spans, W3C traceparent propagation, memory/stderr/file JSON exporters
+- [x] `serp-bigint` [P] 0.1.0 — arbitrary-precision `BigInt` (`+ - * // % **`, abs, comparisons, divmod), CPython-exact
 - [x] `serp-venom` **Venom** [P+L] 0.4.0 — ✅ `fastapi` (module-level `app = FastAPI()`, `@app.get/post/put/delete/patch(path, status_code=)` with parameter injection by name/type — path/query scalars, `T | None`, serp_molt model bodies, raw `Owned[Request]` — JSON-serialized returns incl. models/`list[Model]`, FastAPI's 422 envelope, `HTTPException(status_code=, detail=)`, `JSONResponse`/`PlainTextResponse`/`HTMLResponse`/`RedirectResponse` with `headers=`, `TestClient(app)` with `json=`/`params=`/`headers=`, `serp_uvicorn.run`; `Depends(fn)` (nested), `APIRouter(prefix=)` + module-level `app.include_router`/`add_api_route`; threaded keep-alive + event-loop servers) — drop-in since 2026-09-07 via D41 (module-level object bindings + `@registrar`) and D42 (exception `__init__`); **axum parity** (1.05x at w1/c16, 0.92–1.03x at w3/c64, 2026-08-30) — **roadmap: [libraries/venom.md](libraries/venom.md)** (still open: middleware/BackgroundTasks/streaming/WebSockets)
 
 ## Wave 5 — Data & modeling flagships

@@ -862,6 +862,31 @@ pub unsafe extern "C" fn rt_hash_md5_y(h: *const u8, out: *mut SStr) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rt_hmac_digest(name: *const SStr, key: *const u8, msg: *const u8, out: *mut *const u8) -> i8 {
+    st_y(serp_hmac_digest(s(name), &bview(key), &bview(msg)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_pbkdf2(name: *const SStr, pw: *const u8, salt: *const u8, iters: i64, dklen: i64, out: *mut *const u8) -> i8 {
+    st_y(serp_pbkdf2(s(name), &bview(pw), &bview(salt), iters, dklen), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_compare_digest(a: *const u8, b: *const u8) -> i8 {
+    serp_compare_digest(&bview(a), &bview(b)) as i8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bcrypt_hash(pw: *const u8, setting: *const SStr, out: *mut SStr) -> i8 {
+    st_s(serp_bcrypt_hash(&bview(pw), s(setting)), out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_bcrypt_gensalt(rounds: i64, prefix: *const SStr, out: *mut SStr) -> i8 {
+    st_s(serp_bcrypt_gensalt(rounds, s(prefix)), out)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rt_hash_sha1(a: *const SStr, out: *mut SStr) {
     out.write(serp_hash_sha1(s(a)));
 }
@@ -1407,6 +1432,14 @@ pub unsafe extern "C" fn rt_sqlite_step(h: i64, out: *mut i8) -> i8 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rt_sqlite_in_tx(h: i64, out: *mut i8) -> i8 {
+    match serp_sqlite_in_tx(h) {
+        Ok(v) => { out.write(v as i8); 0 }
+        Err(e) => { set_pending(e); 1 }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rt_sqlite_column_count(h: i64, out: *mut i64) -> i8 {
     st_i64(serp_sqlite_column_count(h), out)
 }
@@ -1526,6 +1559,33 @@ pub unsafe extern "C" fn rt_sock_local_port(h: i64, out: *mut i64) -> i8 {
 pub unsafe extern "C" fn rt_sock_close(h: i64) -> i8 {
     st_n(serp_sock_close(h))
 }
+
+#[no_mangle]
+pub extern "C" fn rt_shutdown_install() { serp_shutdown_install() }
+
+#[no_mangle]
+pub extern "C" fn rt_shutdown_requested() -> i8 { serp_shutdown_requested() as i8 }
+
+#[no_mangle]
+pub extern "C" fn rt_shutdown_request() { serp_shutdown_request() }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_add(k: *const SStr, d: f64) { serp_mx_add(s(k), d) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_set(k: *const SStr, v: f64) { serp_mx_set(s(k), v) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_get(k: *const SStr) -> f64 { serp_mx_get(s(k)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_meta_set(k: *const SStr, v: *const SStr) { serp_mx_meta_set(s(k), s(v)) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_meta_get(k: *const SStr, out: *mut SStr) { out.write(serp_mx_meta_get(s(k))) }
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_mx_meta_add(k: *const SStr, v: *const SStr) -> i8 { serp_mx_meta_add(s(k), s(v)) as i8 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rt_sock_udp_bind(host: *const SStr, port: i64, out: *mut i64) -> i8 {

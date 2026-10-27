@@ -1,6 +1,6 @@
 [project]
 name = "serp-url"
-version = "0.1.0"
+version = "0.1.1"
 
 [build]
 roots = ["src"]

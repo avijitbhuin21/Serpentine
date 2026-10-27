@@ -316,6 +316,70 @@ def quote_plus(s: str, safe: str = "") -> str:
     return q.replace(" ", "+")
 
 
+def _utf8_seq(b: Ref[bytes], i: int) -> int:
+    """Length of the well-formed UTF-8 sequence at i, or -k for a k-byte maximal invalid subpart."""
+    n: int = len(b)
+    c: int = b[i]
+    if c < 128:
+        return 1
+    need: int = 0
+    lo: int = 128
+    hi: int = 191
+    if c >= 0xC2 and c <= 0xDF:
+        need = 1
+    elif c == 0xE0:
+        need = 2
+        lo = 0xA0
+    elif (c >= 0xE1 and c <= 0xEC) or c == 0xEE or c == 0xEF:
+        need = 2
+    elif c == 0xED:
+        need = 2
+        hi = 0x9F
+    elif c == 0xF0:
+        need = 3
+        lo = 0x90
+    elif c >= 0xF1 and c <= 0xF3:
+        need = 3
+    elif c == 0xF4:
+        need = 3
+        hi = 0x8F
+    else:
+        return -1
+    j: int = 1
+    while j <= need:
+        if i + j >= n:
+            return -j
+        x: int = b[i + j]
+        if j == 1:
+            if x < lo or x > hi:
+                return -j
+        elif x < 128 or x > 191:
+            return -j
+        j += 1
+    return need + 1
+
+
+def _decode_replace(b: bytes) -> str:
+    """UTF-8 decode with errors='replace' (one U+FFFD per maximal invalid subpart, as CPython)."""
+    parts: list[str] = []
+    i: int = 0
+    start: int = 0
+    n: int = len(b)
+    while i < n:
+        k: int = _utf8_seq(b, i)
+        if k > 0:
+            i += k
+        else:
+            if i > start:
+                parts.append(b[start:i].decode("utf-8"))
+            parts.append("\ufffd")
+            i += -k
+            start = i
+    if start < n:
+        parts.append(b[start:n].decode("utf-8"))
+    return "".join(parts)
+
+
 def unquote(s: str) -> str:
     out: bytearray = bytearray(b"")
     i: int = 0
@@ -332,7 +396,7 @@ def unquote(s: str) -> str:
                 continue
         out.extend(ch.encode("utf-8"))
         i += 1
-    return bytes(out).decode("utf-8")
+    return _decode_replace(bytes(out))
 
 
 def unquote_plus(s: str) -> str:

@@ -100,6 +100,11 @@ def last_rowid(db: int) -> int:
         raise ValueError(str(e))
 
 
+def in_tx(db: int) -> bool:
+    """True while an explicit or implicit transaction is open (not autocommit)."""
+    return _db(db)[0].in_transaction
+
+
 def prepare(db: int, sql: str) -> int:
     """Prepare a statement and return its handle (execution is deferred to step)."""
     rec = _db(db)

@@ -1,0 +1,6 @@
+[project]
+name = "serp-shutdown-check"
+version = "0.0.0"
+
+[build]
+roots = [".", "../../libs/serp-venom/src", "../../libs/serp-http-server/src", "../../libs/serp-socket/src", "../../libs/serp-json/src", "../../libs/serp-url/src", "../../libs/serp-time/src"]

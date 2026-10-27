@@ -197,12 +197,15 @@ either library work or gated on LB3/LB4/LB5/LB8. Test: `tests/test_dropin.py`.
 
 ## B4. Middleware & lifecycle
 
-- [ ] **[L]** `@app.middleware("http")` / `add_middleware` chains. Needs **LB3** —
-      middleware is a closure over non-Copy state, and lambdas capture Copy-only today.
-- [ ] **[P]** CORS middleware (once B4's chain exists).
+- [x] **[L→done]** `@app.middleware("http")` chains — **DONE 2026-10-27** without closures: the
+      remaining chain travels inside the `Request` (`_chain`/`_handlers`) and `call_next` is the
+      module function `_call_next`; the registrar passes 2-argument callables through and the
+      frontend completes `(request: Request, call_next)` signatures. Sync `def` middleware only.
+- [x] **[P]** CORS middleware — `app.add_middleware(CORSMiddleware, allow_origins=..., ...)`
+      (`CORSMiddleware` is a module constant so FastAPI's call shape compiles).
 - [ ] **[L]** `startup`/`shutdown` / `lifespan` hooks. Needs LB1 (module-level app).
-- [ ] **[L]** `BackgroundTasks`. Needs **LB5** — `spawn`'s Send boundary is by-copy over
-      primitives only (D9 v1), so a task cannot carry a request payload.
+- [x] **[L→done]** `BackgroundTasks` — run on the serving thread after the response is written
+      (Starlette semantics, no Send boundary needed); `add_task` takes a zero-arg callable.
 
 ## B5. Errors & responses
 
@@ -228,8 +231,8 @@ either library work or gated on LB3/LB4/LB5/LB8. Test: `tests/test_dropin.py`.
 
 ## B7. Streaming & long-lived connections
 
-- [ ] **[L]** `StreamingResponse` — needs `yield`/generators, which the language does not
-      have (this is why `serp-itertools` uses explicit iterator classes). Needs **LB8**.
+- [~] **[L]** `StreamingResponse` — chunked transfer encoding shipped (0.5.0, one write per chunk);
+      lazy production from a generator still needs `yield` (**LB8**), so chunks are a list today.
 - [ ] **[P]** `FileResponse` + static files (`StaticFiles` mount) — needs `os.stat`-class
       metadata in `serp-os`.
 - [ ] **[L]** WebSockets. Framing and masking are library work, but usable duplex needs

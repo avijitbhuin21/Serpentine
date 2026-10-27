@@ -3,11 +3,15 @@
 `connect()` returns a `Connection`; cursors execute SQL with `?` parameters and
 fetch rows as dynamic values (PyVal lists), like sqlite3 row tuples. SQLite
 errors raise `OperationalError` (under `DatabaseError` / `Error`) with the
-SQLite message. Runs in autocommit mode (`commit()` is a no-op).
+SQLite message. Transactions follow sqlite3's legacy (3.11) rules: with the
+default `isolation_level=""`, an INSERT/UPDATE/DELETE/REPLACE implicitly opens
+`BEGIN`; `commit()`/`rollback()` end it; `in_transaction` reports it;
+`isolation_level=None` is autocommit and explicit `BEGIN`/`SAVEPOINT` SQL works.
 
 Caps: rows are lists (not tuples); no `description`/`executemany`/`row_factory`;
 parameters must be a list (any sequence works under CPython's sqlite3, and a
-list already does); `Connection` is not a context manager.
+list already does); `Connection` is not a context manager (use commit/rollback
+in try/except).
 """
 from __future__ import annotations
 from serpentine import Mut, Ref, PyVal, pyval_kind, dataclass, move
@@ -20,6 +24,7 @@ from serp_sqlite_core import bind_null as _core_bind_null, step as _core_step
 from serp_sqlite_core import column_count as _core_column_count, col_type as _core_col_type
 from serp_sqlite_core import col_int as _core_col_int, col_float as _core_col_float
 from serp_sqlite_core import col_text as _core_col_text, col_blob as _core_col_blob
+from serp_sqlite_core import execute as _core_execute, in_tx as _core_in_tx
 
 
 class Error(Exception):
@@ -59,17 +64,38 @@ def _bind_params(stmt: int, params: PyVal) -> None:
             raise ProgrammingError(f"Error binding parameter {idx}: type '{kind}' is not supported")
 
 
+def _is_dml(sql: str) -> bool:
+    """True when the statement starts with INSERT/UPDATE/DELETE/REPLACE (sqlite3's implicit-BEGIN rule)."""
+    head: str = sql.lstrip().upper()
+    return (head.startswith("INSERT") or head.startswith("UPDATE")
+            or head.startswith("DELETE") or head.startswith("REPLACE"))
+
+
+def _begin_sql(level: str | None) -> str:
+    """The BEGIN statement sqlite3 issues for an isolation level ('' when autocommit)."""
+    if level is None:
+        return ""
+    return "BEGIN " + level
+
+
 @dataclass
 class Cursor:
     _db: int
     _stmt: int
     rowcount: int
     lastrowid: int
+    _begin: str = ""
 
     def execute(self: Mut[Cursor], sql: str, params: PyVal | None = None) -> None:
         if self._stmt != 0:
             _core_finalize(self._stmt)
             self._stmt = 0
+        if self._begin != "" and _is_dml(sql):
+            try:
+                if not _core_in_tx(self._db):
+                    _core_execute(self._db, self._begin)
+            except ValueError as e0:
+                raise OperationalError(f"{e0}")
         stmt: int = 0
         try:
             stmt = _core_prepare(self._db, sql)
@@ -142,9 +168,27 @@ class Cursor:
 @dataclass
 class Connection:
     _db: int
+    isolation_level: str | None = ""
 
     def cursor(self: Ref[Connection]) -> Cursor:
-        return Cursor(self._db, 0, -1, 0)
+        return Cursor(self._db, 0, -1, 0, _begin_sql(self.isolation_level))
+
+    @property
+    def in_transaction(self: Ref[Connection]) -> bool:
+        try:
+            return _core_in_tx(self._db)
+        except ValueError as e:
+            raise ProgrammingError(f"{e}")
+
+    def _finish(self: Ref[Connection], sql: str) -> None:
+        try:
+            if _core_in_tx(self._db):
+                _core_execute(self._db, sql)
+        except ValueError as e:
+            raise OperationalError(f"{e}")
+
+    def rollback(self: Ref[Connection]) -> None:
+        self._finish("ROLLBACK")
 
     def execute(self: Ref[Connection], sql: str, params: PyVal | None = None) -> Cursor:
         cur: Cursor = self.cursor()
@@ -155,7 +199,7 @@ class Connection:
         return move(cur)
 
     def commit(self: Ref[Connection]) -> None:
-        return None
+        self._finish("COMMIT")
 
     def close(self: Ref[Connection]) -> None:
         try:
@@ -164,10 +208,10 @@ class Connection:
             raise ProgrammingError(f"{e}")
 
 
-def connect(database: str) -> Connection:
+def connect(database: str, isolation_level: str | None = "") -> Connection:
     h: int = 0
     try:
         h = _core_connect(database)
     except ValueError as e:
         raise OperationalError(f"{e}")
-    return Connection(h)
+    return Connection(h, isolation_level)

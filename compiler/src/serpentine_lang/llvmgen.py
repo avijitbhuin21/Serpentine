@@ -253,6 +253,15 @@ RT_SIGS = {
     "rt_math_modf_int": (F64, [F64]),
     "rt_rand_seed": (VOID, [I64]),
     "rt_rand_seed_sys": (VOID, []),
+    "rt_shutdown_install": (VOID, []),
+    "rt_shutdown_requested": (I8, []),
+    "rt_shutdown_request": (VOID, []),
+    "rt_mx_add": (VOID, [SSTRP, F64]),
+    "rt_mx_set": (VOID, [SSTRP, F64]),
+    "rt_mx_get": (F64, [SSTRP]),
+    "rt_mx_meta_set": (VOID, [SSTRP, SSTRP]),
+    "rt_mx_meta_get": (VOID, [SSTRP, SSTRP]),
+    "rt_mx_meta_add": (I8, [SSTRP, SSTRP]),
     "rt_rand_random": (F64, []),
     "rt_rand_getrandbits": (I8, [I64, I64.as_pointer()]),
     "rt_rand_randbelow": (I64, [I64]),
@@ -285,6 +294,11 @@ RT_SIGS = {
     "rt_hash_sha256_y": (VOID, [I8P, SSTRP]),
     "rt_hash_sha1_y": (VOID, [I8P, SSTRP]),
     "rt_hash_md5_y": (VOID, [I8P, SSTRP]),
+    "rt_hmac_digest": (I8, [SSTRP, I8P, I8P, I8P.as_pointer()]),
+    "rt_pbkdf2": (I8, [SSTRP, I8P, I8P, I64, I64, I8P.as_pointer()]),
+    "rt_compare_digest": (I8, [I8P, I8P]),
+    "rt_bcrypt_hash": (I8, [I8P, SSTRP, SSTRP]),
+    "rt_bcrypt_gensalt": (I8, [I64, SSTRP, SSTRP]),
     "rt_uuid4": (VOID, [SSTRP]),
     "rt_secrets_token_hex": (I8, [I64, SSTRP]),
     "rt_secrets_randbits": (I8, [I64, I64.as_pointer()]),
@@ -313,6 +327,7 @@ RT_SIGS = {
     "rt_sqlite_bind_blob": (I8, [I64, I64, I8P]),
     "rt_sqlite_bind_null": (I8, [I64, I64]),
     "rt_sqlite_step": (I8, [I64, I8.as_pointer()]),
+    "rt_sqlite_in_tx": (I8, [I64, I8.as_pointer()]),
     "rt_sqlite_column_count": (I8, [I64, I64.as_pointer()]),
     "rt_sqlite_col_type": (I8, [I64, I64, I64.as_pointer()]),
     "rt_sqlite_col_int": (I8, [I64, I64, I64.as_pointer()]),
@@ -1386,6 +1401,21 @@ class LLVMGen:
             b.call(self._rt("rt_sb_push_str"), [sb, tmp])
             b.call(self._rt("rt_str_drop"), [tmp])
             return
+        if isinstance(t, TClass) and not as_repr:
+            info_s = self.tc.classes.get((t.module, t.name))
+            ssig = self.tc.sigs.get((t.module, f"{t.name}.__str__"))
+            if info_s is not None and ssig is not None and not ssig.is_template \
+                    and not info_s.typevars:
+                res = b.call(self.funcs[(t.module, ssig.name)], [v.ptr])
+                err = b.extract_value(res, 0)
+                with b.if_then(err):
+                    b.call(self._rt("rt_abort_pending"), [])
+                    b.unreachable()
+                tmp = b.alloca(SSTR)
+                b.store(b.extract_value(res, 1), tmp)
+                b.call(self._rt("rt_sb_push_str"), [sb, tmp])
+                b.call(self._rt("rt_str_drop"), [tmp])
+                return
         if isinstance(t, (TList, TDict, TTuple, TClass)):
             b.call(self._repr_fn(t), [sb, v.ptr])
             return
@@ -1625,10 +1655,16 @@ class LLVMGen:
             if bind["flag"] is not None:
                 self.b.store(ir.Constant(I1, 1), bind["flag"])
 
-        ret = ast.Return(value=lnode.body)
-        ast.copy_location(ret, lnode.body)
-        ast.fix_missing_locations(ret)
-        self._emit_stmt(ret)
+        if isinstance(ft.ret, TNone):
+            st = ast.Expr(value=lnode.body)
+            ast.copy_location(st, lnode.body)
+            ast.fix_missing_locations(st)
+            self._emit_stmt(st)
+        else:
+            ret = ast.Return(value=lnode.body)
+            ast.copy_location(ret, lnode.body)
+            ast.fix_missing_locations(ret)
+            self._emit_stmt(ret)
         if not self.b.block.is_terminated:
             self.b.branch(self.exit_block)
 

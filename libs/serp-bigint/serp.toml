@@ -1,0 +1,6 @@
+[project]
+name = "serp-bigint"
+version = "0.1.0"
+
+[build]
+roots = ["src"]

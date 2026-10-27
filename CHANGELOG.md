@@ -5,9 +5,93 @@ All notable changes to `serpentine-lang` (compiler) and `serpentine-shim`. Libra
 Everything is `0.x`: the language surface, SE codes and runtime ABI may change between minor
 versions.
 
-## [Unreleased]
+## [0.7.3] — prepared, not yet tagged or published
 
-### Security / hardening
+### Language / compiler
+- Lambdas capture non-Copy values (cloned into the closure); soundness rules keep this equal
+  to CPython's by-reference capture: no mutation/move/rebinding after capture, no mutation/move
+  inside the lambda, no non-Copy capture in a lambda built inside a loop (accept 111;
+  r096–r098). Fixed: rustgen moved non-Copy captures into the closure instead of cloning.
+- `abs(x)` on a class dispatches to `__abs__` (new allowed dunder).
+- Lambdas may return `None` (callbacks such as `add_task(lambda: f(x))`); Backend B used to drop
+  such bodies (`return <expr>` in a `None` function never evaluated), Backend A rejected
+  `print(...)` bodies — both fixed (accept 109).
+- Comprehensions take any number of `for`/`if` clauses: extra `if`s merge into `and`, extra
+  `for`s lower to a nested comprehension + generic `_serp_flatten` (CPython element and
+  evaluation order; set comprehensions go through `set()`; dict ones still take one `for`)
+  (accept 110; r029 now targets multi-`for` dict comprehensions).
+- D41 registrars whose endpoint is a 2-argument callable (`@app.middleware("http")`) receive the
+  decorated function itself; a bare `request: Request, call_next` signature is completed from the
+  registrar and `call_next(request)` gets an explicit move.
+- D41 handler injection: a `BackgroundTasks` parameter is created per request, passed `Mut`, and
+  its tasks are moved onto the returned `Response`.
+- Plain `import a.b` and `import a.b as c`: `a.b.name` / `c.name` resolve like
+  `from a.b import name` (functions, classes in annotations, constants, runtime-library
+  members). `import serpentine/typing/enum` stays `from`-only (accept 108).
+- Class attributes bound at module level: `C.attr = D(...)` after `class C` becomes a
+  build-time factory (D41 extension), so `timezone.utc`-style constants work across modules
+  (accept 107).
+- Fixed: rustgen dropped the unwrap on a narrowed Optional *field* used as a base
+  (`self.tz.offset`, `self.a.b.c`) → rustc E0609 (accept 107).
+- Fixed: Backend B printed an `Optional[C]`/union member with `__repr__` instead of `__str__`.
+- Fixed: rustgen crashed on a `bytes` parameter default (`prefix: bytes = b"2b"`).
+- Runtime: `accept_nb` always returns a blocking socket (Windows inherited the listener's
+  non-blocking mode).
+- `SERP_RUSTC_FLAGS` now also reaches Backend B's runtime build and final link (and the
+  runtime cache key), so the runtime can be built with AddressSanitizer.
+- Fixed: on the Microsoft Store Python, a fresh Backend B runtime build failed with
+  "couldn't find file …serp_rt.rs" (the Store sandbox hides `%LOCALAPPDATA%` writes from
+  rustc); the temp-dir fallback now covers this error too.
+
+### Services (Venom 0.5.0 / serp-http-server 0.2.0)
+- `@app.middleware("http")` middleware chains (FastAPI spelling; latest-added outermost; wraps
+  404/405 and converted handler exceptions), `app.add_middleware(CORSMiddleware, ...)` with
+  Starlette's preflight/simple-request rules, `BackgroundTasks` (run after the response is
+  written, in every server and in `TestClient`), `StreamingResponse` (chunked transfer
+  encoding). Fixed (CPython only): response factories shared their mutable `headers={}` default,
+  so headers leaked between responses.
+- Graceful shutdown: `shutdown_install()` (called by `run()`) routes SIGTERM/SIGINT/Ctrl-C/
+  Ctrl-Break to a flag; `serve_async` and `serve_on` stop accepting, drain in-flight requests
+  (`SHUTDOWN_GRACE` 10 s), close idle keep-alive connections and return; a second signal
+  exits at once. `shutdown_request()`/`shutdown_requested()` for code.
+- Slowloris guard: whole-request read deadline (`REQUEST_DEADLINE` 30 s, head + body) on top
+  of the 10 s per-`recv` timeout; `serve_async(..., read_deadline=)`.
+- Crash containment found by the new HTTP fuzzer: malformed percent-encoding, a 20-digit
+  `Content-Length` and a peer reset mid-send each killed the server; they now yield
+  500/413/close for that connection only.
+- `serp-url`: `unquote` decodes invalid UTF-8 with CPython's `errors='replace'` semantics
+  (200k-case parity).
+
+### New libraries
+- `serp-bigint` (arbitrary-precision `BigInt`, CPython-exact floor semantics).
+- Venom `LazyStreamingResponse(producer)`: chunks produced while the response is written.
+- `serp-tracing` (OpenTelemetry-style spans, W3C `traceparent` inject/extract, memory/stderr/file
+  JSON exporters).
+- `serpentine-shim` 0.9.1: `registrar` passes 2-argument callables (middleware) through and injects
+  `BackgroundTasks`.
+- `serp-hmac` (hmac drop-in), `serp-jwt` (PyJWT-compatible HS256 with exp/nbf/iat/aud/iss),
+  `serp-bcrypt` (pyca/bcrypt-compatible, byte-identical hashes), `serp-prometheus`
+  (prometheus_client-style metrics + text exposition), `serp-redis` (redis-py-style RESP2).
+- `serp-hashlib` 0.2.0: `pbkdf2_hmac`; native HMAC/PBKDF2/bcrypt/constant-time compare in the
+  runtime.
+- `serp-datetime`: fixed-offset `timezone` (`timezone.utc`, `UTC`), aware datetimes
+  (`tzinfo=`, `utcoffset/tzname/astimezone/timestamp`, `now(tz)`, `fromtimestamp(ts, tz)`,
+  `replace`, aware comparisons/arithmetic, `fromisoformat` offsets and `Z`).
+- `serp-sqlite`: transactions with sqlite3's legacy rules (implicit `BEGIN` before DML,
+  `commit`/`rollback`, `in_transaction`, `isolation_level`).
+
+### Tooling
+- `run_shutdown_check.py` (real-signal drain, both backends × both serve modes),
+  `run_http_fuzz.py`, `run_check_fuzz.py` (checker never crashes), `run_scale_test.py`
+  (10k–50k LOC), `run_asan.py --backend llvm`.
+- Flaky tests fixed: `test_async_fang` (test server closed with unread body → Windows RST),
+  `test_asyncio` (equal-deadline sleeps and tight margins).
+
+### Docs
+- `docs/stability.md` (versioning policy), `docs/guides/deployment.md` (health checks,
+  shutdown, systemd/Docker/Kubernetes).
+
+### Security / hardening (since 0.7.2)
 - Native crashes print a CPython-style traceback (`.py` file, line, function per frame) in
   both backends; frames are recorded on the error path only.
 - `serp-re`: ReDoS guard of 1M VM steps and 10k recursion levels per match attempt; raises
@@ -38,6 +122,12 @@ versions.
   characters because of this.
 
 ### Fixed
+- Packaging (found by installing every built wheel into a clean venv): the `serp-socket` wheel
+  omitted `_serp_socket` and the `serp-log` wheel omitted `serp_log_core`, so CPython imports
+  of those libs (and of serp-http-server/Fang/Venom through them) failed after `pip install`.
+  Fixed in serp-socket 0.2.0 and serp-log 0.2.1.
+- `serp-molt` 0.7.1: `datetime` fields stopped parsing from ISO text after serp-datetime 0.4.0
+  added `tzinfo` (molt matched the 7-field layout only). Molt now requires serp-datetime>=0.4.0.
 - Backend A: a local first assigned inside a `try` body and used after a diverging handler
   (`except: continue|break|return`) no longer fails rustc with E0381. Scalar and Optional locals
   assigned inside a `try` get a zero initializer.

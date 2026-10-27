@@ -1,0 +1,9 @@
+[project]
+name = "serp-redis"
+version = "0.1.0"
+
+[build]
+roots = ["src", "../serp-socket/src"]
+
+[dependencies]
+serp-socket = "0.2.0"

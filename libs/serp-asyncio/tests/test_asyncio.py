@@ -13,7 +13,7 @@ async def waiter(name: str, ev: Owned[asyncio.Event]) -> str:
 
 
 async def setter(ev: Owned[asyncio.Event]) -> None:
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(0.05)
     print("setting", ev.is_set())
     ev.set()
     print("set", ev.is_set())
@@ -28,7 +28,7 @@ async def locker(name: str, lock: Owned[asyncio.Lock], hold: float) -> None:
 
 
 async def barge(lock: Owned[asyncio.Lock]) -> None:
-    await asyncio.sleep(0.03)
+    await asyncio.sleep(0.1)
     print("barge acquire", lock.locked())
     await lock.acquire()
     print("barge holding")
@@ -36,10 +36,10 @@ async def barge(lock: Owned[asyncio.Lock]) -> None:
     print("barge released")
 
 
-async def sem_user(name: str, sem: Owned[asyncio.Semaphore]) -> None:
+async def sem_user(name: str, sem: Owned[asyncio.Semaphore], hold: float) -> None:
     async with sem:
         print("in", name)
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(hold)
     print("out", name)
 
 
@@ -78,7 +78,7 @@ async def amain() -> None:
 
     lock: asyncio.Lock = asyncio.Lock()
     print("locked?", lock.locked())
-    await asyncio.gather(locker("l1", lock, 0.05), locker("l2", lock, 0.02), barge(lock))
+    await asyncio.gather(locker("l1", lock, 0.3), locker("l2", lock, 0.05), barge(lock))
     print("locked?", lock.locked())
     try:
         lock.release()
@@ -86,7 +86,7 @@ async def amain() -> None:
         print("release error:", str(e))
 
     sem: asyncio.Semaphore = asyncio.Semaphore(2)
-    await asyncio.gather(sem_user("s1", sem), sem_user("s2", sem), sem_user("s3", sem))
+    await asyncio.gather(sem_user("s1", sem, 0.03), sem_user("s2", sem, 0.15), sem_user("s3", sem, 0.03))
     print("sem locked?", sem.locked())
 
     bs: asyncio.BoundedSemaphore = asyncio.BoundedSemaphore(1)

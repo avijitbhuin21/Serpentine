@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-socket"
-version = "0.1.0"
+version = "0.2.0"
 description = "Serpentine TCP/UDP sockets: connect/listen/accept/send/recv + UDP datagrams with timeouts (runtime-backed; stdlib socket delegate under CPython)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,4 +24,4 @@ Homepage = "https://github.com/avijitbhuin21/Serpentine"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-py-modules = ["serp_socket"]
+py-modules = ["serp_socket", "_serp_socket"]

@@ -17,8 +17,8 @@ handlers `-> Response`); `HTTPException` carries its status/detail in the messag
 from __future__ import annotations
 
 from serpentine import Callable, Mut, Owned, PyVal, Ref, block_on, dataclass, move, registrar
-from serp_http_server import (BaseHTTPRequestHandler, HTTPServer, MAX_BODY, _Headers,
-                              _digits_ok, _read_head)
+from serp_http_server import (BaseHTTPRequestHandler, HTTPServer, MAX_BODY, REQUEST_DEADLINE,
+                              _Headers, _digits_ok, _parse_clen, _read_head, _read_body)
 from _serp_socket import accept as _accept
 from _serp_socket import accept_nb as _accept_nb
 from _serp_socket import close as _close
@@ -30,6 +30,10 @@ from _serp_socket import send_all as _send_all
 from _serp_socket import set_async as _set_async
 from _serp_socket import set_nonblocking as _set_nonblocking
 from _serp_socket import set_timeout as _set_timeout
+from _serp_socket import shutdown_install as _shutdown_install
+from _serp_socket import shutdown_requested as _shutdown_requested
+from _serp_socket import shutdown_request as _shutdown_request
+from serp_time import monotonic as _monotonic
 from serp_json import dumps, loads
 from serp_url import unquote, unquote_plus
 
@@ -122,6 +126,9 @@ class Request:
     headers: dict[str, str]
     body: str
     _status: int = 200
+    _chain: list[Callable[[Request, Callable[[Request], Response]], Response]] = []
+    _handlers: list[Callable[[Request], Response]] = []
+    _async: bool = False
 
     def json(self: Ref[Request]) -> PyVal:
         return loads(self.body)
@@ -222,29 +229,138 @@ class Response:
     status_code: int = 200
     headers: dict[str, str] = {}
     media_type: str = "text/plain"
+    background: list[Callable[[], None]] = []
+    chunks: list[str] = []
+    streaming: bool = False
+    producers: list[Callable[[int], str | None]] = []
+
+
+def StreamingResponse(content: Owned[list[str]], status_code: int = 200,
+                      headers: Owned[dict[str, str]] = {},
+                      media_type: str = "text/plain; charset=utf-8") -> Response:
+    """Chunked response: each element goes out as its own HTTP/1.1 chunk (Transfer-Encoding:
+    chunked). For chunks computed while sending, use LazyStreamingResponse."""
+    return Response("", status_code, _fresh(headers), media_type, [], move(content), True)
+
+
+def LazyStreamingResponse(producer: Callable[[int], str | None], status_code: int = 200,
+                          headers: Owned[dict[str, str]] = {},
+                          media_type: str = "text/plain; charset=utf-8") -> Response:
+    """Chunked response produced lazily: `producer(i)` is called while the response is being
+    written, for i = 0, 1, 2, ..., until it returns None (the generator-free form of
+    FastAPI's StreamingResponse over a generator)."""
+    ps: list[Callable[[int], str | None]] = []
+    ps.append(producer)
+    return Response("", status_code, _fresh(headers), media_type, [], [], True, move(ps))
+
+
+def _collect_stream(resp: Ref[Response]) -> str:
+    """The whole streamed body (TestClient): list chunks, then producer output."""
+    out: list[str] = []
+    for c in resp.chunks:
+        out.append(c)
+    for p in resp.producers:
+        i: int = 0
+        going: bool = True
+        while going:
+            part: str | None = p(i)
+            if part is None:
+                going = False
+            else:
+                out.append(part)
+                i += 1
+    return "".join(out)
+
+
+def _chunk(text: str) -> bytes:
+    """One HTTP/1.1 chunk frame."""
+    data: bytes = text.encode("utf-8")
+    return (_hex(len(data)) + "\r\n").encode("utf-8") + data + b"\r\n"
+
+
+def _hex(n: int) -> str:
+    """Lowercase hex digits of a non-negative int."""
+    if n == 0:
+        return "0"
+    digits: str = "0123456789abcdef"
+    out: str = ""
+    v: int = n
+    while v > 0:
+        out = digits[v % 16] + out
+        v = v // 16
+    return out
+
+
+def _send_stream(conn: int, resp: Ref[Response]) -> None:
+    """Send every chunk with its own write (calling producers as it goes), then the
+    terminating zero chunk."""
+    for c in resp.chunks:
+        if c != "":
+            n: int = _send_all(conn, _chunk(c), 0)
+    for p in resp.producers:
+        i: int = 0
+        going: bool = True
+        while going:
+            part: str | None = p(i)
+            if part is None:
+                going = False
+            else:
+                if part != "":
+                    n1: int = _send_all(conn, _chunk(part), 0)
+                i += 1
+    n2: int = _send_all(conn, b"0\r\n\r\n", 0)
+
+
+@dataclass
+class BackgroundTasks:
+    """Work to run after the response is sent (FastAPI's `BackgroundTasks` parameter).
+
+    `add_task` takes a zero-argument callable — `background_tasks.add_task(lambda: f(x))` —
+    because the subset has no `*args`; tasks run in order once the response is written."""
+    tasks: list[Callable[[], None]] = []
+
+    def add_task(self: Mut[BackgroundTasks], func: Callable[[], None]) -> None:
+        self.tasks.append(func)
+
+
+def _run_background(resp: Ref[Response]) -> None:
+    """Run a response's background tasks; a failing task never affects the client."""
+    for t in resp.background:
+        try:
+            t()
+        except Exception as e:
+            pass
+
+
+def _fresh(headers: Ref[dict[str, str]]) -> dict[str, str]:
+    """An independent copy of a headers mapping (CPython shares mutable default arguments)."""
+    out: dict[str, str] = {}
+    for k, v in headers.items():
+        out[k] = v
+    return out
 
 
 def JSONResponse(content: PyVal, status_code: int = 200, headers: Owned[dict[str, str]] = {},
                  media_type: str = "application/json") -> Response:
     """Factory mirroring fastapi.responses.JSONResponse."""
-    return Response(dumps(content, False, False, True), status_code, move(headers), media_type)
+    return Response(dumps(content, False, False, True), status_code, _fresh(headers), media_type)
 
 
 def PlainTextResponse(content: str, status_code: int = 200, headers: Owned[dict[str, str]] = {},
                       media_type: str = "text/plain; charset=utf-8") -> Response:
     """Factory mirroring fastapi.responses.PlainTextResponse."""
-    return Response(content, status_code, move(headers), media_type)
+    return Response(content, status_code, _fresh(headers), media_type)
 
 
 def HTMLResponse(content: str, status_code: int = 200, headers: Owned[dict[str, str]] = {},
                  media_type: str = "text/html; charset=utf-8") -> Response:
     """Factory mirroring fastapi.responses.HTMLResponse."""
-    return Response(content, status_code, move(headers), media_type)
+    return Response(content, status_code, _fresh(headers), media_type)
 
 
 def RedirectResponse(url: str, status_code: int = 307, headers: Owned[dict[str, str]] = {}) -> Response:
     """Factory mirroring fastapi.responses.RedirectResponse."""
-    hs: dict[str, str] = move(headers)
+    hs: dict[str, str] = _fresh(headers)
     hs["location"] = url
     return Response("", status_code, move(hs), "text/plain; charset=utf-8")
 
@@ -370,6 +486,58 @@ def _fallback(req: Owned[Request]) -> Response:
     return Response("", 500, {}, "text/plain")
 
 
+def _not_found(req: Owned[Request]) -> Response:
+    """Router 404 as a handler, so middleware wraps it too (Starlette semantics)."""
+    return JSONResponse({"detail": "Not Found"}, 404)
+
+
+def _method_not_allowed(req: Owned[Request]) -> Response:
+    """Router 405 as a handler, so middleware wraps it too."""
+    return JSONResponse({"detail": "Method Not Allowed"}, 405)
+
+
+def _call_next(request: Owned[Request]) -> Response:
+    """FastAPI's `call_next`: run the next middleware (outermost = most recently added), or
+    the route handler at the end with its exceptions turned into responses."""
+    req: Request = move(request)
+    if len(req._chain) > 0:
+        mw: Callable[[Request, Callable[[Request], Response]], Response] = req._chain.pop()
+        return mw(move(req), _call_next)
+    h: Callable[[Request], Response] = req._handlers.pop()
+    try:
+        if req._async:
+            return block_on(h(move(req)))
+        return h(move(req))
+    except HTTPException as e:
+        return _http_exc_response(str(e))
+    except RequestValidationError as e2:
+        return JSONResponse({"detail": loads(str(e2))}, 422)
+    except Exception as e3:
+        return PlainTextResponse("Internal Server Error", 500)
+
+
+CORSMiddleware: str = "CORSMiddleware"
+_CORS_SAFE: str = "Accept, Accept-Language, Content-Language, Content-Type"
+_CORS_ALL_METHODS: str = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+
+
+def _has(xs: Ref[list[str]], x: str) -> bool:
+    """Case-sensitive list membership."""
+    for v in xs:
+        if v == x:
+            return True
+    return False
+
+
+def _has_ci(xs: Ref[list[str]], x: str) -> bool:
+    """Case-insensitive list membership."""
+    low: str = x.lower()
+    for v in xs:
+        if v.lower() == low:
+            return True
+    return False
+
+
 @dataclass
 class _Match:
     found: bool
@@ -437,6 +605,95 @@ class FastAPI:
     title: str = "FastAPI"
     version: str = "0.1.0"
     routes: list[Route] = []
+    middlewares: list[Callable[[Request, Callable[[Request], Response]], Response]] = []
+    cors_on: bool = False
+    cors_origins: list[str] = []
+    cors_methods: list[str] = []
+    cors_headers: list[str] = []
+    cors_expose: list[str] = []
+    cors_credentials: bool = False
+    cors_max_age: int = 600
+
+    @registrar
+    def middleware(self: Mut[FastAPI], middleware_type: str,
+                   endpoint: Callable[[Request, Callable[[Request], Response]], Response]) -> None:
+        """`@app.middleware("http")`: wrap every request; the latest-added runs outermost."""
+        if middleware_type != "http":
+            raise ValueError(f"unsupported middleware type {middleware_type!r}")
+        self.middlewares.append(endpoint)
+
+    def add_middleware(self: Mut[FastAPI], middleware_class: str,
+                       allow_origins: Owned[list[str]] = [], allow_methods: Owned[list[str]] = [],
+                       allow_headers: Owned[list[str]] = [], allow_credentials: bool = False,
+                       expose_headers: Owned[list[str]] = [], max_age: int = 600) -> None:
+        """`app.add_middleware(CORSMiddleware, allow_origins=[...], ...)` (Starlette semantics)."""
+        if middleware_class != CORSMiddleware:
+            raise ValueError(f"unsupported middleware {middleware_class!r}")
+        self.cors_on = True
+        self.cors_origins = move(allow_origins)
+        self.cors_methods = move(allow_methods)
+        if len(self.cors_methods) == 0:
+            self.cors_methods.append("GET")
+        self.cors_headers = move(allow_headers)
+        self.cors_expose = move(expose_headers)
+        self.cors_credentials = allow_credentials
+        self.cors_max_age = max_age
+
+    def _cors_origin_ok(self: Ref[FastAPI], origin: str) -> bool:
+        return _has(self.cors_origins, "*") or _has(self.cors_origins, origin)
+
+    def _cors_preflight(self: Ref[FastAPI], origin: str, req_method: str,
+                        req_headers: str) -> Response:
+        """Answer an OPTIONS preflight the way Starlette's CORSMiddleware does."""
+        failures: list[str] = []
+        if not self._cors_origin_ok(origin):
+            failures.append("origin")
+        if not (_has(self.cors_methods, "*") or _has(self.cors_methods, req_method)):
+            failures.append("method")
+        allowed_headers: str = _CORS_SAFE
+        if _has(self.cors_headers, "*"):
+            allowed_headers = req_headers
+        else:
+            if len(self.cors_headers) > 0:
+                allowed_headers = _CORS_SAFE + ", " + ", ".join(self.cors_headers)
+            if req_headers.strip() != "":
+                for h in req_headers.split(","):
+                    name: str = h.strip()
+                    if name != "" and not _has_ci(self.cors_headers, name) \
+                            and _CORS_SAFE.lower().find(name.lower()) < 0:
+                        if not _has(failures, "headers"):
+                            failures.append("headers")
+        hs: dict[str, str] = {}
+        if _has(self.cors_origins, "*") and not self.cors_credentials:
+            hs["access-control-allow-origin"] = "*"
+        else:
+            hs["access-control-allow-origin"] = origin
+            hs["vary"] = "Origin"
+        hs["access-control-allow-methods"] = _CORS_ALL_METHODS if _has(self.cors_methods, "*") \
+            else ", ".join(self.cors_methods)
+        hs["access-control-max-age"] = str(self.cors_max_age)
+        if allowed_headers != "":
+            hs["access-control-allow-headers"] = allowed_headers
+        if self.cors_credentials:
+            hs["access-control-allow-credentials"] = "true"
+        if len(failures) > 0:
+            return Response("Disallowed CORS " + ", ".join(failures), 400, move(hs),
+                            "text/plain; charset=utf-8")
+        return Response("OK", 200, move(hs), "text/plain; charset=utf-8")
+
+    def _cors_decorate(self: Ref[FastAPI], resp: Mut[Response], origin: str) -> None:
+        """Add CORS headers to a normal response for an allowed origin."""
+        if not self._cors_origin_ok(origin):
+            return
+        if _has(self.cors_origins, "*") and not self.cors_credentials:
+            resp.headers["access-control-allow-origin"] = "*"
+        else:
+            resp.headers["access-control-allow-origin"] = origin
+            resp.headers["vary"] = "Origin"
+        if self.cors_credentials:
+            resp.headers["access-control-allow-credentials"] = "true"
+        if len(self.cors_expose) > 0:
+            resp.headers["access-control-expose-headers"] = ", ".join(self.cors_expose)
 
     def add_api_route(self: Mut[FastAPI], path: str,
                       endpoint: Callable[[Request], Response],
@@ -523,6 +780,27 @@ class FastAPI:
 
     def _handle(self: Ref[FastAPI], method: str, target: str,
                 headers: Owned[dict[str, str]], body: str) -> Response:
+        """Dispatch one request: CORS preflight/decoration around the middleware chain."""
+        origin: str = ""
+        if self.cors_on:
+            o: str | None = headers.get("origin")
+            if o is not None:
+                origin = o
+            rm: str | None = headers.get("access-control-request-method")
+            if origin != "" and method == "OPTIONS":
+                if rm is not None:
+                    rh: str | None = headers.get("access-control-request-headers")
+                    hdrs: str = ""
+                    if rh is not None:
+                        hdrs = rh
+                    return self._cors_preflight(origin, rm, hdrs)
+        resp: Response = self._dispatch(method, target, move(headers), body)
+        if origin != "":
+            self._cors_decorate(resp, origin)
+        return resp
+
+    def _dispatch(self: Ref[FastAPI], method: str, target: str,
+                  headers: Owned[dict[str, str]], body: str) -> Response:
         q: int = target.find("?")
         path: str = target
         query: str = ""
@@ -531,6 +809,19 @@ class FastAPI:
             query = target[q + 1:len(target)]
         m: _Match = self._match(method, path)
         if not m.found:
+            if len(self.middlewares) > 0:
+                miss: Request = Request(method, path, {}, _parse_query(query), move(headers),
+                                        body, 404)
+                if m.matched_other:
+                    miss._handlers.append(_method_not_allowed)
+                else:
+                    miss._handlers.append(_not_found)
+                for mw0 in self.middlewares:
+                    miss._chain.append(mw0)
+                try:
+                    return _call_next(move(miss))
+                except Exception as e0:
+                    return PlainTextResponse("Internal Server Error", 500)
             if m.matched_other:
                 return JSONResponse({"detail": "Method Not Allowed"}, 405)
             return JSONResponse({"detail": "Not Found"}, 404)
@@ -538,9 +829,15 @@ class FastAPI:
         if m.nparam > 0:
             params = _params_from(_split_path(m.pattern), _split_path(path))
         handler: Callable[[Request], Response] = m.handler
-        req: Request = Request(method, path, move(params), _parse_query(query),
-                               move(headers), body, m.status)
         try:
+            req: Request = Request(method, path, move(params), _parse_query(query),
+                                   move(headers), body, m.status)
+            if len(self.middlewares) > 0:
+                req._handlers.append(handler)
+                req._async = m.is_async
+                for mw in self.middlewares:
+                    req._chain.append(mw)
+                return _call_next(move(req))
             if m.is_async:
                 return block_on(handler(move(req)))
             return handler(move(req))
@@ -554,7 +851,10 @@ class FastAPI:
     async def _handle_async(self: Ref[FastAPI], method: str, target: str,
                             headers: Owned[dict[str, str]], body: str) -> Response:
         """Task-context dispatch: `async def` handlers are awaited, so their awaits
-        suspend only this connection's task (D45)."""
+        suspend only this connection's task (D45). With CORS or middleware configured the
+        request goes through the synchronous chain instead (handlers then run to completion)."""
+        if self.cors_on or len(self.middlewares) > 0:
+            return self._handle(method, target, move(headers), body)
         q: int = target.find("?")
         path: str = target
         query: str = ""
@@ -570,9 +870,9 @@ class FastAPI:
         if m.nparam > 0:
             params = _params_from(_split_path(m.pattern), _split_path(path))
         handler: Callable[[Request], Response] = m.handler
-        req: Request = Request(method, path, move(params), _parse_query(query),
-                               move(headers), body, m.status)
         try:
+            req: Request = Request(method, path, move(params), _parse_query(query),
+                                   move(headers), body, m.status)
             if m.is_async:
                 return await handler(move(req))
             return handler(move(req))
@@ -620,6 +920,9 @@ class TestClient:
                 hs["content-type"] = "application/json"
             hs["content-length"] = str(len(content.encode("utf-8")))
         resp: Response = self.app._handle(method, _with_query(url, params), move(hs), content)
+        _run_background(resp)
+        if resp.streaming:
+            resp.content = _collect_stream(resp)
         out: dict[str, str] = {"content-type": resp.media_type,
                                "content-length": str(len(resp.content.encode("utf-8")))}
         for k2, v2 in resp.headers.items():
@@ -694,6 +997,7 @@ def handle_once(app: Ref[FastAPI], srv: Mut[HTTPServer]) -> None:
     req.end_headers()
     n: int = req.wfile.write(payload)
     req.finish()
+    _run_background(resp)
 
 
 def _status_line(code: int) -> str:
@@ -765,6 +1069,21 @@ def listen(host: str, port: int) -> int:
     return _listen(host, port)
 
 
+def shutdown_install() -> None:
+    """Route SIGTERM/SIGINT (Ctrl-C/Ctrl-Break on Windows) to a graceful stop of every serve loop."""
+    _shutdown_install()
+
+
+def shutdown_requested() -> bool:
+    """True once a shutdown signal arrived or shutdown_request() was called."""
+    return _shutdown_requested()
+
+
+def shutdown_request() -> None:
+    """Ask every serve loop in the process to stop accepting, drain in-flight requests and return."""
+    _shutdown_request()
+
+
 def listen_port(fd: int) -> int:
     """The local port of a listening socket (useful after binding port 0)."""
     return _local_port(fd)
@@ -813,17 +1132,13 @@ def _parse_request(conn: int) -> _Parsed:
             hval: str = hline[c + 1:len(hline)].strip()
             hs[hname] = hval
             if hname == "content-length" and _digits_ok(hval):
-                clen = int(hval)
+                clen = _parse_clen(hval)
         i += 1
     if clen > MAX_BODY:
         return _Parsed(False, "413", "", {}, "", False)
-    acc: bytearray = bytearray(rest)
-    while len(acc) < clen:
-        chunk: bytes = _recv(conn, 4096)
-        if len(chunk) == 0:
-            break
-        acc.extend(chunk)
-    full: bytes = bytes(acc)
+    full: bytes = _read_body(conn, rest, clen)
+    if len(full) < clen:
+        return bad
     body: str = ""
     try:
         body = full[0:clen].decode("utf-8")
@@ -842,16 +1157,24 @@ def _write_response(conn: int, resp: Ref[Response], keep: bool) -> None:
     payload: bytes = resp.content.encode("utf-8")
     out: str = "HTTP/1.1 " + _status_line(resp.status_code) + "\r\n"
     out += "content-type: " + resp.media_type + "\r\n"
-    out += "content-length: " + str(len(payload)) + "\r\n"
+    if resp.streaming:
+        out += "transfer-encoding: chunked\r\n"
+    else:
+        out += "content-length: " + str(len(payload)) + "\r\n"
     for k, hv in resp.headers.items():
         out += k + ": " + hv + "\r\n"
     if keep:
         out += "connection: keep-alive\r\n\r\n"
     else:
         out += "connection: close\r\n\r\n"
-    n: int = _send_all(conn, out.encode("utf-8") + payload, 0)
+    if resp.streaming:
+        n0: int = _send_all(conn, out.encode("utf-8"), 0)
+        _send_stream(conn, resp)
+    else:
+        n: int = _send_all(conn, out.encode("utf-8") + payload, 0)
     if not keep:
         _close(conn)
+    _run_background(resp)
 
 
 def _reject(conn: int, why: str) -> None:
@@ -921,24 +1244,50 @@ def serve_on(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
 
     Run one call per worker thread: `spawn(worker, fd)` where the worker builds
     its own app and calls serve_on(app, fd). max_requests bounds the total
-    requests served by THIS worker (-1 = forever).
+    requests served by THIS worker (-1 = forever). The loop returns after a
+    shutdown request (SIGTERM/Ctrl-C once `shutdown_install()` ran, or
+    `shutdown_request()`): the request in flight finishes, then its connection closes.
     """
+    _set_nonblocking(fd)
     served: int = 0
-    while max_requests < 0 or served < max_requests:
-        conn: int = _accept(fd)
+    while (max_requests < 0 or served < max_requests) and not shutdown_requested():
+        ready: bytes = _poll_ready(_pack1(fd), 100)
+        if len(ready) == 0:
+            continue
+        conn: int = _accept_nb(fd)
+        if conn <= 0:
+            continue
         _set_timeout(conn, 10000)
         alive: bool = True
         while alive and (max_requests < 0 or served < max_requests):
-            alive = _handle_conn(app, conn)
+            try:
+                alive = _handle_conn(app, conn)
+            except Exception as e:
+                alive = False
+                try:
+                    _close(conn)
+                except Exception as e2:
+                    pass
             served += 1
+            if alive and shutdown_requested():
+                break
         if alive:
             _close(conn)
 
 
+SHUTDOWN_GRACE: float = 10.0
+
+
 def run(app: Owned[FastAPI], host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Serve app forever on this thread (uvicorn.run equivalent, event-loop I/O)."""
+    """Serve app on this thread until SIGTERM/Ctrl-C (uvicorn.run equivalent, event-loop I/O).
+
+    The first signal stops accepting, lets in-flight requests finish (up to
+    SHUTDOWN_GRACE seconds), closes idle keep-alive connections and returns; a
+    second signal terminates immediately."""
+    shutdown_install()
     fd: int = listen(host, port)
     serve_async(app, fd)
+    _close(fd)
 
 
 def _pack(hs: Ref[list[int]]) -> bytes:
@@ -1034,7 +1383,7 @@ def _serve_buffered(app: Ref[FastAPI], conn: int, raw: Ref[bytes]) -> tuple[int,
     v: str | None = hs.get("content-length")
     if v is not None:
         if _digits_ok(v):
-            clen = int(v)
+            clen = _parse_clen(v)
     if clen > MAX_BODY:
         return (-1, False)
     total: int = sep + 4 + clen
@@ -1052,6 +1401,20 @@ def _serve_buffered(app: Ref[FastAPI], conn: int, raw: Ref[bytes]) -> tuple[int,
         conn_hdr = v2.lower()
     keep: bool = parts[2] == "HTTP/1.1" and conn_hdr != "close"
     resp: Response = app._handle(parts[0], parts[1], move(hs), body)
+    if resp.streaming:
+        sh: bytearray = bytearray(_status_head(resp.status_code))
+        sh.extend(resp.media_type.encode("utf-8"))
+        sh.extend(b"\r\ntransfer-encoding: chunked\r\n")
+        for k0, hv0 in resp.headers.items():
+            sh.extend((k0 + ": " + hv0 + "\r\n").encode("utf-8"))
+        if keep:
+            sh.extend(b"connection: keep-alive\r\n\r\n")
+        else:
+            sh.extend(b"connection: close\r\n\r\n")
+        ns: int = _send_all(conn, bytes(sh), 0)
+        _send_stream(conn, resp)
+        _run_background(resp)
+        return (total, keep)
     payload: bytes = resp.content.encode("utf-8")
     fast: bytes = b""
     if len(resp.headers) == 0:
@@ -1066,6 +1429,7 @@ def _serve_buffered(app: Ref[FastAPI], conn: int, raw: Ref[bytes]) -> tuple[int,
             out.extend(b"\r\nconnection: close\r\n\r\n")
         out.extend(payload)
         n0: int = _send_all(conn, bytes(out), 0)
+        _run_background(resp)
         return (total, keep)
     out.extend(_status_head(resp.status_code))
     out.extend(resp.media_type.encode("utf-8"))
@@ -1080,10 +1444,12 @@ def _serve_buffered(app: Ref[FastAPI], conn: int, raw: Ref[bytes]) -> tuple[int,
         out.extend(b"connection: close\r\n\r\n")
     out.extend(payload)
     n: int = _send_all(conn, bytes(out), 0)
+    _run_background(resp)
     return (total, keep)
 
 
-def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
+def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1,
+                read_deadline: float = 30.0) -> None:
     """Event-loop serving: ONE thread multiplexes every connection (non-blocking I/O).
 
     This is the uvicorn-style model: readiness-polled sockets, no thread per
@@ -1093,20 +1459,41 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
     _set_nonblocking(fd)
     conns: list[int] = []
     bufs: list[bytearray] = []
+    since: list[float] = []
     slot: dict[int, int] = {}
     packed: bytearray = bytearray(_pack1(fd))
     dirty: bool = False
     served: int = 0
+    draining: bool = False
+    deadline: float = 0.0
     while max_requests < 0 or served < max_requests:
+        now: float = _monotonic()
+        if not draining and shutdown_requested():
+            draining = True
+            deadline = now + SHUTDOWN_GRACE
+            dirty = True
+        closed: list[int] = []
+        for ci in range(len(conns)):
+            if len(bufs[ci]) > 0:
+                if now - since[ci] > read_deadline:
+                    closed.append(conns[ci])
+            elif draining:
+                closed.append(conns[ci])
+        if draining and (len(closed) == len(conns) or now >= deadline):
+            break
         if dirty:
-            packed = bytearray(_pack1(fd))
+            if draining:
+                packed = bytearray(b"")
+            else:
+                packed = bytearray(_pack1(fd))
             for cfd in conns:
                 packed.extend(_pack1(cfd))
             dirty = False
-        ready: list[int] = _unpack(_poll_ready(bytes(packed), 50))
-        closed: list[int] = []
+        ready: list[int] = []
+        if len(packed) > 0:
+            ready = _unpack(_poll_ready(bytes(packed), 50))
         for h in ready:
-            if h == fd:
+            if h == fd and not draining:
                 accepting: bool = True
                 naccept: int = 0
                 while accepting:
@@ -1116,6 +1503,7 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
                         slot[c] = len(conns)
                         conns.append(c)
                         bufs.append(bytearray(b""))
+                        since.append(now)
                         packed.extend(_pack1(c))
                         naccept += 1
                         if naccept >= 64:
@@ -1146,6 +1534,8 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
                     fresh += len(data)
                     if len(data) < 65536:
                         reading = False
+                    if len(bufs[idx]) == 0:
+                        since[idx] = now
                     bufs[idx].extend(data)
             if fresh == 0:
                 if hup:
@@ -1154,7 +1544,11 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
             raw: bytes = bytes(bufs[idx])
             pumping: bool = True
             while pumping:
-                res: tuple[int, bool] = _serve_buffered(app, h, raw)
+                res: tuple[int, bool] = (-1, False)
+                try:
+                    res = _serve_buffered(app, h, raw)
+                except Exception as e_io:
+                    res = (-1, False)
                 if res[0] < 0:
                     closed.append(h)
                     pumping = False
@@ -1175,6 +1569,7 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
             bufs[idx] = bytearray(b"")
             if len(raw) > 0:
                 bufs[idx].extend(raw)
+                since[idx] = now
             if hup:
                 closed.append(h)
         for h2 in closed:
@@ -1189,9 +1584,11 @@ def serve_async(app: Ref[FastAPI], fd: int, max_requests: int = -1) -> None:
                     tail: bytearray = bufs.pop()
                     conns[idx2] = moved
                     bufs[idx2] = move(tail)
+                    since[idx2] = since[last]
                     slot[moved] = idx2
                 else:
                     buf_gone: bytearray = bufs.pop()
+                t_gone: float = since.pop()
                 gone: int = conns.pop()
                 dirty = True
     for h3 in conns:

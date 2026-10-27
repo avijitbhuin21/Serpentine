@@ -9,13 +9,28 @@ from serpentine import JoinHandle, spawn
 
 
 def handle(c: int) -> None:
-    """Serve one connection: /sleep/<ms>/<tag> waits then echoes the tag."""
+    """Serve one connection: /sleep/<ms>/<tag> waits then echoes the tag.
+
+    The request body is drained before replying: closing a socket with unread
+    input makes Windows send RST, which can discard the response in flight."""
     raw: bytes = b""
     while raw.find(b"\r\n\r\n") < 0:
         chunk: bytes = recv(c, 65536)
         if len(chunk) == 0:
             break
         raw = raw + chunk
+    head_end: int = raw.find(b"\r\n\r\n")
+    clen: int = 0
+    for hl in raw[0:head_end].split(b"\r\n"):
+        low: str = hl.decode("utf-8").lower()
+        if low.startswith("content-length:"):
+            clen = int(low[15:len(low)].strip())
+    have: int = len(raw) - (head_end + 4)
+    while have < clen:
+        more: bytes = recv(c, 65536)
+        if len(more) == 0:
+            break
+        have += len(more)
     line: str = raw.split(b"\r\n")[0].decode("utf-8")
     path: str = line.split(" ")[1]
     parts: list[str] = path.split("/")

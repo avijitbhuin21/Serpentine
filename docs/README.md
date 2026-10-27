@@ -12,6 +12,7 @@
 | [DECISIONS.md](DECISIONS.md) | Resolved design decisions (D1–D12+). Reopening one is a spec change. |
 | [libraries.md](libraries.md) | Library tracker — every `serp-*` dist, wave by wave, one line each, blockers at the bottom. |
 | [readiness.md](readiness.md) | Production-readiness checklist — verdict (L1/L2/L3), remaining work by priority, done items with evidence. |
+| [stability.md](stability.md) | Stability & versioning policy — SemVer rules, per-surface guarantees, deprecation. |
 | [../CHANGELOG.md](../CHANGELOG.md) | What shipped in each compiler/shim release. |
 | [../SECURITY.md](../SECURITY.md) | Vulnerability reporting and supported versions. |
 
@@ -45,4 +46,5 @@ stays one line per library.
 | [guides/publishing.md](guides/publishing.md) | Publishing libraries & releases. |
 | [guides/benchmarks.md](guides/benchmarks.md) | Benchmark methodology & results. |
 | [guides/testing.md](guides/testing.md) | Test suites, fuzzers, Miri/ASan, traceback/TLS checks and the soak test. |
+| [guides/deployment.md](guides/deployment.md) | Running a Venom service: health endpoints, graceful shutdown, timeouts, systemd/Docker/Kubernetes. |
 

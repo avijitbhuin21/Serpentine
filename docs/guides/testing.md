@@ -35,6 +35,25 @@ Generates random well-typed programs (bounded int arithmetic, strings, lists, br
 helper functions, `try`/`except`) and requires identical output from CPython, Backend A and
 Backend B. Failing programs are kept in the printed temp directory.
 
+**Checker robustness fuzzer** — `python tools/run_check_fuzz.py [--seed N] [--count N]`. Mutates
+the accept/reject corpora line- and token-wise (plus random garbage) and runs the checker
+in-process via `serpentine_lang.api.check_source`. Any escaping Python exception is a crash;
+crashing inputs are saved.
+
+**HTTP request fuzzer** — `python tools/run_http_fuzz.py [--seed N] [--count N] [--backend ...]`.
+Builds `tools/shutdown/app.py` per backend and serving mode and throws malformed requests at it.
+Every reply must be a well-formed status line or a close, `/healthz` must keep answering, and the
+process must stay alive.
+
+## Service checks
+
+- **Graceful shutdown** — `python tools/run_shutdown_check.py`: real SIGTERM / Ctrl-Break while a
+  1 s request is in flight; the request must complete, new connections must be refused and the
+  process must exit 0 (both backends × `serve_async`/`serve_on`).
+- **Scale** — `python tools/run_scale_test.py [--loc 50000]`: generates a multi-module program,
+  times `serp check` and both builds, reports the compiler's peak memory and compares the
+  binaries' output with CPython.
+
 ## Memory-safety checks (local, nightly toolchain)
 
 Both need `rustup toolchain install nightly`.
@@ -46,7 +65,8 @@ Both need `rustup toolchain install nightly`.
 - **AddressSanitizer** — `python tools/run_asan.py [test ...]`. Builds the accept corpus with
   Backend A and `-Zsanitizer=address` (through the `SERP_RUSTC_FLAGS` env hook) and fails on any
   ASan report or output change. On Windows it puts MSVC's `clang_rt.asan_dynamic` DLL on `PATH`
-  automatically.
+  automatically. `--backend llvm` does the same for Backend B: the runtime and link stub are
+  instrumented, but the LLVM-emitted program code isn't (llvmlite has no sanitizer passes).
 
 ## Soak test
 

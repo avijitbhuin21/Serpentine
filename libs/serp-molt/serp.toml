@@ -1,6 +1,6 @@
 [project]
 name = "serp-molt"
-version = "0.7.0"
+version = "0.7.1"
 
 [build]
 roots = ["src", "../serp-json/src", "../serp-re/src", "../serp-datetime/src", "../serp-uuid/src", "../serp-base64/src"]
@@ -8,6 +8,6 @@ roots = ["src", "../serp-json/src", "../serp-re/src", "../serp-datetime/src", ".
 [dependencies]
 serp-json = "0.3.0"
 serp-re = "0.2.0"
-serp-datetime = "0.2.0"
+serp-datetime = "0.4.0"
 serp-uuid = "0.2.0"
 serp-base64 = "0.1.0"

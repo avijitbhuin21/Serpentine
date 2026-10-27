@@ -1270,7 +1270,15 @@ class RustGen:
                 guard = self._q(f"shared_mut({self._expr(e.value, 'ref')})") if mut \
                     else self._q(f"shared_ref({self._expr(e.value, 'ref')})")
                 return f"{guard}.a_{e.attr}"
-            return f"{self._place(e.value, mut)}.a_{e.attr}"
+            base = self._place(e.value, mut)
+            if isinstance(e.value, (ast.Name, ast.Attribute)) \
+                    and id(e.value) in self.tc.narrowed_uses:
+                vslot = self.tc.narrow_variant.get(id(e.value))
+                if vslot is not None:
+                    base = f"{base}.mut_{vslot}()" if mut else f"{base}.as_{vslot}()"
+                else:
+                    base = f"{base}.as_mut().unwrap()" if mut else f"{base}.as_ref().unwrap()"
+            return f"{base}.a_{e.attr}"
         if isinstance(e, ast.Subscript) and id(e) not in self.tc.op_calls:
             base_t = self._t(e.value)
             idx = self._expr(e.slice, "val")
@@ -1347,7 +1355,8 @@ class RustGen:
                 return f"{code}.clone()"
             return code
         place = self._place(node.value, mut=(mode == "mut"))
-        if isinstance(node.value, ast.Name) and id(node.value) in self.tc.narrowed_uses:
+        if isinstance(node.value, (ast.Name, ast.Attribute)) \
+                and id(node.value) in self.tc.narrowed_uses:
             vslot = self.tc.narrow_variant.get(id(node.value))
             if vslot is not None:
                 place = f"{place}.mut_{vslot}()" if mode == "mut" else f"{place}.as_{vslot}()"
@@ -1748,7 +1757,8 @@ class RustGen:
         ft = self._t(node)
         assert isinstance(ft, TFunc)
         caps = self.tc.lambda_caps.get(id(node), [])
-        lets = " ".join(f"let v_{n} = v_{n}.clone();" for n, t in caps if needs_clone(t))
+        lets = " ".join(f"let v_{n} = v_{n}.clone();" for n, t in caps
+                        if needs_clone(t) or not t.is_copy())
         saved_scope = {}
         for a, pt in zip(node.args.args, ft.params):
             saved_scope[a.arg] = self.scope_types.get(a.arg)
@@ -1756,8 +1766,19 @@ class RustGen:
         saved_ctx, self.try_ctx = self.try_ctx, []
         saved_fin, self.try_finals = self.try_finals, []
         saved_loops, self.loop_stack = self.loop_stack, []
-        body = self._coerce(self._expr(node.body, "val", expect=ft.ret),
-                            self._t(node.body), ft.ret)
+        stmt_body: str | None = None
+        if isinstance(ft.ret, TNone):
+            saved_out, saved_indent = self.out, self.indent
+            self.out, self.indent = [], 0
+            st = ast.Expr(value=node.body)
+            ast.copy_location(st, node.body)
+            self._emit_stmt(st)
+            stmt_body = " ".join(s.strip() for s in self.out)
+            self.out, self.indent = saved_out, saved_indent
+            body = ""
+        else:
+            body = self._coerce(self._expr(node.body, "val", expect=ft.ret),
+                                self._t(node.body), ft.ret)
         self.try_ctx = saved_ctx
         self.try_finals = saved_fin
         self.loop_stack = saved_loops
@@ -1769,6 +1790,9 @@ class RustGen:
         params = ", ".join(f"v_{a.arg}: {rust_type(pt)}"
                            for a, pt in zip(node.args.args, ft.params))
         ret = "()" if isinstance(ft.ret, TNone) else rust_type(ft.ret)
+        if stmt_body is not None:
+            return (f"{{ {lets} (Rc::new(move |{params}| -> SRes<()> "
+                    f"{{ {stmt_body} Ok(()) }}) as {rust_type(ft)}) }}")
         return (f"{{ {lets} (Rc::new(move |{params}| -> SRes<{ret}> "
                 f"{{ Ok({body}) }}) as {rust_type(ft)}) }}")
 
@@ -1944,6 +1968,10 @@ class RustGen:
             code, vt = f"{v}i64", TInt()
         elif isinstance(v, float):
             code, vt = f"{v!r}f64", TFloat()
+        elif isinstance(v, bytes):
+            items = ", ".join(f"{b}u8" for b in v)
+            code = f"sbytes(vec![{items}])" if v else "sbytes(Vec::new())"
+            vt = TBytes()
         else:
             esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") \
                 .replace("\r", "\\r").replace("\t", "\\t")

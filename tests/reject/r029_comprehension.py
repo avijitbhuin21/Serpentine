@@ -1,10 +1,10 @@
 # serp-reject: SE201 unsupported-feature
-"""Reject: Tier-2 comprehensions take exactly one 'for' clause."""
+"""Reject: dict comprehensions take exactly one 'for' clause (list/set ones may take several)."""
 
 
 def main() -> None:
     xss: list[list[int]] = [[1, 2], [3]]
-    flat: list[int] = [x for xs in xss for x in xs]  # E: SE201
+    flat: dict[int, int] = {x: x for xs in xss for x in xs}  # E: SE201
     print(flat)
 
 

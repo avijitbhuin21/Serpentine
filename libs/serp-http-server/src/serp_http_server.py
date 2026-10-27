@@ -19,9 +19,25 @@ from _serp_socket import local_port as _local_port
 from _serp_socket import recv as _recv
 from _serp_socket import send_all as _send_all
 from _serp_socket import set_timeout as _set_timeout
+from serp_time import monotonic as _monotonic
 
 MAX_HEAD: int = 65536
 MAX_BODY: int = 16777216
+REQUEST_DEADLINE: float = 30.0
+
+
+def _deadline_passed(start: float) -> bool:
+    """True once a request has been reading for longer than REQUEST_DEADLINE seconds (slowloris guard)."""
+    return _monotonic() - start > REQUEST_DEADLINE
+
+
+def _parse_clen(v: str) -> int:
+    """Content-Length value: -1 when not plain digits, MAX_BODY + 1 when too long to be acceptable."""
+    if not _digits_ok(v):
+        return -1
+    if len(v) > 12:
+        return MAX_BODY + 1
+    return int(v)
 
 
 def _send(conn: int, data: bytes) -> int:
@@ -72,6 +88,7 @@ def _digits_ok(s: str) -> bool:
 
 def _read_head(conn: int) -> bytes:
     buf: bytearray = bytearray(b"")
+    start: float = _monotonic()
     while len(buf) < MAX_HEAD:
         chunk: bytes = _recv(conn, 4096)
         if len(chunk) == 0:
@@ -79,7 +96,23 @@ def _read_head(conn: int) -> bytes:
         buf.extend(chunk)
         if bytes(buf).find(b"\r\n\r\n") >= 0:
             break
+        if _deadline_passed(start):
+            return b""
     return bytes(buf)
+
+
+def _read_body(conn: int, have: bytes, clen: int) -> bytes:
+    """Read the rest of a content-length body; b"" when the peer is too slow or hangs up early."""
+    acc: bytearray = bytearray(have)
+    start: float = _monotonic()
+    while len(acc) < clen:
+        chunk: bytes = _recv(conn, 4096)
+        if len(chunk) == 0:
+            break
+        acc.extend(chunk)
+        if len(acc) < clen and _deadline_passed(start):
+            return b""
+    return bytes(acc)
 
 
 @dataclass
@@ -250,17 +283,13 @@ class HTTPServer:
                 hval: str = hline[c + 1:len(hline)].strip()
                 hlines.append(hname + ": " + hval)
                 if hname.lower() == "content-length" and _digits_ok(hval):
-                    clen = int(hval)
+                    clen = _parse_clen(hval)
             i += 1
         if clen > MAX_BODY:
             return _too_large(conn)
-        body: bytearray = bytearray(rest)
-        while len(body) < clen:
-            chunk: bytes = _recv(conn, 4096)
-            if len(chunk) == 0:
-                break
-            body.extend(chunk)
-        full: bytes = bytes(body)
+        full: bytes = _read_body(conn, rest, clen)
+        if len(full) < clen:
+            return _bad_request(conn)
         hdrs: _Headers = _Headers(move(hlines))
         rf: _RFile = _RFile(full[0:clen])
         wf: _WFile = _WFile(conn)

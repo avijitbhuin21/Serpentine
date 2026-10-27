@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-log"
-version = "0.2.0"
+version = "0.2.1"
 description = "Serpentine logging library: level-filtered loggers with stdout and append-file sinks (pure Serpentine)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,4 +24,4 @@ Homepage = "https://github.com/avijitbhuin21/Serpentine"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-py-modules = ["serp_log"]
+py-modules = ["serp_log", "serp_log_core"]

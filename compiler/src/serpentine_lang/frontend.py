@@ -44,6 +44,8 @@ class Module:
     async_methods: bool = False
     imports_asyncio: bool = False
     app_bindings: dict[str, ast.Call] = field(default_factory=dict)
+    class_attrs: dict[tuple[str, str], str] = field(default_factory=dict)
+    module_aliases: dict[str, str] = field(default_factory=dict)
     app_stmts: list[ast.Call] = field(default_factory=list)
     registrars: dict[str, dict[str, ast.FunctionDef]] = field(default_factory=dict)
     exc_inits: dict[str, str] = field(default_factory=dict)
@@ -661,6 +663,20 @@ def _inject_params(program: Program, mod: Module, rep: Reporter, fn: ast.Functio
         elif isinstance(inner, ast.Name) and inner.id in SCALAR_KINDS:
             kind, _zero = SCALAR_KINDS[inner.id]
             value = _rq_call(f"_serp_query_opt_{kind}", [ast.Constant(value=p.arg)])
+        elif is_class and isinstance(ann, ast.Name) \
+                and (_origin_of(program, mod, ann.id) or ("", ""))[1] == "BackgroundTasks":
+            value = ast.Call(func=_name(ann.id), args=[], keywords=[])
+            if not (isinstance(p.annotation, ast.Subscript) and isinstance(p.annotation.value, ast.Name)
+                    and p.annotation.value.id == "Mut"):
+                p.annotation = ast.Subscript(value=_name("Mut"), slice=copy.deepcopy(ann),
+                                             ctx=ast.Load())
+                ast.copy_location(p.annotation, ann)
+            mod.shim_imports.update({"Mut", "move"})
+            setattr(fn, "_serp_bg_local", local)
+            body.append(ast.AnnAssign(target=ast.Name(id=local, ctx=ast.Store()),
+                                      annotation=copy.deepcopy(ann), value=value, simple=1))
+            call_args.append(_name(local))
+            continue
         elif is_class:
             assert isinstance(ann, ast.Name)
             if not _class_has_method(program, _origin_of(program, mod, ann.id),
@@ -763,6 +779,18 @@ def _endpoint_for(program: Program, mod: Module, rep: Reporter, fn: ast.Function
                 generators=[ast.comprehension(target=ast.Name(id="_serp_x", ctx=ast.Store()),
                                               iter=_name("_serp_r"), ifs=[], is_async=0)])
         body.append(ast.Return(value=ast.Call(func=respond, args=[payload], keywords=[])))
+    bg_local = getattr(fn, "_serp_bg_local", None)
+    if bg_local is not None and body and isinstance(body[-1], ast.Return):
+        final = body.pop()
+        assert isinstance(final, ast.Return) and final.value is not None
+        body.append(ast.AnnAssign(target=ast.Name(id="_serp_resp", ctx=ast.Store()),
+                                  annotation=_name(rs), value=final.value, simple=1))
+        body.append(ast.Assign(
+            targets=[ast.Attribute(value=_name("_serp_resp"), attr="background", ctx=ast.Store())],
+            value=ast.Call(func=_name("move"),
+                           args=[ast.Attribute(value=_name(bg_local), attr="tasks", ctx=ast.Load())],
+                           keywords=[])))
+        body.append(ast.Return(value=_name("_serp_resp")))
     ep_name = f"_serp_ep_{fn.name}"
     ep = ast.FunctionDef(
         name=ep_name,
@@ -835,14 +863,19 @@ def _synthesize_app_bindings(program: Program, rep: Reporter) -> None:
                     rep.fatal("SE201", "unsupported-feature",
                               f"@{xname}.{target.attr}(...) is not a @registrar method of "
                               f"'{cname}'", dspan)
-                rq, rs = _registrar_types(cmod, meth, rep, dspan)
-                path = dexpr.args[0].value if dexpr.args and isinstance(dexpr.args[0], ast.Constant) \
-                    and isinstance(dexpr.args[0].value, str) else ""
                 fn = mod.functions.get(fname)
                 assert fn is not None
-                rq_local = _import_alias(mod, _origin_of(cmod, cmod, rq) or (cmod.name, rq))
-                rs_local = _import_alias(mod, _origin_of(cmod, cmod, rs) or (cmod.name, rs))
-                ep = _endpoint_for(program, mod, rep, fn, path, rq_local, rs_local)
+                direct = _registrar_direct(meth)
+                if direct is not None:
+                    _fill_direct_sig(program, mod, cmod, fn, direct)
+                    ep = fname
+                else:
+                    rq, rs = _registrar_types(cmod, meth, rep, dspan)
+                    path = dexpr.args[0].value if dexpr.args and isinstance(dexpr.args[0], ast.Constant) \
+                        and isinstance(dexpr.args[0].value, str) else ""
+                    rq_local = _import_alias(mod, _origin_of(cmod, cmod, rq) or (cmod.name, rq))
+                    rs_local = _import_alias(mod, _origin_of(cmod, cmod, rs) or (cmod.name, rs))
+                    ep = _endpoint_for(program, mod, rep, fn, path, rq_local, rs_local)
                 kws = [copy.deepcopy(k) for k in dexpr.keywords]
                 if fname in mod.async_fns:
                     kws.append(ast.keyword(arg="is_async", value=ast.Constant(value=True)))
@@ -878,7 +911,107 @@ def _synthesize_app_bindings(program: Program, rep: Reporter) -> None:
                     if tgt == (mod.name, xname):
                         other.imports[local] = (mod.name, factory)
                         _rewrite_name_to_call(other, local, local, skip=set())
+        for (cname, attr), synth in mod.class_attrs.items():
+            factory = f"_serp_app_{synth}"
+            _rewrite_attr_to_call(mod, cname, attr, factory)
+            for other in program.modules.values():
+                for local, tgt in list(other.imports.items()):
+                    if tgt == (mod.name, cname):
+                        other.imports[factory] = (mod.name, factory)
+                        _rewrite_attr_to_call(other, local, attr, factory)
         del factories
+
+
+def _rewrite_attr_to_call(mod: Module, cname: str, attr: str, factory: str) -> None:
+    """Replace every load of the class attribute `cname.attr` inside functions/methods with
+    a call to its binding factory (module-level `C.attr = D(...)`, D41)."""
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node: ast.Attribute):
+            """Swap a Load of `cname.attr` for the factory call."""
+            if node.attr == attr and isinstance(node.value, ast.Name) \
+                    and node.value.id == cname and isinstance(node.ctx, ast.Load):
+                return ast.copy_location(
+                    ast.Call(func=ast.copy_location(_name(factory), node), args=[], keywords=[]),
+                    node)
+            self.generic_visit(node)
+            return node
+
+    rw = Rewriter()
+    for fn in list(mod.functions.values()):
+        if fn.name != factory:
+            rw.visit(fn)
+    for cls in mod.classes.values():
+        rw.visit(cls)
+
+
+def _registrar_direct(meth: ast.FunctionDef) -> ast.expr | None:
+    """The endpoint annotation of a registrar taking a 2-argument callable (middleware style,
+    `Callable[[Rq, Callable[[Rq], Rs]], Rs]`): such decorated functions are passed as is."""
+    for a in meth.args.args[1:]:
+        ann = a.annotation
+        if isinstance(ann, ast.Subscript) and isinstance(ann.value, ast.Name) \
+                and ann.value.id == "Callable" and isinstance(ann.slice, ast.Tuple) \
+                and len(ann.slice.elts) == 2 and isinstance(ann.slice.elts[0], ast.List) \
+                and len(ann.slice.elts[0].elts) == 2:
+            return ann
+    return None
+
+
+def _localize_ann(ann: ast.expr, cmod: Module, mod: Module) -> ast.expr:
+    """Copy an annotation written in the registrar's module so its class names resolve in mod."""
+    out = copy.deepcopy(ann)
+
+    class Localizer(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name):
+            """Re-point class names of cmod at import aliases in mod."""
+            if node.id in cmod.classes or node.id in cmod.imports:
+                origin = _origin_of(cmod, cmod, node.id) or (cmod.name, node.id)
+                return ast.copy_location(_name(_import_alias(mod, origin)), node)
+            return node
+
+    return Localizer().visit(out)
+
+
+def _fill_direct_sig(program: Program, mod: Module, cmod: Module, fn: ast.FunctionDef,
+                     ann: ast.expr) -> None:
+    """Complete a middleware function's signature from the registrar's callable type:
+    `(request: Request, call_next)` becomes `(request: Owned[Request], call_next: Callable[...])
+    -> Response` so FastAPI-style middleware compiles unchanged."""
+    assert isinstance(ann, ast.Subscript) and isinstance(ann.slice, ast.Tuple)
+    params_t = ann.slice.elts[0]
+    assert isinstance(params_t, ast.List)
+    ps = fn.args.args
+    if len(ps) == 2:
+        p0 = ps[0]
+        if p0.annotation is None:
+            p0.annotation = _localize_ann(params_t.elts[0], cmod, mod)
+        if not (isinstance(p0.annotation, ast.Subscript) and isinstance(p0.annotation.value, ast.Name)
+                and p0.annotation.value.id in ("Owned", "Ref", "Mut")):
+            p0.annotation = ast.Subscript(value=_name("Owned"), slice=p0.annotation, ctx=ast.Load())
+        if ps[1].annotation is None:
+            ps[1].annotation = _localize_ann(params_t.elts[1], cmod, mod)
+    if fn.returns is None:
+        fn.returns = _localize_ann(ann.slice.elts[1], cmod, mod)
+    if len(ps) == 2:
+        req_name, next_name = ps[0].arg, ps[1].arg
+
+        class MoveIntoNext(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call):
+                """`call_next(request)` hands the request over: make the move explicit."""
+                self.generic_visit(node)
+                if isinstance(node.func, ast.Name) and node.func.id == next_name \
+                        and len(node.args) == 1 and isinstance(node.args[0], ast.Name) \
+                        and node.args[0].id == req_name:
+                    node.args[0] = ast.copy_location(
+                        ast.Call(func=_name("move"), args=[node.args[0]], keywords=[]), node.args[0])
+                return node
+
+        for st in fn.body:
+            MoveIntoNext().visit(st)
+        mod.shim_imports.add("move")
+    ast.fix_missing_locations(fn)
+    mod.shim_imports.update({"Owned", "Callable"})
 
 
 def _registrar_types(cmod: Module, meth: ast.FunctionDef, rep: Reporter,
@@ -1021,6 +1154,88 @@ def _import_span(mod: Module, mod_name: str) -> Span:
     return Span(str(mod.path), 1, 0)
 
 
+_FLATTEN_SRC = '''
+from serpentine import Owned, TypeVar
+_SerpFlatT = TypeVar("_SerpFlatT")
+
+
+def _serp_flatten(xss: Owned[list[list[_SerpFlatT]]]) -> list[_SerpFlatT]:
+    """Concatenate a list of lists, moving the elements (multi-for comprehension support)."""
+    rev: list[_SerpFlatT] = []
+    while len(xss) > 0:
+        xs: list[_SerpFlatT] = xss.pop()
+        while len(xs) > 0:
+            rev.append(xs.pop())
+    rev.reverse()
+    return rev
+'''
+
+
+def _desugar_comprehensions(tree: ast.Module) -> None:
+    """Lower comprehension shapes the backends don't emit directly into ones they do:
+    several `if` clauses on one `for` become one `and`, and every extra `for` clause turns
+    `[e for a in A for b in B]` into `_serp_flatten([[e for b in B] for a in A])` (same
+    element order and evaluation order as CPython). Set comprehensions go through set()."""
+    used = [False]
+
+    def merge_ifs(gens: list[ast.comprehension]) -> None:
+        for g in gens:
+            if len(g.ifs) > 1:
+                g.ifs = [ast.copy_location(ast.BoolOp(op=ast.And(), values=list(g.ifs)), g.ifs[0])]
+
+    def split(elt: ast.expr, gens: list[ast.comprehension], at: ast.AST) -> ast.expr:
+        if len(gens) == 1:
+            return ast.copy_location(ast.ListComp(elt=elt, generators=gens), at)
+        used[0] = True
+        inner = split(elt, gens[1:], at)
+        outer = ast.copy_location(ast.ListComp(elt=inner, generators=[gens[0]]), at)
+        return ast.copy_location(ast.Call(func=ast.Name(id="_serp_flatten", ctx=ast.Load()),
+                                          args=[outer], keywords=[]), at)
+
+    class Lower(ast.NodeTransformer):
+        def visit_ListComp(self, node: ast.ListComp):
+            """Multi-clause list comprehension → nested comprehension + flatten."""
+            self.generic_visit(node)
+            merge_ifs(node.generators)
+            if len(node.generators) > 1:
+                return split(node.elt, node.generators, node)
+            return node
+
+        def visit_SetComp(self, node: ast.SetComp):
+            """Multi-clause set comprehension → set(flattened list)."""
+            self.generic_visit(node)
+            merge_ifs(node.generators)
+            if len(node.generators) > 1:
+                return ast.copy_location(ast.Call(func=ast.Name(id="set", ctx=ast.Load()),
+                                                  args=[split(node.elt, node.generators, node)],
+                                                  keywords=[]), node)
+            return node
+
+        def visit_DictComp(self, node: ast.DictComp):
+            """Dict comprehensions: only the multi-`if` form is lowered."""
+            self.generic_visit(node)
+            merge_ifs(node.generators)
+            return node
+
+    Lower().visit(tree)
+    if used[0]:
+        helper = ast.parse(_FLATTEN_SRC).body
+        for st in helper:
+            ast.copy_location(st, tree.body[0] if tree.body else st)
+            for sub in ast.walk(st):
+                if hasattr(sub, "lineno"):
+                    sub.lineno = getattr(tree.body[0], "lineno", 1) if tree.body else 1
+                    sub.col_offset = 0
+        at = 0
+        while at < len(tree.body) and (
+                (isinstance(tree.body[at], ast.Expr) and isinstance(tree.body[at].value, ast.Constant)
+                 and isinstance(tree.body[at].value.value, str) and at == 0)
+                or (isinstance(tree.body[at], ast.ImportFrom) and tree.body[at].module == "__future__")):
+            at += 1
+        tree.body[at:at] = helper
+        ast.fix_missing_locations(tree)
+
+
 def _load_module(path: Path, name: str, rep: Reporter,
                  overlay: dict[str, str] | None = None) -> Module:
     """Parse one file and enforce the module-level structure rules."""
@@ -1036,6 +1251,7 @@ def _load_module(path: Path, name: str, rep: Reporter,
         rep.fatal("SE201", "unsupported-feature", f"syntax error: {exc.msg}",
                   Span(str(path), exc.lineno or 1, (exc.offset or 1) - 1))
     _rewrite_with_statements(tree)
+    _desugar_comprehensions(tree)
     mod = Module(name=name, path=path, tree=tree)
     file = str(path)
 
@@ -1123,12 +1339,13 @@ def _load_module(path: Path, name: str, rep: Reporter,
                             and sub.value.id == "asyncio" and sub.attr not in AIO_CORE:
                         mod.imports.setdefault(_aio_local(sub.attr), ("serp_asyncio", sub.attr))
                 continue
-            rep.fatal("SE213", "foreign-import",
-                      f"import of '{node.names[0].name}' is not supported — use "
-                      f"'from {node.names[0].name} import ...' for Serpentine modules "
-                      f"(only 'import sys' is special-cased); the interop boundary refuses "
-                      f"foreign imports in native builds (docs/guides/interop.md)",
-                      span)
+            for alias in node.names:
+                if alias.name in ("sys", "asyncio", "serpentine", "typing", "enum", "dataclasses"):
+                    rep.fatal("SE213", "foreign-import",
+                              f"'import {alias.name}' is only supported as a bare 'import sys' / "
+                              f"'import asyncio'; use 'from {alias.name} import ...'", span)
+                mod.module_aliases[alias.asname or alias.name] = alias.name
+            continue
         elif isinstance(node, ast.FunctionDef):
             if node.decorator_list:
                 for d in node.decorator_list:
@@ -1231,6 +1448,14 @@ def _load_module(path: Path, name: str, rep: Reporter,
                 and isinstance(node.targets[0], ast.Name) \
                 and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
             mod.app_bindings[node.targets[0].id] = node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Attribute) \
+                and isinstance(node.targets[0].value, ast.Name) \
+                and node.targets[0].value.id in mod.classes \
+                and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            synth = f"_serp_ca_{node.targets[0].value.id}_{node.targets[0].attr}"
+            mod.app_bindings[synth] = node.value
+            mod.class_attrs[(node.targets[0].value.id, node.targets[0].attr)] = synth
         elif isinstance(node, ast.Assign):
             rep.fatal("SE206", "mutable-global",
                       "module-level bindings must be annotated Copy-typed constants", span)
@@ -1243,10 +1468,55 @@ def _load_module(path: Path, name: str, rep: Reporter,
             rep.fatal("SE205", "module-level-statement",
                       "only imports, function definitions, classes, Copy constants, and the "
                       "entry guard are allowed at module level", span)
+    if mod.module_aliases:
+        _rewrite_module_attrs(mod, tree, rep)
     _fold_negative_literals(mod)
     if mod.rtlib_consts:
         _fold_rtlib_consts(mod, rep)
     return mod
+
+
+def _dotted(e: ast.expr) -> str | None:
+    """`a.b.c` text of a Name/Attribute chain (None for anything else)."""
+    if isinstance(e, ast.Name):
+        return e.id
+    if isinstance(e, ast.Attribute):
+        inner = _dotted(e.value)
+        return None if inner is None else inner + "." + e.attr
+    return None
+
+
+def _rewrite_module_attrs(mod: Module, tree: ast.Module, rep: Reporter) -> None:
+    """`import a.b [as c]`: every load of `a.b.x` (or `c.x`) becomes a synthesized local
+    bound exactly like `from a.b import x` would bind it (rtlib members included)."""
+    aliases = mod.module_aliases
+    file = str(mod.path)
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Attribute(self, node: ast.Attribute):
+            """Replace `<module path>.<member>` with the member's synthesized local name."""
+            path = _dotted(node.value)
+            if path is not None and path in aliases and isinstance(node.ctx, ast.Load):
+                target = aliases[path]
+                local = f"_serp_imp_{path.replace('.', '_')}__{node.attr}"
+                if target in RTLIB_MODULES:
+                    fn = RTLIB_FUNCS.get((target, node.attr))
+                    cv = RTLIB_CONSTS.get((target, node.attr))
+                    if fn is not None:
+                        mod.rtlib_imports[local] = fn
+                    elif cv is not None:
+                        mod.rtlib_consts[local] = cv
+                    else:
+                        rep.fatal("SE201", "unsupported-feature",
+                                  f"runtime library '{target}' has no member '{node.attr}'",
+                                  Span(file, node.lineno, node.col_offset))
+                else:
+                    mod.imports[local] = (target, node.attr)
+                return ast.copy_location(ast.Name(id=local, ctx=ast.Load()), node)
+            self.generic_visit(node)
+            return node
+
+    Rewriter().visit(tree)
 
 
 HOOK_DECOS = {"field_validator": "field", "model_validator": "model",

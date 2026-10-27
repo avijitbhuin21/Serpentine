@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-hashlib"
-version = "0.1.0"
+version = "0.2.0"
 description = "Serpentine hash digests: sha256/sha1/md5 hex of UTF-8 text (runtime-backed; stdlib hashlib delegate under CPython)"
 readme = "README.md"
 license = { text = "MIT" }

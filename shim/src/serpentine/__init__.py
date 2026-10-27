@@ -279,6 +279,8 @@ def _param_plan(fn, path_names):
                 plan.append(("query", p.name, kind, (p.default if has else None, has)))
         elif opt is not None:
             plan.append(("opt", p.name, opt, None))
+        elif getattr(ann, "__name__", "") == "BackgroundTasks":
+            plan.append(("bg", p.name, ann, None))
         elif hasattr(ann, "model_validate_json_errors"):
             plan.append(("body", p.name, ann, None))
         else:
@@ -296,6 +298,8 @@ def _run_plan(plan, req):
             kwargs[name] = getattr(req, f"_serp_query_{kind}")(name, extra[0], extra[1])
         elif how == "opt":
             kwargs[name] = getattr(req, f"_serp_query_opt_{kind}")(name)
+        elif how == "bg":
+            kwargs[name] = kind()
         elif how == "dep":
             sub, err = _run_plan(extra, req)
             if err is not None:
@@ -335,9 +339,9 @@ def _make_endpoint(fn, path: str, rq, rs):
             if err is not None:
                 return err
             r = await fn(**kwargs)
-            if ret is rs and ret is not None:
-                return r
-            return req._serp_respond_json(_dump_result(r))
+            if not (ret is rs and ret is not None):
+                r = req._serp_respond_json(_dump_result(r))
+            return _attach_background(r, kwargs)
 
         aendpoint.__name__ = f"_serp_ep_{fn.__name__}"
         return aendpoint
@@ -348,12 +352,20 @@ def _make_endpoint(fn, path: str, rq, rs):
         if err is not None:
             return err
         r = fn(**kwargs)
-        if ret is rs and ret is not None:
-            return r
-        return req._serp_respond_json(_dump_result(r))
+        if not (ret is rs and ret is not None):
+            r = req._serp_respond_json(_dump_result(r))
+        return _attach_background(r, kwargs)
 
     endpoint.__name__ = f"_serp_ep_{fn.__name__}"
     return endpoint
+
+
+def _attach_background(resp, kwargs):
+    """Move an injected BackgroundTasks' tasks onto the response (run after it is sent)."""
+    for v in kwargs.values():
+        if type(v).__name__ == "BackgroundTasks":
+            resp.background = list(v.tasks)
+    return resp
 
 
 def block_on(value):
@@ -389,15 +401,21 @@ def registrar(method):
             return method(self, *args, **kwargs)
         hints = typing.get_type_hints(method)
         rq = rs = None
+        direct = False
         for h in hints.values():
             if typing.get_origin(h) is collections.abc.Callable:
                 cargs = typing.get_args(h)
                 if len(cargs) == 2 and isinstance(cargs[0], list) and len(cargs[0]) == 1:
                     rq, rs = _strip_owned(cargs[0][0]), cargs[1]
+                if len(cargs) == 2 and isinstance(cargs[0], list) and len(cargs[0]) == 2:
+                    direct = True
         path = args[0] if args and isinstance(args[0], str) else ""
         takes_async = "is_async" in inspect.signature(method).parameters
 
         def deco(fn):
+            if direct:
+                method(self, *args, fn, **kwargs)
+                return fn
             extra = dict(kwargs)
             if takes_async and inspect.iscoroutinefunction(fn):
                 extra["is_async"] = True

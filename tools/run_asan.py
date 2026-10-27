@@ -32,8 +32,18 @@ def asan_env() -> dict:
 
 
 def main() -> int:
-    """Build + run each selected accept test under ASan and compare with CPython."""
-    picks = sys.argv[1:]
+    """Build + run each selected accept test under ASan and compare with CPython.
+
+    `--backend llvm` sanitizes Backend B: the Rust runtime (all `unsafe` code) and the
+    stub are ASan-instrumented; the LLVM-emitted program code itself is not
+    (llvmlite has no sanitizer passes), so this covers runtime memory errors only."""
+    args = sys.argv[1:]
+    backend = "rust"
+    if "--backend" in args:
+        i = args.index("--backend")
+        backend = args[i + 1]
+        del args[i:i + 2]
+    picks = args
     tests = [p for p in sorted(ACCEPT.glob("*.py")) if not picks or any(s in p.name for s in picks)]
     env = asan_env()
     tmp = Path(tempfile.mkdtemp(prefix="serp_asan_"))
@@ -41,7 +51,7 @@ def main() -> int:
     for src in tests:
         exe = tmp / (src.stem + (".exe" if sys.platform == "win32" else ""))
         b = subprocess.run([sys.executable, "-m", "serpentine_lang.cli", "build", str(src), "-o", str(exe),
-                            "--backend", "rust", "--debug"], capture_output=True, text=True, cwd=ACCEPT, env=env)
+                            "--backend", backend, "--debug"], capture_output=True, text=True, cwd=ACCEPT, env=env)
         if b.returncode != 0:
             failures += 1
             print(f"FAIL {src.name}: asan build failed {(b.stderr or b.stdout)[-600:]}")
@@ -58,7 +68,7 @@ def main() -> int:
             print("   " + r.stderr.strip()[-2000:].replace("\n", "\n   "))
         else:
             print(f"ok   {src.name}")
-    print(f"asan: {len(tests) - failures}/{len(tests)} clean")
+    print(f"asan ({backend}): {len(tests) - failures}/{len(tests)} clean")
     return 1 if failures else 0
 
 

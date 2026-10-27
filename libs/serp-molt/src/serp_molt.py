@@ -534,7 +534,7 @@ def _fmt_of(t: PyVal) -> str:
     first: str = _first_field(t)
     if cname == "date" and n == 3 and first == "year":
         return "date"
-    if cname == "datetime" and n == 7 and first == "year":
+    if cname == "datetime" and (n == 7 or n == 8) and first == "year":
         return "date-time"
     if cname == "timedelta" and n == 7 and first == "days":
         return "duration"
@@ -584,7 +584,8 @@ def _from_datetime(v: PyVal, loc: PyVal, errs: Mut[list[PyVal]]) -> PyVal:
     try:
         d: datetime = datetime.fromisoformat(str(v))
         out = {"year": d.year, "month": d.month, "day": d.day, "hour": d.hour,
-               "minute": d.minute, "second": d.second, "microsecond": d.microsecond}
+               "minute": d.minute, "second": d.second, "microsecond": d.microsecond,
+               "tzinfo": None}
     except ValueError:
         ok = False
     if not ok:

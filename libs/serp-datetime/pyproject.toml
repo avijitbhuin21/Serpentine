@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-datetime"
-version = "0.3.0"
+version = "0.4.0"
 description = "Serpentine UTC date/time: civil-calendar Dt dataclass, unix conversions, ISO-8601 parse/format (pure Serpentine over serp-time)"
 readme = "README.md"
 license = { text = "MIT" }

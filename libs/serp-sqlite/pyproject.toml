@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-sqlite"
-version = "0.2.0"
+version = "0.3.0"
 description = "Serpentine drop-in sqlite3 subset: Connection/Cursor over the system SQLite library (runtime-backed; stdlib sqlite3 delegate under CPython)"
 readme = "README.md"
 license = { text = "MIT" }
