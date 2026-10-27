@@ -86,7 +86,7 @@ async def amain() -> None:
         print("release error:", str(e))
 
     sem: asyncio.Semaphore = asyncio.Semaphore(2)
-    await asyncio.gather(sem_user("s1", sem, 0.03), sem_user("s2", sem, 0.15), sem_user("s3", sem, 0.03))
+    await asyncio.gather(sem_user("s1", sem, 0.03), sem_user("s2", sem, 0.6), sem_user("s3", sem, 0.03))
     print("sem locked?", sem.locked())
 
     bs: asyncio.BoundedSemaphore = asyncio.BoundedSemaphore(1)
