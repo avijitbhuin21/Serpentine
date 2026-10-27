@@ -47,6 +47,16 @@ class LLVMBuildError(Exception):
     """Backend-B build failure (toolchain missing or link error)."""
 
 
+def llvmlite_missing() -> str | None:
+    """Return a user-facing message when llvmlite cannot be imported, else None."""
+    import importlib.util
+    if importlib.util.find_spec("llvmlite") is not None:
+        return None
+    return ("serp: the default LLVM backend needs the 'llvmlite' package, which is missing from "
+            "this environment. Reinstall with `pip install -U serpentine-lang`, or build with "
+            "`--backend rust` (needs only rustc).")
+
+
 def _run(cmd: list[str], what: str) -> subprocess.CompletedProcess:
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
                           errors="replace")
@@ -59,7 +69,7 @@ def _rustc() -> str:
     rustc = shutil.which("rustc")
     if rustc is None:
         raise LLVMBuildError("rustc not found on PATH (needed once to build the "
-                             "Backend-B runtime library)")
+                             "Backend-B runtime library) — install Rust from https://rustup.rs")
     return rustc
 
 

@@ -5,6 +5,38 @@ All notable changes to `serpentine-lang` (compiler) and `serpentine-shim`. Libra
 Everything is `0.x`: the language surface, SE codes and runtime ABI may change between minor
 versions.
 
+## [0.7.4] — 2026-10-27
+
+Public-launch readiness release (compiler 0.7.4, shim 0.9.2, serp-scales 0.2.1).
+
+### Fixed
+- `pip install serpentine-lang` now pulls in `llvmlite`. Before, the default LLVM backend crashed
+  with a Python traceback (`serp run` / `serp build`) unless the `[llvm]` extra was installed. The
+  extra remains as an alias, and a missing `llvmlite` now prints a clear message instead.
+- f-string format specs: `serp check` accepted specs such as `{n:03d}`, `{x:>10.2f}`, `{n:,}`,
+  `{n:#x}` or `{x:.1%}` that native builds then failed on with an internal codegen error. Both
+  backends now implement CPython's format mini-language for `int`, `float`, `bool` and `str` (fill,
+  alignment incl. `=`, sign, `#`, zero-padding, width, `,`/`_` grouping, precision and the
+  `b c d o x X n e E f F g G %` types), matched against CPython on a 92-line matrix (accept 112)
+  and 720 random specs. The checker validates every spec at compile time and rejects specs CPython
+  would refuse (r100, r101), dynamic `{x:{w}}` specs (r099) and the few unimplemented forms (`z`,
+  `#` on floats, zero-padding together with a separator).
+- A plain `import requests` (or any unresolvable module) is now SE213 even when no member is used
+  (r102); before, an unused foreign import passed `serp check`.
+- serp-scales 0.2.1 pins serp-datetime 0.4.0 (it pinned 0.2.0, which conflicted with serp-molt).
+- `serpentine.__version__` reported 0.8.0; it now matches the package (0.9.2).
+
+### Improved
+- Diagnostics carry `help:` lines with the fix for the most common newcomer errors: generator
+  expressions, `*args`/`**kwargs`, plain classes/`super()`, module-level script code, the walrus
+  operator, and foreign imports (with the matching `serp-*` library, e.g. `os` -> `serp add serp-os`).
+  "Tier-0" jargon is gone from messages, and long SE213 search paths are shortened.
+- Missing-`rustc` messages link to rustup.rs. Typographic dashes fall back to ASCII when output is
+  piped through a non-UTF-8 console.
+- README: requirements, a "what compiles / what doesn't" table, corrected status and benchmark
+  framing; the compiler's PyPI page is rewritten; PyPI classifiers and project URLs added.
+- Governance: CONTRIBUTING.md, CODE_OF_CONDUCT.md, issue and pull-request templates.
+
 ## [0.7.3] — 2026-10-27
 
 Released alongside: serpentine-shim 0.9.1; serp-datetime 0.4.0, serp-sqlite 0.3.0,
@@ -161,7 +193,7 @@ serp-redis, serp-tracing, serp-bigint 0.1.0. The compiler now requires serpentin
   (fixed 2026-08-30). It crashes a pre-fix compiler on every run.
 
 ### Known issues
-- Backend A: E0381 on locals assigned in `try` and used after `except: continue`. Fixed in Unreleased.
+- Backend A: E0381 on locals assigned in `try` and used after `except: continue`. Fixed in 0.7.3.
 
 ## [0.7.1] — 2026-09-29
 - Dependency import roots are resolved from `*.dist-info` metadata, so dists whose names differ

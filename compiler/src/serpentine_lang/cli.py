@@ -58,8 +58,8 @@ def _oracle_verify(tc, entry: Path, keep_rust: bool) -> int:
         return 2
     rustc = shutil.which("rustc")
     if rustc is None:
-        print("serp: rustc not found on PATH — needed for the release oracle pass "
-              "(use --no-verify or --debug to skip)", file=sys.stderr)
+        print("serp: rustc not found on PATH — needed for the release oracle pass; install Rust "
+              "from https://rustup.rs (or use --no-verify or --debug to skip)", file=sys.stderr)
         return 2
     rs_dir = Path(tempfile.mkdtemp(prefix="serp_verify_"))
     rs_file = rs_dir / f"{entry.stem}.rs"
@@ -98,11 +98,15 @@ def cmd_build(args: argparse.Namespace) -> int:
         out = out.with_suffix(".exe")
 
     if args.backend == "llvm":
+        from .llvmbuild import LLVMBuildError, llvmlite_missing
+        missing = llvmlite_missing()
+        if missing:
+            print(missing, file=sys.stderr)
+            return 2
         if not args.debug and not args.no_verify:
             rc = _oracle_verify(tc, entry, args.keep_rust)
             if rc != 0:
                 return rc
-        from .llvmbuild import LLVMBuildError
         from .llvmgen import LLVMUnsupported, build_llvm_native
         try:
             build_llvm_native(tc, out, debug=args.debug, debuginfo=args.debuginfo)
@@ -123,7 +127,8 @@ def cmd_build(args: argparse.Namespace) -> int:
 
     rustc = shutil.which("rustc")
     if rustc is None:
-        print("serp: rustc not found on PATH — install Rust to use `serp build`", file=sys.stderr)
+        print("serp: rustc not found on PATH — install Rust from https://rustup.rs "
+              "(on Windows also the MSVC C++ Build Tools) to use `serp build`", file=sys.stderr)
         return 2
 
     rs_dir = Path(tempfile.mkdtemp(prefix="serp_build_"))
@@ -151,7 +156,11 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 def cmd_llvm(args: argparse.Namespace) -> int:
     """serp llvm: check, build via Backend B (LLVM), run — or dump the IR."""
-    from .llvmbuild import LLVMBuildError
+    from .llvmbuild import LLVMBuildError, llvmlite_missing
+    missing = llvmlite_missing()
+    if missing:
+        print(missing, file=sys.stderr)
+        return 2
     from .llvmgen import LLVMUnsupported, generate_llvm, run_llvm
     rep = Reporter()
     try:
@@ -179,8 +188,40 @@ def cmd_lsp(args: argparse.Namespace) -> int:
     return serve_stdio()
 
 
+_TYPO_ASCII = str.maketrans({"—": "-", "–": "-", "→": "->", "‘": "'", "’": "'",
+                              "“": '"', "”": '"', "…": "..."})
+
+
+class _AsciiTypoStream:
+    """Text stream wrapper replacing typographic punctuation for non-UTF-8 pipes."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def write(self, s: str) -> int:
+        """Write text with typographic characters mapped to ASCII."""
+        return self._inner.write(s.translate(_TYPO_ASCII))
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
+def _ascii_safe_streams() -> None:
+    """Swap stdout/stderr for ASCII-safe wrappers when piped through a non-UTF-8 encoding."""
+    for attr in ("stdout", "stderr"):
+        stream = getattr(sys, attr)
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("-", "").replace("_", "")
+        try:
+            tty = stream.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        if not tty and enc not in ("utf8", "utf8sig"):
+            setattr(sys, attr, _AsciiTypoStream(stream))
+
+
 def main() -> int:
     """CLI entry point."""
+    _ascii_safe_streams()
     parser = argparse.ArgumentParser(prog="serp", description="Serpentine compiler")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

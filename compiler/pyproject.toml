@@ -4,19 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serpentine-lang"
-version = "0.7.3"
+version = "0.7.4"
 description = "Serpentine: AOT compiler for an ownership-disciplined Python subset (serp CLI)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "Serpentine contributors" }]
+keywords = ["compiler", "python", "aot", "native", "llvm", "rust", "ownership"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Compilers",
+]
 dependencies = [
     "serpentine-shim>=0.9.1",
     "uv>=0.5",
+    "llvmlite>=0.44",
 ]
 
 [project.urls]
 Homepage = "https://github.com/avijitbhuin21/Serpentine"
+Documentation = "https://github.com/avijitbhuin21/Serpentine/tree/master/docs"
+Changelog = "https://github.com/avijitbhuin21/Serpentine/blob/master/CHANGELOG.md"
+Issues = "https://github.com/avijitbhuin21/Serpentine/issues"
 
 [project.optional-dependencies]
 llvm = ["llvmlite>=0.44"]

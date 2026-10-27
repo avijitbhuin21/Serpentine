@@ -9,7 +9,7 @@ This API is part of the Serpentine language spec; treat changes as spec changes.
 import dataclasses as _dataclasses
 from typing import Annotated, Callable, Generic, Protocol, TypeVar
 
-__version__ = "0.8.0"
+__version__ = "0.9.2"
 
 __all__ = ["Owned", "Ref", "Mut", "Shared", "Weak", "move", "native", "Callable",
            "dataclass", "TypeVar", "Generic", "Protocol", "share", "downgrade", "upgrade",

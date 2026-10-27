@@ -349,6 +349,155 @@ impl<T> PyShow for std::rc::Weak<RefCell<T>> {
 fn py_str<T: PyShow>(v: T) -> String { v.py_str() }
 fn py_repr<T: PyShow>(v: T) -> String { v.py_repr() }
 
+struct PyFmtSpec { fill: char, align: char, sign: char, alt: bool, width: usize, group: char, prec: Option<usize>, ty: char }
+
+fn pyfmt_parse(spec: &str) -> PyFmtSpec {
+    let c: Vec<char> = spec.chars().collect();
+    let mut f = PyFmtSpec { fill: ' ', align: '\0', sign: '-', alt: false, width: 0, group: '\0', prec: None, ty: '\0' };
+    let is_al = |ch: char| matches!(ch, '<' | '>' | '=' | '^');
+    let mut i = 0usize;
+    let mut fill_set = false;
+    if c.len() >= 2 && is_al(c[1]) {
+        f.fill = c[0];
+        f.align = c[1];
+        fill_set = true;
+        i = 2;
+    } else if !c.is_empty() && is_al(c[0]) {
+        f.align = c[0];
+        i = 1;
+    }
+    if i < c.len() && matches!(c[i], '+' | '-' | ' ') { f.sign = c[i]; i += 1; }
+    if i < c.len() && c[i] == '#' { f.alt = true; i += 1; }
+    let mut zero = false;
+    if i < c.len() && c[i] == '0' { zero = true; i += 1; }
+    while i < c.len() && c[i].is_ascii_digit() { f.width = f.width * 10 + (c[i] as usize - '0' as usize); i += 1; }
+    if i < c.len() && (c[i] == ',' || c[i] == '_') { f.group = c[i]; i += 1; }
+    if i < c.len() && c[i] == '.' {
+        i += 1;
+        let mut p = 0usize;
+        while i < c.len() && c[i].is_ascii_digit() { p = p * 10 + (c[i] as usize - '0' as usize); i += 1; }
+        f.prec = Some(p);
+    }
+    if i < c.len() { f.ty = c[i]; }
+    if zero && !fill_set {
+        f.fill = '0';
+        if f.align == '\0' { f.align = '='; }
+    }
+    f
+}
+
+fn pyfmt_pad(f: &PyFmtSpec, sign: &str, body: &str, default_align: char) -> String {
+    let len = sign.chars().count() + body.chars().count();
+    if f.width <= len { return format!("{}{}", sign, body); }
+    let n = f.width - len;
+    let fill = |k: usize| -> String { std::iter::repeat(f.fill).take(k).collect() };
+    match if f.align == '\0' { default_align } else { f.align } {
+        '<' => format!("{}{}{}", sign, body, fill(n)),
+        '^' => format!("{}{}{}{}", fill(n / 2), sign, body, fill(n - n / 2)),
+        '=' => format!("{}{}{}", sign, fill(n), body),
+        _ => format!("{}{}{}", fill(n), sign, body),
+    }
+}
+
+fn pyfmt_group(digits: &str, sep: char, every: usize) -> String {
+    let cs: Vec<char> = digits.chars().collect();
+    let mut out = String::new();
+    for (k, ch) in cs.iter().enumerate() {
+        if k > 0 && (cs.len() - k) % every == 0 { out.push(sep); }
+        out.push(*ch);
+    }
+    out
+}
+
+fn pyfmt_sign(neg: bool, sign: char) -> &'static str {
+    if neg { "-" } else if sign == '+' { "+" } else if sign == ' ' { " " } else { "" }
+}
+
+fn pyfmt_split_exp(s: &str) -> (String, i32) {
+    match s.find('e') {
+        Some(k) => (s[..k].to_string(), s[k + 1..].parse::<i32>().unwrap_or(0)),
+        None => (s.to_string(), 0),
+    }
+}
+
+fn pyfmt_exp_text(mant: &str, exp: i32, upper: bool) -> String {
+    format!("{}{}{}{:02}", mant, if upper { 'E' } else { 'e' }, if exp < 0 { '-' } else { '+' }, exp.abs())
+}
+
+fn pyfmt_trim_zeros(s: &str) -> String {
+    if !s.contains('.') { return s.to_string(); }
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn pyfmt_general(a: f64, p: usize, upper: bool, keep_point: bool) -> String {
+    let p = if p == 0 { 1 } else { p };
+    let exp = if a == 0.0 { 0 } else { pyfmt_split_exp(&format!("{:.*e}", p - 1, a)).1 };
+    let limit = if keep_point { p as i32 - 1 } else { p as i32 };
+    if exp >= -4 && exp < limit {
+        let mut s = pyfmt_trim_zeros(&format!("{:.*}", (p as i32 - 1 - exp) as usize, a));
+        if keep_point && !s.contains('.') { s.push_str(".0"); }
+        s
+    } else {
+        let (m, e) = pyfmt_split_exp(&format!("{:.*e}", p - 1, a));
+        pyfmt_exp_text(&pyfmt_trim_zeros(&m), e, upper)
+    }
+}
+
+fn py_fmt_float(v: f64, spec: &str) -> String {
+    let f = pyfmt_parse(spec);
+    let neg = v.is_sign_negative() && !v.is_nan();
+    let a = v.abs();
+    let upper = matches!(f.ty, 'E' | 'F' | 'G');
+    let mut body = if !a.is_finite() {
+        let t = if a.is_nan() { "nan" } else { "inf" };
+        let t = if upper { t.to_uppercase() } else { t.to_string() };
+        if f.ty == '%' { format!("{}%", t) } else { t }
+    } else {
+        match f.ty {
+            'f' | 'F' => format!("{:.*}", f.prec.unwrap_or(6), a),
+            '%' => format!("{:.*}%", f.prec.unwrap_or(6), a * 100.0),
+            'e' | 'E' => {
+                let (m, e) = pyfmt_split_exp(&format!("{:.*e}", f.prec.unwrap_or(6), a));
+                pyfmt_exp_text(&m, e, upper)
+            }
+            'g' | 'G' | 'n' => pyfmt_general(a, f.prec.unwrap_or(6), upper, false),
+            _ => match f.prec { None => py_str(a), Some(p) => pyfmt_general(a, p, false, true) },
+        }
+    };
+    if f.group != '\0' {
+        let end = body.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(body.len());
+        body = format!("{}{}", pyfmt_group(&body[..end], f.group, 3), &body[end..]);
+    }
+    pyfmt_pad(&f, pyfmt_sign(neg, f.sign), &body, '>')
+}
+
+fn py_fmt_int(v: i64, spec: &str) -> String {
+    let f = pyfmt_parse(spec);
+    if matches!(f.ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') { return py_fmt_float(v as f64, spec); }
+    if f.ty == 'c' {
+        let ch = char::from_u32(v as u32).unwrap_or('\u{FFFD}').to_string();
+        return pyfmt_pad(&f, "", &ch, '>');
+    }
+    let mag = v.unsigned_abs();
+    let (digits, prefix, every) = match f.ty {
+        'b' => (format!("{:b}", mag), "0b", 4),
+        'o' => (format!("{:o}", mag), "0o", 4),
+        'x' => (format!("{:x}", mag), "0x", 4),
+        'X' => (format!("{:X}", mag), "0X", 4),
+        _ => (mag.to_string(), "", 3),
+    };
+    let digits = if f.group != '\0' { pyfmt_group(&digits, f.group, every) } else { digits };
+    let mut sign = pyfmt_sign(v < 0, f.sign).to_string();
+    if f.alt { sign.push_str(prefix); }
+    pyfmt_pad(&f, &sign, &digits, '>')
+}
+
+fn py_fmt_str(v: &str, spec: &str) -> String {
+    let f = pyfmt_parse(spec);
+    let body: String = match f.prec { Some(p) => v.chars().take(p).collect(), None => v.to_string() };
+    pyfmt_pad(&f, "", &body, '<')
+}
+
 // ---------- Shared[T] / Weak[T] (DECISIONS.md D3: Rc, cycles leak) ----------
 
 fn serp_share<T>(v: T) -> Rc<RefCell<T>> { Rc::new(RefCell::new(v)) }

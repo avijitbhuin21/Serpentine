@@ -58,6 +58,34 @@ BUILTIN_EXC = {"Exception", "ValueError", "RuntimeError", "TypeError", "IndexErr
                "PermissionError", "OSError", "ArithmeticError", "LookupError", "StopIteration",
                "UnicodeDecodeError", "NotImplementedError", "AssertionError", "AttributeError"}
 
+# Foreign import -> (PyPI dist, import module) suggested by SE213 diagnostics.
+SERP_EQUIVALENTS = {
+    "os": ("serp-os", "serp_os"), "json": ("serp-json", "serp_json"), "re": ("serp-re", "serp_re"),
+    "math": ("serp-math", "serp_math"), "random": ("serp-random", "serp_random"),
+    "time": ("serp-time", "serp_time"), "datetime": ("serp-datetime", "serp_datetime"),
+    "csv": ("serp-csv", "serp_csv"), "base64": ("serp-base64", "serp_base64"),
+    "hashlib": ("serp-hashlib", "serp_hashlib"), "hmac": ("serp-hmac", "serp_hmac"),
+    "uuid": ("serp-uuid", "serp_uuid"), "secrets": ("serp-secrets", "serp_secrets"),
+    "sqlite3": ("serp-sqlite", "serp_sqlite"), "zlib": ("serp-zlib", "serp_zlib"),
+    "gzip": ("serp-zlib", "serp_zlib"), "zipfile": ("serp-zipfile", "serp_zipfile"),
+    "socket": ("serp-socket", "serp_socket"), "urllib": ("serp-url", "serp_url"),
+    "logging": ("serp-log", "serp_log"), "argparse": ("serpentine-argparse", "serp_cli"),
+    "pathlib": ("serp-pathlib", "serp_pathlib"), "io": ("serpentine-io", "serp_io"),
+    "subprocess": ("serp-subprocess", "serp_subprocess"),
+    "threading": ("serp-threading", "serp_threading"), "queue": ("serp-queue", "serp_queue"),
+    "asyncio": ("serp-asyncio", "serp_asyncio"), "itertools": ("serp-itertools", "serp_itertools"),
+    "unittest": ("serp-test", "serp_test"), "http": ("serp-http-server", "serp_http_server"),
+    "statistics": ("serp-statistics", "serp_statistics"), "tomllib": ("serp-tomllib", "serp_tomllib"),
+    "heapq": ("serp-structs", "serp_structs"), "bisect": ("serp-structs", "serp_structs"),
+    "requests": ("serp-fang", "serp_fang"), "httpx": ("serp-fang", "serp_fang"),
+    "fastapi": ("serp-venom", "serp_fastapi"), "uvicorn": ("serp-venom", "serp_uvicorn"),
+    "pydantic": ("serp-molt", "serp_molt"), "numpy": ("serp-coil", "serp_coil"),
+    "pandas": ("serp-scales", "serp_scales"), "jwt": ("serp-jwt", "serp_jwt"),
+    "bcrypt": ("serp-bcrypt", "serp_bcrypt"), "redis": ("serp-redis", "serp_redis"),
+    "prometheus_client": ("serp-prometheus", "serp_prometheus"),
+    "opentelemetry": ("serp-tracing", "serp_tracing"),
+}
+
 # Direct parent of each non-root builtin (mirrors prelude.rs SerpErr::matches).
 BUILTIN_EXC_PARENT = {"FileNotFoundError": "OSError",
                       "ZeroDivisionError": "ArithmeticError",
@@ -123,18 +151,17 @@ def load_program(entry_path: Path, rep: Reporter,
     queue = [entry]
     while queue:
         mod = queue.pop()
+        for target in sorted(set(mod.module_aliases.values())):
+            if target in program.modules or target in RTLIB_MODULES:
+                continue
+            if ctx.resolve(target) is None:
+                _report_foreign_import(rep, mod, target, ctx)
         for local, (mod_name, _orig) in mod.imports.items():
             if mod_name in program.modules:
                 continue
             candidate = ctx.resolve(mod_name)
             if candidate is None:
-                span = _import_span(mod, mod_name)
-                roots = ", ".join(str(r) for r in ctx.searched_roots())
-                rep.fatal("SE213", "foreign-import",
-                          f"import of '{mod_name}' does not resolve to a Serpentine module "
-                          f"(searched: {roots}) — the CPython interop boundary refuses foreign "
-                          f"imports in native builds (docs/guides/interop.md); run under CPython to "
-                          f"use them", span)
+                _report_foreign_import(rep, mod, mod_name, ctx)
             sub = _load_module(candidate, mod_name, rep, overlay)
             _check_name_collision(program, sub, rep)
             program.modules[mod_name] = sub
@@ -1143,6 +1170,24 @@ def _check_name_collision(program: Program, new: Module, rep: Reporter) -> None:
                       Span(str(new.path), 1, 0))
 
 
+def _report_foreign_import(rep: Reporter, mod: Module, mod_name: str, ctx) -> None:
+    """Abort with SE213 for an unresolvable import, suggesting a serp-* equivalent when known."""
+    span = _import_span(mod, mod_name)
+    roots = [str(r) for r in ctx.searched_roots()]
+    shown = ", ".join(roots[:3]) + (f", … (+{len(roots) - 3} more)" if len(roots) > 3 else "")
+    alt = SERP_EQUIVALENTS.get(mod_name) or SERP_EQUIVALENTS.get(mod_name.split(".")[0])
+    if alt is not None:
+        hint = (f"use the Serpentine equivalent: run `serp add {alt[0]}` and write "
+                f"`import {alt[1]} as {mod_name.split('.')[-1]}` (or `from {alt[1]} import ...`)")
+    else:
+        hint = ("native builds can import only your own modules and serp-* libraries "
+                "(see docs/libraries.md); run under CPython to use other packages")
+    rep.fatal("SE213", "foreign-import",
+              f"import of '{mod_name}' does not resolve to a Serpentine module "
+              f"(searched: {shown}) — the CPython interop boundary refuses foreign "
+              f"imports in native builds (docs/guides/interop.md)", span, help=hint)
+
+
 def _import_span(mod: Module, mod_name: str) -> Span:
     """Locate the import statement for mod_name for error reporting."""
     for node in mod.tree.body:
@@ -1416,7 +1461,11 @@ def _load_module(path: Path, name: str, rep: Reporter,
                 rep.fatal("SE201", "unsupported-feature",
                           "classes must carry exactly the @dataclass decorator "
                           "(from serpentine import dataclass) — a class inheriting a "
-                          "@dataclass base may omit it", span)
+                          "@dataclass base may omit it", span,
+                          help="write classes as `@dataclass` with annotated fields (an `__init__` "
+                               "is allowed); single inheritance from another @dataclass works, but "
+                               "super() calls and virtual dispatch are not supported "
+                               "(docs/language/divergences.md)")
             if node.keywords or plain_bases:
                 if not node.keywords and len(plain_bases) == 1 \
                         and isinstance(plain_bases[0], ast.Name):
@@ -1458,7 +1507,10 @@ def _load_module(path: Path, name: str, rep: Reporter,
             mod.class_attrs[(node.targets[0].value.id, node.targets[0].attr)] = synth
         elif isinstance(node, ast.Assign):
             rep.fatal("SE206", "mutable-global",
-                      "module-level bindings must be annotated Copy-typed constants", span)
+                      "module-level bindings must be annotated Copy-typed constants", span,
+                      help="move script code into `def main() -> None:` and call it under "
+                           "`if __name__ == \"__main__\":`; the module level may only hold "
+                           "annotated constants such as `LIMIT: int = 10`")
         elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) \
                 and isinstance(node.value.func, ast.Attribute) \
                 and isinstance(node.value.func.value, ast.Name) \

@@ -139,6 +139,9 @@ RT_SIGS = {
     "rt_sb_push_f64": (VOID, [I8P, F64]),
     "rt_sb_push_f64_prec": (VOID, [I8P, F64, I64]),
     "rt_sb_push_padded": (VOID, [I8P, SSTRP, I8, I64]),
+    "rt_sb_push_fmt_i64": (VOID, [I8P, I64, I8P, I64]),
+    "rt_sb_push_fmt_f64": (VOID, [I8P, F64, I8P, I64]),
+    "rt_sb_push_fmt_str": (VOID, [I8P, SSTRP, I8P, I64]),
     "rt_sb_finish": (VOID, [I8P, SSTRP]),
     "rt_list_grow": (VOID, [SLISTP, I64, I64]),
     "rt_list_free": (VOID, [SLISTP, I64]),
@@ -3663,27 +3666,30 @@ class LLVMGen:
                 spec = "".join(str(c.value) for c in part.format_spec.values
                                if isinstance(c, ast.Constant))
             t = self._t(part.value)
-            if part.conversion == 114:      # !r
+            if spec == "" and part.conversion == 114:
                 v = self._expr(part.value, "ref")
                 self._push(self.b, t, v, sb, as_repr=True)
-            elif spec == "" or spec == "d":
+            elif spec == "":
                 v = self._expr(part.value, "ref")
                 self._push(self.b, t, v, sb, as_repr=False)
-            elif re.fullmatch(r"\.(\d+)f", spec):
-                v = self._expr(part.value, "val")
-                x = v.ssa if isinstance(t, TFloat) else self.b.sitofp(v.ssa, F64)
-                self.b.call(self._rt("rt_sb_push_f64_prec"),
-                            [sb, x, ir.Constant(I64, int(spec[1:-1]))])
-            elif re.fullmatch(r"[<>^]\d+", spec):
+            elif part.conversion in (114, 115) or isinstance(t, TStr):
+                sp, sl = self._cstr(spec)
                 inner_sb = self.b.call(self._rt("rt_sb_new"), [])
                 v = self._expr(part.value, "ref")
-                self._push(self.b, t, v, sb=inner_sb, as_repr=False)
+                self._push(self.b, t, v, sb=inner_sb, as_repr=part.conversion == 114)
                 tmp = self._entry_alloca(SSTR)
                 self.b.call(self._rt("rt_sb_finish"), [inner_sb, tmp])
-                self.b.call(self._rt("rt_sb_push_padded"),
-                            [sb, tmp, ir.Constant(I8, ord(spec[0])),
-                             ir.Constant(I64, int(spec[1:]))])
+                self.b.call(self._rt("rt_sb_push_fmt_str"), [sb, tmp, sp, ir.Constant(I64, sl)])
                 self.b.call(self._rt("rt_str_drop"), [tmp])
+            elif isinstance(t, (TInt, TBool)):
+                sp, sl = self._cstr(spec)
+                v = self._expr(part.value, "val")
+                x = self.b.zext(v.ssa, I64) if isinstance(t, TBool) else v.ssa
+                self.b.call(self._rt("rt_sb_push_fmt_i64"), [sb, x, sp, ir.Constant(I64, sl)])
+            elif isinstance(t, TFloat):
+                sp, sl = self._cstr(spec)
+                v = self._expr(part.value, "val")
+                self.b.call(self._rt("rt_sb_push_fmt_f64"), [sb, v.ssa, sp, ir.Constant(I64, sl)])
             else:
                 raise LLVMUnsupported(f"f-string format spec '{spec}'")
         out = self._temp(TStr())

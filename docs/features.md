@@ -5,8 +5,8 @@
 > [DECISIONS.md](DECISIONS.md); the library ecosystem is tracked in [libraries.md](libraries.md);
 > production readiness in [readiness.md](readiness.md).
 
-**As of:** v0.7.2 + `master` (2026-10-05). Suites: 106/106 accept differential (CPython vs
-both backends, 3 OSes), 102/102 reject with exact SE codes, 70 library dual-run tests over 37
+**As of:** v0.7.4 (2026-10-27). Suites: 112/112 accept differential (CPython vs
+both backends, 3 OSes), 109/109 reject with exact SE codes, 82 library dual-run tests over 44
 libs, rustc agreement 0 disagreements ([guides/testing.md](guides/testing.md)).
 
 ## Language
@@ -134,7 +134,7 @@ remain future work.
   traceback/TLS checks and a soak test ([guides/testing.md](guides/testing.md)).
 
 ## Libraries
-37 `serp-*` libraries in `libs/`, all on PyPI (Waves 1–6): stdlib drop-ins (json, re, csv,
+44 `serp-*` libraries in `libs/`, published on PyPI (Waves 1–6 + the L3 pass): stdlib drop-ins (json, re, csv,
 datetime, pathlib, io, zipfile, sqlite3, socket, subprocess, threading, queue, asyncio, logging,
 argparse, …) plus flagships **Molt** (pydantic), **Venom** (FastAPI), **Fang** (httpx with native
 TLS), **Coil** (numpy) and **Scales** (pandas). Most are true CPython **drop-ins** (facade +

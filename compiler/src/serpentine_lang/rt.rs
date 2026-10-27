@@ -344,6 +344,21 @@ pub unsafe extern "C" fn rt_sb_push_padded(sb: *mut String, a: *const SStr, alig
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn rt_sb_push_fmt_i64(sb: *mut String, v: i64, sp: *const u8, sl: i64) {
+    (*sb).push_str(&py_fmt_int(v, bytes(sp, sl)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sb_push_fmt_f64(sb: *mut String, v: f64, sp: *const u8, sl: i64) {
+    (*sb).push_str(&py_fmt_float(v, bytes(sp, sl)));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rt_sb_push_fmt_str(sb: *mut String, a: *const SStr, sp: *const u8, sl: i64) {
+    (*sb).push_str(&py_fmt_str(s(a), bytes(sp, sl)));
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn rt_sb_finish(sb: *mut String, out: *mut SStr) {
     let boxed = Box::from_raw(sb);
     out.write(sstring(*boxed));

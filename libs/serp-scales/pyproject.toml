@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-scales"
-version = "0.2.0"
+version = "0.2.1"
 description = "Scales: pandas drop-in DataFrame/Series for Serpentine (pure Serpentine, PyVal columns; groupby, pivot, rolling, query, merge, concat, datetime, CSV/JSON)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["serpentine-shim>=0.8.0", "serp-json>=0.3.0", "serp-datetime>=0.2.0"]
+dependencies = ["serpentine-shim>=0.8.0", "serp-json>=0.3.0", "serp-datetime>=0.4.0"]
 
 [project.urls]
 Homepage = "https://github.com/avijitbhuin21/Serpentine"

@@ -152,7 +152,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     except SerpError:
         print(rep.render_all(), file=sys.stderr)
         return 1
-    from .llvmbuild import LLVMBuildError
+    from .llvmbuild import LLVMBuildError, llvmlite_missing
+    missing = llvmlite_missing()
+    if missing:
+        print(missing, file=sys.stderr)
+        return 2
     from .llvmgen import LLVMUnsupported, build_llvm_native
     out_dir = Path(tempfile.mkdtemp(prefix="serp_run_"))
     out = out_dir / (entry.stem + (".exe" if sys.platform == "win32" else ""))

@@ -1600,22 +1600,27 @@ class RustGen:
                 assert isinstance(part.format_spec, ast.JoinedStr)
                 spec = "".join(str(c.value) for c in part.format_spec.values
                                if isinstance(c, ast.Constant))
-            if part.conversion == 114:  # !r
+            lit = '"' + spec.replace("\\", "\\\\").replace('"', '\\"') + '"'
+            pt = self._t(part.value)
+            if spec == "" and part.conversion == 114:
                 fmt_parts.append("{}")
                 args.append(f"py_repr({self._expr(part.value, 'ref')})")
             elif spec == "":
                 fmt_parts.append("{}")
                 args.append(f"py_str({self._expr(part.value, 'ref')})")
-            elif re.fullmatch(r"\.(\d+)f", spec):
-                n = spec[1:-1]
-                fmt_parts.append(f"{{:.{n}}}")
-                args.append(self._expr(part.value, "val"))
-            elif re.fullmatch(r"[<>^]\d+", spec):
-                fmt_parts.append(f"{{:{spec}}}")
-                args.append(self._expr(part.value, "val"))
-            elif spec == "d":
+            elif part.conversion in (114, 115) or isinstance(pt, TStr):
+                conv = "py_repr" if part.conversion == 114 else "py_str"
                 fmt_parts.append("{}")
-                args.append(self._expr(part.value, "val"))
+                args.append(f"py_fmt_str(&{conv}({self._expr(part.value, 'ref')}), {lit})")
+            elif isinstance(pt, TBool):
+                fmt_parts.append("{}")
+                args.append(f"py_fmt_int(({self._expr(part.value, 'val')}) as i64, {lit})")
+            elif isinstance(pt, TInt):
+                fmt_parts.append("{}")
+                args.append(f"py_fmt_int({self._expr(part.value, 'val')}, {lit})")
+            elif isinstance(pt, TFloat):
+                fmt_parts.append("{}")
+                args.append(f"py_fmt_float({self._expr(part.value, 'val')}, {lit})")
             else:
                 raise CodegenError(f"unsupported f-string format spec '{spec}'")
         fmt = "".join(fmt_parts)

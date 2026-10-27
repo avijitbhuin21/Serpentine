@@ -7,6 +7,7 @@ lowering and the Rust backend consume.
 
 import ast
 import copy
+import re
 from dataclasses import dataclass, field
 
 from .diagnostics import Reporter, Span
@@ -154,6 +155,20 @@ OP_DUNDERS = set(BINOP_DUNDER.values()) | set(CMP_DUNDER.values()) | set(EQ_DUND
     set(RBINOP_DUNDER.values()) | \
     {"__neg__", "__invert__", "__getitem__", "__setitem__", "__len__"}
 # Non-operator dunders with dedicated support (Tier-2 protocol forms).
+UNSUPPORTED_EXPR_HINTS = {
+    "GeneratorExp": ("a generator expression",
+                     "use a list comprehension instead, e.g. `sum([x * x for x in xs])`"),
+    "NamedExpr": ("the walrus operator `:=`", "assign the value on its own line first"),
+    "Await": ("`await` here", "await only inside `async def` bodies, as a statement or "
+              "assignment (`x = await f()`)"),
+    "Yield": ("`yield` (generator functions)",
+              "build and return a list, or write a class with `__iter__`/`__next__`"),
+    "YieldFrom": ("`yield from` (generator functions)",
+                  "build and return a list, or write a class with `__iter__`/`__next__`"),
+    "Starred": ("`*` unpacking in an expression",
+                "pass the list itself, or index the elements explicitly"),
+}
+
 ALLOWED_DUNDERS = OP_DUNDERS | {"__str__", "__repr__", "__post_init__", "__init__",
                                  "__setattr__", "__abs__",
                                 "__next__", "__iter__",
@@ -1727,8 +1742,16 @@ class TypeChecker:
                 names = self._type_names(mod)
             a = fn.args
             if a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg:
+                if a.vararg:
+                    hint = "replace `*args` with a list parameter, e.g. `def f(xs: list[int])`"
+                elif a.kwarg:
+                    hint = ("replace `**kwargs` with explicit keyword parameters that have "
+                            "defaults, e.g. `def f(x: int, verbose: bool = False)`")
+                else:
+                    hint = "drop the `*` / `/` markers; callers may still pass these by keyword"
                 self.rep.fatal("SE201", "unsupported-feature",
-                               "only plain positional parameters are Tier 0", self._span(mod, fn))
+                               "only plain positional parameters (with optional defaults) are "
+                               "supported", self._span(mod, fn), help=hint)
             defaults_off = len(a.args) - len(a.defaults)
             params = []
             for i, arg in enumerate(a.args):
@@ -2855,8 +2878,10 @@ class TypeChecker:
     def _type_expr_inner(self, node: ast.expr, narrow: dict[str, Type], expect: Type | None) -> Type:
         if isinstance(node, (ast.GeneratorExp, ast.NamedExpr,
                              ast.Await, ast.Yield, ast.YieldFrom, ast.Starred)):
+            name, hint = UNSUPPORTED_EXPR_HINTS.get(type(node).__name__,
+                                                    (type(node).__name__, ""))
             self._err("SE201", "unsupported-feature",
-                      f"'{type(node).__name__}' is not in the Tier-0 grammar", node)
+                      f"{name} is not supported by Serpentine", node, help=hint)
         if isinstance(node, ast.Set):
             return self._type_set_literal(node, narrow, expect)
         if isinstance(node, ast.Lambda):
@@ -2919,8 +2944,10 @@ class TypeChecker:
             return self._type_call(node, narrow, expect)
         if isinstance(node, ast.Attribute):
             return self._type_attribute(node, narrow)
+        name, hint = UNSUPPORTED_EXPR_HINTS.get(type(node).__name__,
+                                                (f"the '{type(node).__name__}' expression", ""))
         self._err("SE201", "unsupported-feature",
-                  f"'{type(node).__name__}' is not in the Tier-0 grammar", node)
+                  f"{name} is not supported by Serpentine", node, help=hint)
         raise AssertionError
 
     def _field_type(self, cls_t: TClass, attr: str, node: ast.AST) -> Type:
@@ -3051,7 +3078,65 @@ class TypeChecker:
                                                      [], narrow, require=STR)
                             if r is not None:
                                 self.expr_types[id(part.value)] = STR
+                if part.format_spec is not None:
+                    self._check_format_spec(part, self._t_of(part.value, t))
         return STR
+
+    def _t_of(self, node: ast.expr, fallback: Type) -> Type:
+        """The recorded type of a node after any desugaring, else the given fallback."""
+        return self.expr_types.get(id(node), fallback)
+
+    def _check_format_spec(self, part: ast.FormattedValue, t: Type) -> None:
+        """Reject f-string format specs CPython would refuse or the runtime does not implement."""
+        fs = part.format_spec
+        assert isinstance(fs, ast.JoinedStr)
+        if any(not isinstance(c, ast.Constant) for c in fs.values):
+            self._err("SE201", "unsupported-feature",
+                      "format specs must be literal text (no nested {...} fields); compute "
+                      "the width first and use str.rjust/ljust/center instead", part)
+            return
+        spec = "".join(str(c.value) for c in fs.values)
+        if spec == "":
+            return
+        if part.conversion == 97:
+            self._err("SE201", "unsupported-feature", "the !a conversion is not supported; "
+                      "use !r", part)
+            return
+        if part.conversion in (114, 115) or isinstance(t, TStr):
+            sample: object = ""
+            kind = "str"
+        elif isinstance(t, (TInt, TBool)):
+            sample, kind = 0, "int"
+        elif isinstance(t, TFloat):
+            sample, kind = 0.0, "float"
+        else:
+            self._err("SE214", "type-mismatch",
+                      f"format spec '{spec}' applied to {t}: CPython only formats int, float, "
+                      f"bool and str with a spec (others raise TypeError)",
+                      part.value, help="convert first, e.g. f\"{str(x):>10}\" or f\"{x!s:>10}\"")
+            return
+        try:
+            format(sample, spec)
+        except (ValueError, TypeError) as exc:
+            self._err("SE214", "type-mismatch",
+                      f"invalid format spec '{spec}' for {kind}: {exc}", part)
+            return
+        m = re.fullmatch(r"(?:.?[<>=^])?[-+ ]?(z)?(#)?(0)?\d*([,_])?(?:\.\d+)?([a-zA-Z%])?", spec,
+                         re.S)
+        bad = None
+        if m is None:
+            bad = "this format spec"
+        elif m.group(1):
+            bad = "the 'z' (negative-zero) flag"
+        elif m.group(3) and m.group(4):
+            bad = "zero-padding combined with a thousands separator"
+        elif m.group(2) and kind != "int":
+            bad = "the '#' alternate form for float/str"
+        elif m.group(2) and (m.group(5) or "") in ("e", "E", "f", "F", "g", "G", "%"):
+            bad = "the '#' alternate form for float presentation types"
+        if bad is not None:
+            self._err("SE201", "unsupported-feature",
+                      f"{bad} is not supported in native builds (format spec '{spec}')", part)
 
     def _type_list_literal(self, node: ast.List, narrow: dict[str, Type], expect: Type | None) -> Type:
         expect = _expect_member(expect, TList)

@@ -102,7 +102,11 @@ def cmd_test(args: argparse.Namespace) -> int:
         where = args.path or "tests/"
         print(f"serp: no test_*.py files found under {where}", file=sys.stderr)
         return 1
-    from .llvmbuild import LLVMBuildError
+    from .llvmbuild import LLVMBuildError, llvmlite_missing
+    missing = llvmlite_missing()
+    if missing:
+        print(missing, file=sys.stderr)
+        return 2
     from .llvmgen import LLVMUnsupported, build_llvm_native
     out_dir = Path(tempfile.mkdtemp(prefix="serp_test_"))
     failed = []

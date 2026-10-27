@@ -1,10 +1,10 @@
 [project]
 name = "serp-scales"
-version = "0.2.0"
+version = "0.2.1"
 
 [build]
 roots = ["src", "../serp-json/src", "../serp-datetime/src", "../serp-time/src"]
 
 [dependencies]
 serp-json = "0.3.0"
-serp-datetime = "0.2.0"
+serp-datetime = "0.4.0"

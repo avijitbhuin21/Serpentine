@@ -5,7 +5,7 @@ collector. One `.py` file, two ways to run it — always with identical output:
 
 ```
 python tool.py          # CPython: full ecosystem, debugger, REPL
-serp build tool.py      # native binary: ~140 KB, no Python, no GC, 9–140x faster
+serp build tool.py      # native binary: ~140 KB, no Python, no GC; numeric code up to ~140x faster, strings ≈ CPython
 ```
 
 This is the **Dual-Execution Guarantee**. It works because `serp check` only accepts
