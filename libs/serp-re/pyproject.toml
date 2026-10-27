@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serp-re"
-version = "0.2.0"
+version = "0.2.1"
 description = "Serpentine regex subset engine (literals, classes, * + ?, groups, alternation, anchors) written in the Serpentine subset"
 readme = "README.md"
 license = { text = "MIT" }

@@ -5,7 +5,13 @@ All notable changes to `serpentine-lang` (compiler) and `serpentine-shim`. Libra
 Everything is `0.x`: the language surface, SE codes and runtime ABI may change between minor
 versions.
 
-## [0.7.3] — prepared, not yet tagged or published
+## [0.7.3] — 2026-10-27
+
+Released alongside: serpentine-shim 0.9.1; serp-datetime 0.4.0, serp-sqlite 0.3.0,
+serp-hashlib 0.2.0, serp-http-server 0.2.0, serp-socket 0.2.0, serp-url 0.1.1, serp-venom 0.5.0,
+serp-log 0.2.1, serp-molt 0.7.1, serp-re 0.2.1 (ReDoS step/depth limits), serp-zlib 0.1.1
+(256 MiB decompression cap, fuzz fixes); new: serp-hmac, serp-jwt, serp-bcrypt, serp-prometheus,
+serp-redis, serp-tracing, serp-bigint 0.1.0. The compiler now requires serpentine-shim>=0.9.1.
 
 ### Language / compiler
 - Lambdas capture non-Copy values (cloned into the closure); soundness rules keep this equal

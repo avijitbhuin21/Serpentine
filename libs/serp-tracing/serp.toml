@@ -7,7 +7,7 @@ roots = ["src", "../serp-json/src"]
 
 [dependencies]
 serp-json = "0.2.0"
-serp-log = "0.2.0"
+serp-log = "0.2.1"
 serp-prometheus = "0.1.0"
 serp-secrets = "0.1.0"
 serp-time = "0.1.0"

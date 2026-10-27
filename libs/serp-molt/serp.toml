@@ -7,7 +7,7 @@ roots = ["src", "../serp-json/src", "../serp-re/src", "../serp-datetime/src", ".
 
 [dependencies]
 serp-json = "0.3.0"
-serp-re = "0.2.0"
+serp-re = "0.2.1"
 serp-datetime = "0.4.0"
 serp-uuid = "0.2.0"
 serp-base64 = "0.1.0"

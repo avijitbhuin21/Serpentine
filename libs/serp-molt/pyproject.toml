@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["serpentine-shim>=0.7.0", "serp-json", "serp-re", "serp-datetime>=0.4.0", "serp-uuid", "serp-base64"]
+dependencies = ["serpentine-shim>=0.7.0", "serp-json", "serp-re>=0.2.1", "serp-datetime>=0.4.0", "serp-uuid", "serp-base64"]
 
 [project.urls]
 Homepage = "https://github.com/avijitbhuin21/Serpentine"
