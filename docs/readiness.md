@@ -6,7 +6,7 @@
 > `[ ]` open · `[~]` partial · `[x]` done. Priority: **P1** blocks production services with real
 > users, **P2** is needed for broad adoption. Every done item names its evidence.
 >
-> Last assessed: **2026-10-27** (compiler 0.7.3 + shim 0.9.1 released; CI green on 3 OSes; verified from a clean PyPI install; repo public).
+> Last assessed: **2026-10-27** (compiler 0.7.4 + shim 0.9.2 released with the public-launch audit fixes; CI green on 3 OSes; verified from a clean PyPI install; repo public).
 
 ## Verdict
 
@@ -35,6 +35,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 ### Release & process
 
 - [x] **Release 0.7.3.** Tagged `v0.7.3` 2026-10-27 (release run 40518539601): `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI, prebuilt runtimes for linux-x86_64/macos-arm64/windows-x86_64 on the GitHub Release; 11 bumped + 4 new libs published. Verified from a clean PyPI install (`serp new` → `serp add serp-venom/serp-molt/serp-hmac` → both backends = CPython). `serp-jwt`, `serp-redis`, `serp-tracing` wait on PyPI's new-project rate limit (429).
+- [x] **Release 0.7.4** (public-launch audit fixes). Tagged `v0.7.4` 2026-10-27 (release run 40571003441): `serpentine-lang` 0.7.4 (llvmlite now a hard dependency, f-string format mini-language in both backends, diagnostics with `help:` fixes, plain foreign imports always SE213), `serpentine-shim` 0.9.2, `serp-scales` 0.2.1. Verified from a fresh PyPI install (`pip install serpentine-lang==0.7.4` → `serp new` → `serp run`).
 - [x] **Stability & versioning policy**: [stability.md](stability.md) (SemVer rules for `0.x`, per-surface guarantees for programs, SE codes, CLI, `serp.toml`, runtime ABI, shim and libraries; deprecation; road to 1.0).
 - [x] **Enable GitHub private vulnerability reporting.** Repo made public 2026-10-27; `gh api repos/avijitbhuin21/Serpentine/private-vulnerability-reporting` → `{"enabled": true}`. [SECURITY.md](../SECURITY.md) points reporters to it.
 - [x] **Stabilize flaky lib tests:** `test_async_fang`: the test server closed with an unread POST body, so Windows sent RST and the response was lost (1/5 → 20/20 under CPython). `test_asyncio`: equal-deadline sleeps and 10 ms margins (now 32/32 per backend at 8 concurrent runs).
@@ -80,7 +81,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 - [ ] **Language:** subtype polymorphism / `super()` / virtual dispatch (out of scope by D15, so a migration-patterns doc is owed); returned borrows (SE209), `Sync[T]` and scoped cross-thread borrows; asyncio cancellation, `wait_for`, `async for`, `Task.result()` and multiple loops; `class Worker(Thread)` subclassing; a `Decimal` pattern (D26 rejected it).
 - [ ] **Ecosystem:** templating, an ORM/query builder, a background job queue, cloud SDKs; `serp-molt` `plain`/`wrap` validators; typed Scales storage.
 - [ ] **Services:** HTTP/2; a container image + deployment guide.
-- [ ] **Governance:** `CONTRIBUTING.md`, issue/PR templates, a code of conduct, and onboarding docs for a second maintainer.
+- [~] **Governance:** `CONTRIBUTING.md`, issue/PR templates and a code of conduct added (0.7.4); onboarding docs for a second maintainer still open.
 - [ ] **Local/CI parity:** the local venv is CPython 3.11, CI pins 3.12.
 - [ ] **Public announcement** (venues in [guides/publishing.md](guides/publishing.md)).
 
@@ -91,7 +92,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 **Source control, CI, releases**
 
 - [x] Three-OS CI (ubuntu/macos/windows): accept/reject corpora, both backend differentials, rustc agreement, LSP smoke, every lib suite, tracebacks, parser + compiler fuzz smoke, TLS check.
-- [x] `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
+- [x] `serpentine-lang` 0.7.4 + `serpentine-shim` 0.9.2 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
 - [x] 41 of 44 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`); `serp-jwt`/`serp-redis`/`serp-tracing` pending PyPI's new-project limit.
 - [x] `CHANGELOG.md`, `SECURITY.md`, README CI/PyPI badges and an experimental-status warning.
 
