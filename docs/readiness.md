@@ -6,7 +6,7 @@
 > `[ ]` open · `[~]` partial · `[x]` done. Priority: **P1** blocks production services with real
 > users, **P2** is needed for broad adoption. Every done item names its evidence.
 >
-> Last assessed: **2026-10-27** (compiler 0.7.3 prepared, unreleased; L3 pass on `master`).
+> Last assessed: **2026-10-27** (compiler 0.7.3 prepared, unreleased; L3 pass pushed to `master` (CI green on 3 OSes), every dist built and tested from a clean-venv install; repo public).
 
 ## Verdict
 
@@ -36,7 +36,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 - [~] **Release 0.7.3.** Prepared (version bump, CHANGELOG `[0.7.3]`) but not tagged/published; publishing to PyPI is irreversible and waits for the maintainer. The prebuilt `dist-rt` runtime needs refreshing (prelude.rs/rt.rs changed).
 - [x] **Stability & versioning policy**: [stability.md](stability.md) (SemVer rules for `0.x`, per-surface guarantees for programs, SE codes, CLI, `serp.toml`, runtime ABI, shim and libraries; deprecation; road to 1.0).
-- [ ] **Enable GitHub private vulnerability reporting.** Blocked: GitHub only offers it on public repositories and the repo is private (`gh api … private-vulnerability-reporting` → 404). Enable it when the repo goes public.
+- [x] **Enable GitHub private vulnerability reporting.** Repo made public 2026-10-27; `gh api repos/avijitbhuin21/Serpentine/private-vulnerability-reporting` → `{"enabled": true}`. [SECURITY.md](../SECURITY.md) points reporters to it.
 - [x] **Stabilize flaky lib tests:** `test_async_fang`: the test server closed with an unread POST body, so Windows sent RST and the response was lost (1/5 → 20/20 under CPython). `test_asyncio`: equal-deadline sleeps and 10 ms margins (now 32/32 per backend at 8 concurrent runs).
 
 ### Running services (Venom stack)
