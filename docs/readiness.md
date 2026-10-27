@@ -34,7 +34,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 ### Release & process
 
-- [x] **Release 0.7.3.** Tagged `v0.7.3` 2026-10-27 (release run 40518539601): `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI, prebuilt runtimes for linux-x86_64/macos-arm64/windows-x86_64 on the GitHub Release; 11 bumped + 4 new libs published. Verified from a clean PyPI install (`serp new` → `serp add serp-venom/serp-molt/serp-hmac` → both backends = CPython). `serp-jwt`, `serp-redis`, `serp-tracing` wait on PyPI's new-project rate limit (429).
+- [x] **Release 0.7.3.** Tagged `v0.7.3` 2026-10-27 (release run 40518539601): `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1 on PyPI, prebuilt runtimes for linux-x86_64/macos-arm64/windows-x86_64 on the GitHub Release; 11 bumped + 4 new libs published. Verified from a clean PyPI install (`serp new` → `serp add serp-venom/serp-molt/serp-hmac` → both backends = CPython). `serp-jwt`, `serp-redis`, `serp-tracing` hit PyPI's new-project rate limit (429) and were published later the same day through pending trusted publishers.
 - [x] **Release 0.7.4** (public-launch audit fixes). Tagged `v0.7.4` 2026-10-27 (release run 40571003441): `serpentine-lang` 0.7.4 (llvmlite now a hard dependency, f-string format mini-language in both backends, diagnostics with `help:` fixes, plain foreign imports always SE213), `serpentine-shim` 0.9.2, `serp-scales` 0.2.1. Verified from a fresh PyPI install (`pip install serpentine-lang==0.7.4` → `serp new` → `serp run`).
 - [x] **Stability & versioning policy**: [stability.md](stability.md) (SemVer rules for `0.x`, per-surface guarantees for programs, SE codes, CLI, `serp.toml`, runtime ABI, shim and libraries; deprecation; road to 1.0).
 - [x] **Enable GitHub private vulnerability reporting.** Repo made public 2026-10-27; `gh api repos/avijitbhuin21/Serpentine/private-vulnerability-reporting` → `{"enabled": true}`. [SECURITY.md](../SECURITY.md) points reporters to it.
@@ -93,7 +93,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 - [x] Three-OS CI (ubuntu/macos/windows): accept/reject corpora, both backend differentials, rustc agreement, LSP smoke, every lib suite, tracebacks, parser + compiler fuzz smoke, TLS check.
 - [x] `serpentine-lang` 0.7.4 + `serpentine-shim` 0.9.2 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
-- [x] 41 of 44 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`); `serp-jwt`/`serp-redis`/`serp-tracing` pending PyPI's new-project limit.
+- [x] All 44 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`).
 - [x] `CHANGELOG.md`, `SECURITY.md`, README CI/PyPI badges and an experimental-status warning.
 
 **Language** ([features.md](features.md), [spec.md](spec.md))

@@ -81,7 +81,7 @@
 
 ## Sync status
 
-**PyPI:** `serpentine-lang` 0.7.3 + `serpentine-shim` 0.9.1, and 41 of the 44 libs at the versions above (`serp-jwt`, `serp-redis`, `serp-tracing` are tagged but wait on PyPI's new-project rate limit).
+**PyPI:** `serpentine-lang` 0.7.4 + `serpentine-shim` 0.9.2, and all 44 libs at the versions above (`serp-jwt`, `serp-redis` and `serp-tracing` were published through PyPI pending publishers after the account hit the new-project rate limit).
 The hardening changes to serp-re, serp-zlib, serp-http-server and serp-venom shipped in their
 0.7.3-wave releases.
 Two libs publish under different dist names than their folder/import names: `libs/serp-io` →
