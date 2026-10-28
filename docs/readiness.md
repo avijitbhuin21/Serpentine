@@ -42,7 +42,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 ### Running services (Venom stack)
 
-- [x] **Graceful shutdown:** SIGTERM/SIGINT/Ctrl-C/Ctrl-Break → stop accepting, drain in-flight requests (`SHUTDOWN_GRACE` 10 s), close idle keep-alives, exit 0; a second signal exits immediately. `tools/run_shutdown_check.py`: 4/4 (both backends × `serve_async`/`serve_on`, real signals) on Windows; Unix handler type-checked for linux-gnu. `test_shutdown.py` byte-identical in all three worlds.
+- [x] **Graceful shutdown:** SIGTERM/SIGINT/Ctrl-C/Ctrl-Break → stop accepting, drain in-flight requests (`SHUTDOWN_GRACE` 10 s), close idle keep-alives, exit 0; a second signal exits immediately. `tools/run_shutdown_check.py`: 4/4 (both backends × `serve_async`/`serve_on`, real signals) on Windows, Linux and macOS, in CI on every push. `test_shutdown.py` byte-identical in all three worlds.
 - [x] **Health endpoint pattern and restart guide**: [guides/deployment.md](guides/deployment.md) (liveness/readiness routes, systemd, Docker, Kubernetes probes, stop timeouts, scaling).
 - [x] **Per-request read deadline** (slowloris): whole-request budget `REQUEST_DEADLINE` (30 s, head + body) on top of the 10 s per-`recv` timeout, in http-server, threaded Venom and the event loop (`test_shutdown.py` drops a trickling request).
 - [ ] **24h+ soak on Linux server hardware** with latency-drift tracking (`tools/run_soak.py --seconds 86400`). Needs a Linux host; not available from the Windows dev box.
@@ -91,7 +91,7 @@ keep their line here with the evidence, so the gap to L3 stays readable in one p
 
 **Source control, CI, releases**
 
-- [x] Three-OS CI (ubuntu/macos/windows): accept/reject corpora, both backend differentials, rustc agreement, LSP smoke, every lib suite, tracebacks, parser + compiler fuzz smoke, TLS check.
+- [x] Three-OS CI (ubuntu/macos/windows): accept/reject corpora, both backend differentials, rustc agreement, LSP smoke, every lib suite, tracebacks, parser + compiler fuzz smoke, checker fuzz, HTTP fuzz, graceful shutdown, a 10k-LOC scale test, TLS check.
 - [x] `serpentine-lang` 0.7.4 + `serpentine-shim` 0.9.2 on PyPI via trusted publishing (`release.yml`); prebuilt runtimes for linux-x86_64, macos-arm64 and windows-x86_64 attached to each release.
 - [x] All 44 `serp-*` libraries on PyPI (`release-lib.yml`; `serp-io`/`serp-cli` ship as `serpentine-io`/`serpentine-argparse`).
 - [x] `CHANGELOG.md`, `SECURITY.md`, README CI/PyPI badges and an experimental-status warning.
