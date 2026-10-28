@@ -1,7 +1,8 @@
 # Contributing to Serpentine
 
 Thanks for your interest! Serpentine is a young, `0.x` project, so bug reports with a small
-reproducer are the most valuable contribution right now.
+reproducer are the most valuable contribution right now. Questions and ideas are welcome in
+[GitHub Discussions](https://github.com/avijitbhuin21/Serpentine/discussions).
 
 ## Reporting bugs
 

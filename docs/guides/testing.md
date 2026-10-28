@@ -19,6 +19,10 @@ root with the dev venv active (`.\.venv\Scripts\Activate.ps1`) and `PYTHONPATH=s
 | `python tools/run_traceback_check.py` | Native crash tracebacks list the same `.py` (line, function) frames as CPython, in every backend; a caught error leaves no frames behind. |
 | `python tools/run_fuzz.py --per-kind 300 --seed 20260930` | Parser fuzz smoke (see below). |
 | `python tools/run_compiler_fuzz.py --seed 1 --count 8` | Compiler fuzz smoke (see below). |
+| `python tools/run_check_fuzz.py --seed 1 --count 2000` | `serp check` never crashes on mutated or garbage input (see below). |
+| `python tools/run_http_fuzz.py --seed 1 --count 1000` | Venom servers survive malformed HTTP requests with well-formed replies (see below). |
+| `python tools/run_shutdown_check.py` | Graceful shutdown drains in-flight requests on SIGTERM / Ctrl-Break (see *Service checks*). |
+| `python tools/run_scale_test.py --loc 10000` | A generated 10k-LOC multi-module program checks, builds on both backends and matches CPython. |
 | `python tools/run_tls_check.py` | Fang refuses expired, self-signed, wrong-host and untrusted-root certificates (badssl.com). It needs the network, so it's informational in CI: read the `tls check (...)` line. |
 
 ## Fuzzing

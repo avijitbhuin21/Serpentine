@@ -65,6 +65,18 @@ jobs:
       - name: Differential compiler fuzz (random programs, CPython vs both backends)
         run: python tools/run_compiler_fuzz.py --seed 1 --count 8
 
+      - name: Checker robustness fuzz (serp check never crashes on garbage input)
+        run: python tools/run_check_fuzz.py --seed 1 --count 2000
+
+      - name: HTTP request-parser fuzz (Venom servers stay up, no malformed replies)
+        run: python tools/run_http_fuzz.py --seed 1 --count 1000
+
+      - name: Graceful shutdown drains in-flight requests (SIGTERM / CTRL_BREAK, both backends)
+        run: python tools/run_shutdown_check.py
+
+      - name: Scale test (10k-LOC generated program checks, builds on both backends, matches CPython)
+        run: python tools/run_scale_test.py --loc 10000
+
       - name: TLS certificate verification against badssl.com (network; informational)
         continue-on-error: true
         run: python tools/run_tls_check.py

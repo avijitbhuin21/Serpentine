@@ -1,5 +1,8 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Ask a question
+    url: https://github.com/avijitbhuin21/Serpentine/discussions
+    about: Usage questions, ideas and "does Serpentine support X?" belong in Discussions.
   - name: Report a security vulnerability
     url: https://github.com/avijitbhuin21/Serpentine/security/advisories/new
     about: Please report security issues privately, not as public issues.
